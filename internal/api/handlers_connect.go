@@ -110,7 +110,16 @@ func (s *Server) resolveProvider(name string) (provider.Provider, error) {
 	return s.registry.Get(strings.ToUpper(name))
 }
 
-// handleConnectRedirect sends the end user to Microsoft's consent screen.
+// handleConnectRedirect shows the end user a branded landing page before
+// sending them to the provider's real consent screen.
+//
+// This is the Unipile "hosted auth wizard" moment: with several providers
+// registered it is where a picker would go, one button per provider. With one
+// provider it is a single confirmation screen, but it still matters — it is
+// the only thing standing between "click a link from Acme" and "type your
+// Microsoft password", and a bare redirect makes that jump feel like a
+// phishing link. The button's href is the real authorize URL, computed once
+// up front, so clicking it costs no extra round trip through us.
 func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	state := r.PathValue("state")
 	pending, err := s.store.PeekOAuthState(state)
@@ -134,7 +143,21 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 
 	challenge := provider.ChallengeFor(pending.Verifier)
 	force := r.URL.Query().Get("force_consent") == "1"
-	http.Redirect(w, r, p.Auth().AuthorizeURL(state, challenge, force), http.StatusFound)
+	authorizeURL := p.Auth().AuthorizeURL(state, challenge, force)
+
+	renderLanding(w, landingData{
+		Provider:     displayName(p.Name()),
+		AuthorizeURL: authorizeURL,
+	})
+}
+
+func displayName(providerName string) string {
+	switch providerName {
+	case "OUTLOOK":
+		return "Outlook"
+	default:
+		return providerName
+	}
 }
 
 // handleOAuthCallback is Microsoft's redirect target.

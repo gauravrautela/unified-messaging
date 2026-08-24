@@ -55,6 +55,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /connect/{state}", s.handleConnectRedirect)
 	mux.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
 
+	// --- account management UI (gated client-side by the API key) ---
+	mux.HandleFunc("GET /dashboard", s.handleDashboard)
+
 	// --- inbound push from providers ---
 	// Deliberately unauthenticated by API key: providers cannot send custom
 	// headers. Authenticity comes from the per-subscription clientState secret.

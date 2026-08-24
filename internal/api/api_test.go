@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -136,20 +137,39 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 		t.Fatalf("state was not persisted: %v", err)
 	}
 
-	// Following the link should bounce the user to Microsoft with PKCE set up.
+	// Following the link should render the landing page, whose button embeds a
+	// fully-formed Microsoft authorize URL with PKCE set up. This is a page, not
+	// a redirect: a bare 302 straight to a login prompt is what a phishing link
+	// looks like, so the end user sees a branded confirmation screen first.
 	req = httptest.NewRequest(http.MethodGet, "/connect/"+resp.State, nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusFound {
-		t.Fatalf("connect status = %d, want 302", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("connect status = %d, want 200 (a landing page, not a redirect)", rec.Code)
 	}
-	loc, err := url.Parse(rec.Header().Get("Location"))
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("content-type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+
+	start := strings.Index(body, `href="`)
+	if start == -1 {
+		t.Fatalf("no link found in landing page: %s", body)
+	}
+	start += len(`href="`)
+	end := strings.Index(body[start:], `"`)
+	if end == -1 {
+		t.Fatalf("malformed href in landing page: %s", body)
+	}
+	authorizeURL := html.UnescapeString(body[start : start+end])
+
+	loc, err := url.Parse(authorizeURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if loc.Host != "login.microsoftonline.com" {
-		t.Fatalf("redirect host = %q", loc.Host)
+		t.Fatalf("authorize url host = %q", loc.Host)
 	}
 	q := loc.Query()
 	if q.Get("code_challenge") == "" || q.Get("code_challenge_method") != "S256" {
@@ -160,6 +180,22 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	}
 	if !strings.Contains(q.Get("scope"), "offline_access") {
 		t.Fatalf("offline_access missing; there would be no refresh token: %q", q.Get("scope"))
+	}
+}
+
+// The dashboard shell must render without an API key: the gate lives in its
+// client-side JS, not in this route, since the HTML itself carries nothing
+// sensitive to protect.
+func TestDashboardServesWithoutAPIKey(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `id="gate-form"`) {
+		t.Fatal("dashboard did not render the API key gate")
 	}
 }
 

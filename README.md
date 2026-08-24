@@ -93,13 +93,22 @@ set -a && source .env && set +a && go run ./cmd/server
 
 ### 4. Connect a mailbox
 
+The easiest path is the dashboard: open **`http://localhost:8080/dashboard`**,
+paste in `API_KEY`, and click **Connect account**. It walks the same flow below
+but does the `hosted-auth` call and redirect for you, and lists what's connected
+afterward — status, last synced, resync, disconnect.
+
+To do it by hand instead:
+
 ```bash
 curl -s -X POST localhost:8080/api/v1/hosted-auth \
   -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
   -d '{}' | jq -r .url
 ```
 
-Open that URL in a browser, sign in, consent. The page confirms with an
+Open that URL in a browser. It shows a branded "Connect your Outlook account"
+page first — this is what a caller's own users would see mid-flow — then sign
+in and consent on Microsoft's real screen. The confirmation page reports an
 `account_id`. Backfill starts immediately in the background.
 
 ### 5. Optional: real-time push
@@ -119,6 +128,27 @@ registration, point `MS_REDIRECT_URI` at it, and restart. Startup logs
 `push_notifications=true` when subscriptions are active.
 
 ---
+
+## UI
+
+There is no mail client and no operator login system — everything is one API
+plus two small screens, both served by the same binary with no build step:
+
+| Screen | Route | Audience | Auth |
+|---|---|---|---|
+| Connect landing page | `GET /connect/{state}` | The end user being connected (Priya) | The single-use state token in the URL |
+| Account dashboard | `GET /dashboard` | You / the integrating developer | API key pasted client-side, kept in `localStorage` |
+
+The landing page is what stands between "clicked a link from some app" and
+"typing a Microsoft password" — a bare redirect there looks like phishing. With
+one provider it's a single confirmation screen; with a second provider this is
+where a picker (à la Unipile's hosted auth wizard) would go.
+
+The dashboard is connection *lifecycle* management only — list accounts, see
+`OK` vs `CREDENTIALS` status, connect a new one, force a resync, disconnect.
+It does not browse mail or send anything; that's `/api/v1/emails*`, for a real
+caller's own app to build on. The page itself carries no secret — the API key
+lives only in the browser, exactly like any other API consumer.
 
 ## API
 
