@@ -669,7 +669,7 @@ func postForm(h http.Handler, path string, form url.Values) *httptest.ResponseRe
 }
 
 func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
-	s, db := newTestServer(t)
+	s, db, recs := newTestServerWithLog(t)
 	rec := postForm(s.Routes(), "/signup", url.Values{
 		"email": {"new@x.com"}, "password": {"longenoughpassword"}, "name": {"New"},
 	})
@@ -690,6 +690,12 @@ func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
 	}
 	if _, _, err := db.DeveloperByEmail("new@x.com"); err != nil {
 		t.Fatalf("developer not created: %v", err)
+	}
+	if recs.Contains("longenoughpassword") || recs.Contains(cookie.Value) {
+		t.Fatal("password or session id leaked into logs")
+	}
+	if !recs.Contains("request_id=req_") || !recs.Contains("developer signed up") {
+		t.Fatalf("expected request-scoped signup logs: %v", recs.All())
 	}
 }
 

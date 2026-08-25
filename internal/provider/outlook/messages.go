@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 )
@@ -39,7 +40,8 @@ func (c *Client) SyncMessages(ctx context.Context, accountID string, scope provi
 		}
 	}
 
-	for next != "" {
+	log := logx.From(ctx).With("component", "outlook", "account_id", accountID, "scope_id", scope.ID)
+	for pageNum := 1; next != ""; pageNum++ {
 		var page messagesPage
 		err := c.do(ctx, accountID, request{
 			method:  http.MethodGet,
@@ -50,6 +52,8 @@ func (c *Client) SyncMessages(ctx context.Context, accountID string, scope provi
 		if err != nil {
 			return res, err
 		}
+		log.Debug("delta page", "page", pageNum, "items", len(page.Value),
+			"next", page.NextLink != "", "delta", page.DeltaLink != "")
 
 		for _, m := range page.Value {
 			if m.Removed != nil {

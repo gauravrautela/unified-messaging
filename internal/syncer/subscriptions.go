@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -40,11 +41,14 @@ func (s *Syncer) subscriptionLoop(ctx context.Context) {
 }
 
 func (s *Syncer) reconcileSubscriptions(ctx context.Context) {
+	log := s.log.With("component", "syncer")
+	ctx = logx.With(ctx, log)
 	accts, err := s.store.ListAllAccounts()
 	if err != nil {
-		s.log.Error("listing accounts for subscription reconcile", "err", err)
+		log.Error("listing accounts for subscription reconcile", "err", err)
 		return
 	}
+	log.Debug("subscription reconcile", "accounts", len(accts))
 	for _, a := range accts {
 		if a.Status != model.AccountOK {
 			continue
@@ -75,6 +79,11 @@ func (s *Syncer) EnsureSubscription(ctx context.Context, accountID string) error
 	if pusher == nil {
 		return nil
 	}
+	// clientState is deliberately absent from every line below: it is the shared
+	// secret that authenticates inbound notifications.
+	log := logx.From(ctx).With("component", "syncer", "account_id", accountID,
+		"developer_id", acct.DeveloperID, "provider", acct.Provider)
+	ctx = logx.With(ctx, log)
 
 	existing, err := s.store.SubscriptionsForAccount(accountID)
 	if err != nil {
@@ -82,12 +91,16 @@ func (s *Syncer) EnsureSubscription(ctx context.Context, accountID string) error
 	}
 	for _, sub := range existing {
 		if time.Until(sub.ExpiresAt) > pusher.RenewBefore() {
+			log.Debug("subscription decision", "decision", "healthy",
+				"subscription_id", sub.ID, "resource", sub.Resource, "expires_at", sub.ExpiresAt)
 			return nil // still healthy
 		}
+		log.Debug("subscription decision", "decision", "renew",
+			"subscription_id", sub.ID, "resource", sub.Resource, "expires_at", sub.ExpiresAt)
 		renewed, err := pusher.Renew(ctx, accountID, sub.ID)
 		if err == nil {
-			s.log.Info("renewed subscription",
-				"account_id", accountID, "expires", renewed.ExpiresAt)
+			log.Info("renewed subscription",
+				"subscription_id", sub.ID, "resource", sub.Resource, "expires_at", renewed.ExpiresAt)
 			return s.store.SaveSubscription(store.Subscription{
 				ID: sub.ID, AccountID: accountID, Resource: sub.Resource,
 				ClientState: sub.ClientState, ExpiresAt: renewed.ExpiresAt,
@@ -95,10 +108,13 @@ func (s *Syncer) EnsureSubscription(ctx context.Context, accountID string) error
 		}
 		// Providers forget subscriptions they have expired; drop ours and make
 		// a fresh one.
-		s.log.Warn("renewal failed, recreating", "account_id", accountID, "err", err)
+		log.Warn("renewal failed, recreating", "subscription_id", sub.ID, "err", err)
+		log.Debug("subscription decision", "decision", "delete",
+			"subscription_id", sub.ID, "reason", "renew failed")
 		_ = s.store.DeleteSubscription(sub.ID)
 	}
 
+	log.Debug("subscription decision", "decision", "create", "existing", len(existing))
 	return s.createSubscription(ctx, accountID, acct.Provider, pusher)
 }
 
@@ -125,8 +141,8 @@ func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName
 		return err
 	}
 
-	s.log.Info("created subscription",
-		"account_id", accountID, "subscription_id", sub.ID, "expires", sub.ExpiresAt)
+	logx.From(ctx).Info("created subscription",
+		"subscription_id", sub.ID, "resource", sub.Resource, "expires_at", sub.ExpiresAt)
 	return s.store.SaveSubscription(store.Subscription{
 		ID: sub.ID, AccountID: accountID, Resource: sub.Resource,
 		ClientState: secret, ExpiresAt: sub.ExpiresAt,
@@ -139,8 +155,9 @@ func (s *Syncer) adoptExisting(ctx context.Context, accountID string, pusher pro
 		return err
 	}
 	for _, r := range remote {
-		s.log.Info("adopting pre-existing subscription",
-			"account_id", accountID, "subscription_id", r.ID)
+		logx.From(ctx).Info("adopting pre-existing subscription",
+			"account_id", accountID, "subscription_id", r.ID,
+			"resource", r.Resource, "expires_at", r.ExpiresAt)
 		// The clientState of a subscription we did not create is unrecoverable,
 		// so notifications for it can only be verified by subscription ID.
 		return s.store.SaveSubscription(store.Subscription{
@@ -166,29 +183,34 @@ func (s *Syncer) HandleNotifications(ctx context.Context, providerName string, r
 		return err
 	}
 
+	log := s.log.With("component", "syncer", "provider", providerName)
+	log.Debug("notifications received", "bytes", len(raw), "notifications", len(notifications))
+
 	for _, n := range notifications {
 		sub, err := s.store.GetSubscription(n.SubscriptionID)
 		if err != nil {
 			// Unknown subscriptions are expected noise after a database reset.
-			s.log.Warn("notification for unknown subscription",
+			log.Warn("notification for unknown subscription",
 				"subscription_id", n.SubscriptionID)
 			continue
 		}
 		// A blank stored clientState means we adopted this subscription and
 		// never knew its secret; ID ownership is the only check available.
 		if sub.ClientState != "" && sub.ClientState != n.ClientState {
-			s.log.Warn("rejecting notification: clientState mismatch",
+			log.Warn("rejecting notification: clientState mismatch",
 				"subscription_id", n.SubscriptionID)
 			continue
 		}
 
 		if n.Lifecycle != provider.LifecycleNone {
 			if err := s.handleLifecycle(ctx, sub, n.Lifecycle); err != nil {
-				s.log.Error("handling lifecycle notification",
+				log.Error("handling lifecycle notification",
 					"subscription_id", n.SubscriptionID, "err", err)
 			}
 			continue
 		}
+		log.Debug("notification decision", "decision", "wake",
+			"subscription_id", n.SubscriptionID, "account_id", sub.AccountID)
 		s.Wake(sub.AccountID)
 	}
 	return nil
@@ -225,7 +247,7 @@ func (s *Syncer) handleLifecycle(ctx context.Context, sub store.Subscription, ac
 	if err != nil || pusher == nil {
 		return err
 	}
-	s.log.Info("lifecycle notification",
+	s.log.Info("lifecycle notification", "component", "syncer",
 		"subscription_id", sub.ID, "account_id", sub.AccountID, "action", action)
 
 	switch action {
@@ -264,9 +286,13 @@ func (s *Syncer) RemoveSubscriptions(ctx context.Context, accountID string) {
 	if err != nil {
 		return
 	}
+	log := logx.From(ctx).With("component", "syncer", "account_id", accountID)
 	for _, sub := range subs {
+		log.Debug("subscription decision", "decision", "delete",
+			"subscription_id", sub.ID, "resource", sub.Resource,
+			"expires_at", sub.ExpiresAt, "reason", "account disconnected")
 		if err := pusher.Delete(ctx, accountID, sub.ID); err != nil {
-			s.log.Warn("deleting subscription upstream", "subscription_id", sub.ID, "err", err)
+			log.Warn("deleting subscription upstream", "subscription_id", sub.ID, "err", err)
 		}
 		_ = s.store.DeleteSubscription(sub.ID)
 	}

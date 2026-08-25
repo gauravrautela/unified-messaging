@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/events"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
@@ -204,7 +205,7 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log, recs := logx.Capture()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -293,6 +294,18 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	}
 	if seen[model.EventMailDeleted] != "M1" {
 		t.Fatalf("expected mail_deleted for M1, got %+v", seen)
+	}
+
+	for _, want := range []string{
+		"component=syncer", "run_id=run_", "sync run started", "scope decision", "message decision",
+		"decision=new", "event=mail_received", "sync run finished",
+	} {
+		if !recs.Contains(want) {
+			t.Errorf("sync log missing %q", want)
+		}
+	}
+	if recs.Contains("test-token") {
+		t.Error("access token leaked into sync log")
 	}
 }
 

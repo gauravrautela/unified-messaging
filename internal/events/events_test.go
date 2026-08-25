@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
@@ -89,7 +90,7 @@ func TestDeliveryIsScopedToAccount(t *testing.T) {
 
 	now := time.Now()
 	for _, w := range []model.Webhook{
-		{ID: "wh_mine", DeveloperID: "dev_1", AccountID: "acc_1", URL: mine.URL, CreatedAt: now},
+		{ID: "wh_mine", DeveloperID: "dev_1", AccountID: "acc_1", URL: mine.URL, Secret: "topsecret", CreatedAt: now},
 		{ID: "wh_theirs", DeveloperID: "dev_1", AccountID: "acc_2", URL: theirs.URL, CreatedAt: now},
 		{ID: "wh_global", DeveloperID: "dev_1", URL: global.URL, CreatedAt: now},
 	} {
@@ -100,7 +101,8 @@ func TestDeliveryIsScopedToAccount(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	d := NewDispatcher(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	log, recs := logx.Capture()
+	d := NewDispatcher(db, log)
 	d.Start(ctx)
 
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
@@ -110,6 +112,9 @@ func TestDeliveryIsScopedToAccount(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if theirs.count() != 0 {
 		t.Fatalf("acc_2's webhook received acc_1's mail (%d deliveries)", theirs.count())
+	}
+	if recs.Contains("topsecret") {
+		t.Fatalf("webhook signing secret leaked into logs: %v", recs.All())
 	}
 }
 
@@ -121,9 +126,16 @@ func (r *receiver) setCode(code int) {
 
 func newFastDispatcher(t *testing.T, db *store.Store, schedule ...time.Duration) *Dispatcher {
 	t.Helper()
+	return newFastDispatcherLog(t, db, slog.New(slog.NewTextHandler(io.Discard, nil)), schedule...)
+}
+
+// newFastDispatcherLog is newFastDispatcher with a caller-supplied logger, so a
+// test can assert on what the delivery path logged.
+func newFastDispatcherLog(t *testing.T, db *store.Store, log *slog.Logger, schedule ...time.Duration) *Dispatcher {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	d := NewDispatcher(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	d := NewDispatcher(db, log)
 	d.RetrySchedule = schedule
 	d.RetryPoll = 20 * time.Millisecond
 	d.Start(ctx)
@@ -139,7 +151,8 @@ func TestFailedDeliveryIsQueuedAndRetried(t *testing.T) {
 	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	d := newFastDispatcher(t, db, 10*time.Millisecond, time.Hour)
+	log, recs := logx.Capture()
+	d := newFastDispatcherLog(t, db, log, 10*time.Millisecond, time.Hour)
 
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
 
@@ -155,6 +168,12 @@ func TestFailedDeliveryIsQueuedAndRetried(t *testing.T) {
 	})
 	if rcv.count() < 2 {
 		t.Fatalf("expected a redelivery, got %d hits", rcv.count())
+	}
+
+	for _, want := range []string{"component=events", "delivery attempt", "attempt=1", "decision=\"scheduled retry\"", "decision=delivered"} {
+		if !recs.Contains(want) {
+			t.Errorf("events log missing %q", want)
+		}
 	}
 }
 

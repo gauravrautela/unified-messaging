@@ -45,6 +45,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer db.Close()
+	db.SetLogger(log.With("component", "store"))
 	db.PurgeExpiredOAuthStates()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

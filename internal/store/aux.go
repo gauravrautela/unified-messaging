@@ -191,6 +191,9 @@ type Delivery struct {
 
 // SaveDelivery inserts or replaces a queued delivery.
 func (s *Store) SaveDelivery(d Delivery) error {
+	// payload is a byte count, never content.
+	defer s.trace("SaveDelivery", time.Now(), "delivery_id", d.ID, "webhook_id", d.WebhookID,
+		"account_id", d.AccountID, "attempts", d.Attempts, "dead", d.Dead, "payload_bytes", len(d.Payload))
 	_, err := s.db.Exec(`
 		INSERT INTO webhook_deliveries
 		  (id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at)
@@ -206,10 +209,13 @@ func (s *Store) SaveDelivery(d Delivery) error {
 // DueDeliveries returns live deliveries whose retry time has passed, oldest
 // first.
 func (s *Store) DueDeliveries(now time.Time, limit int) ([]Delivery, error) {
-	return s.queryDeliveries(`
+	start := time.Now()
+	out, err := s.queryDeliveries(`
 		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
 		FROM webhook_deliveries WHERE dead = 0 AND next_attempt_at <= ?
 		ORDER BY next_attempt_at LIMIT ?`, now.Unix(), limit)
+	s.trace("DueDeliveries", start, "limit", limit, "rows", len(out))
+	return out, err
 }
 
 // ListDeliveries returns everything queued or dead for one webhook.

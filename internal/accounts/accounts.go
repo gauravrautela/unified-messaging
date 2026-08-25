@@ -145,13 +145,22 @@ func (m *Manager) AccessToken(ctx context.Context, accountID string, force bool)
 	lock.Lock()
 	defer lock.Unlock()
 
+	// Token values never appear here; only whether one was held, and for how
+	// much longer it would have been valid.
+	log := logx.From(ctx).With("component", "accounts", "account_id", accountID)
+
 	rec, err := m.store.GetTokens(accountID)
 	if err != nil {
 		return "", err
 	}
 	if !force && rec.AccessToken != "" && time.Now().Before(rec.AccessExpiresAt) {
+		log.Debug("token decision", "decision", "cached", "forced", force,
+			"expires_in", time.Until(rec.AccessExpiresAt).Round(time.Second))
 		return rec.AccessToken, nil
 	}
+	log.Debug("token decision", "decision", "refreshing", "forced", force,
+		"had_access_token", rec.AccessToken != "",
+		"expires_in", time.Until(rec.AccessExpiresAt).Round(time.Second))
 
 	acct, err := m.store.GetAnyAccount(accountID)
 	if err != nil {
@@ -169,6 +178,7 @@ func (m *Manager) AccessToken(ctx context.Context, accountID string, force bool)
 
 	tok, err := p.Auth().Refresh(ctx, refresh)
 	if err != nil {
+		log.Warn("token refresh failed", "err", err)
 		if errors.Is(err, provider.ErrReauthRequired) {
 			m.markCredentials(accountID)
 		}
@@ -182,6 +192,7 @@ func (m *Manager) AccessToken(ctx context.Context, accountID string, force bool)
 	if err := m.persist(accountID, tok); err != nil {
 		return "", err
 	}
+	log.Info("token refreshed", "expires_at", tok.ExpiresAt, "rotated", tok.RefreshToken != refresh)
 	return tok.AccessToken, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -18,7 +19,25 @@ var ErrNotFound = errors.New("not found")
 
 var ErrPreTenancy = errors.New("database predates multi-tenancy")
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db *sql.DB
+	// log is nil until SetLogger is called. Tests never set it, so the store
+	// stays silent unless a process wires one in.
+	log *slog.Logger
+}
+
+// SetLogger attaches the logger the hot query paths trace to. Pass one already
+// tagged with component=store.
+func (s *Store) SetLogger(l *slog.Logger) { s.log = l }
+
+// trace records one query at DEBUG: which operation, how long it took, and the
+// ids involved. Never called with a token, secret, or hash column.
+func (s *Store) trace(op string, start time.Time, kv ...any) {
+	if s.log == nil {
+		return
+	}
+	s.log.Debug("query", append([]any{"op", op, "dur", time.Since(start).Round(time.Microsecond)}, kv...)...)
+}
 
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
@@ -113,6 +132,7 @@ const accountSelect = `
 // by another developer is ErrNotFound, not an authorization error, so ids
 // cannot be probed across tenants.
 func (s *Store) GetAccount(developerID, id string) (model.Account, error) {
+	defer s.trace("GetAccount", time.Now(), "developer_id", developerID, "account_id", id)
 	return scanAccount(s.db.QueryRow(accountSelect+` WHERE developer_id = ? AND id = ?`, developerID, id))
 }
 
@@ -292,6 +312,7 @@ func (s *Store) SetCursor(accountID, scopeID, cursor string) error {
 // UpsertEmail is deliberately idempotent: Graph delta replays the same message
 // across rounds, so every write path has to tolerate seeing it again.
 func (s *Store) UpsertEmail(e model.Email) error {
+	defer s.trace("UpsertEmail", time.Now(), "account_id", e.AccountID, "email_id", e.ID)
 	to, _ := json.Marshal(e.To)
 	cc, _ := json.Marshal(e.Cc)
 	bcc, _ := json.Marshal(e.Bcc)
@@ -356,7 +377,14 @@ type EmailQuery struct {
 	Offset    int
 }
 
-func (s *Store) ListEmails(q EmailQuery) ([]model.Email, error) {
+func (s *Store) ListEmails(q EmailQuery) (result []model.Email, err error) {
+	start := time.Now()
+	// Search text is a caller-supplied string; only its presence is recorded.
+	defer func() {
+		s.trace("ListEmails", start, "account_id", q.AccountID, "folder_id", q.FolderID,
+			"search", q.Search != "", "rows", len(result))
+	}()
+
 	where := []string{"account_id = ?"}
 	args := []any{q.AccountID}
 	if q.FolderID != "" {
