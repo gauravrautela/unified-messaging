@@ -13,18 +13,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/auth"
+	"github.com/gauravrautela/unified-messaging/internal/chatsync"
 	"github.com/gauravrautela/unified-messaging/internal/config"
 	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
+	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
 )
 
-func newTestServerWithLog(t *testing.T) (*Server, *store.Store, *logx.Records) {
+// newTestServerCore is the one real constructor: every other test-server
+// helper is a thin wrapper choosing what to keep. FAKECHAT rides alongside
+// Outlook so hosted-auth, the connect page and the QR endpoints can all be
+// exercised against a real (if scripted) Linker/Chatter without a network.
+func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store, *logx.Records) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
 	if err != nil {
@@ -39,16 +46,75 @@ func newTestServerWithLog(t *testing.T) (*Server, *store.Store, *logx.Records) {
 	}
 	log, recs := logx.Capture()
 	a := outlook.NewAuth(cfg.ClientID, "", cfg.Tenant, cfg.RedirectURI, cfg.Scopes)
-	registry := provider.NewRegistry(outlook.New(a, stubTokens{}))
+	fakeChat := providertest.NewFakeChat("FAKECHAT")
+	registry := provider.NewRegistry(outlook.New(a, stubTokens{}), fakeChat)
+	acctMgr := accounts.NewManager(db, make([]byte, 32), log)
+	acctMgr.SetRegistry(registry)
 	disp := events.NewDispatcher(db, log)
-	sync := syncer.New(db, registry, nil, disp, log, syncer.Options{PollInterval: time.Hour})
+	sync := syncer.New(db, registry, acctMgr, disp, log, syncer.Options{PollInterval: time.Hour})
 	authSvc := auth.New(db, log, cfg.SessionTTL)
-	return NewServer(cfg, db, registry, nil, sync, authSvc, log), db, recs
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	chat := chatsync.New(db, registry, acctMgr, disp, log, chatsync.Options{MaxAccounts: maxChatAccounts})
+	chat.Start(ctx)
+
+	srv := NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, disp, log)
+	srv.fakeChat = fakeChat
+	return srv, db, recs
+}
+
+func newTestServerWithLog(t *testing.T) (*Server, *store.Store, *logx.Records) {
+	return newTestServerCore(t, 10)
 }
 
 func newTestServer(t *testing.T) (*Server, *store.Store) {
 	s, db, _ := newTestServerWithLog(t)
 	return s, db
+}
+
+// newTestServerWithChatCapacity is for tests that need to exhaust the chat
+// runtime's connection ceiling on purpose.
+func newTestServerWithChatCapacity(t *testing.T, maxChatAccounts int) (*Server, *store.Store) {
+	s, db, _ := newTestServerCore(t, maxChatAccounts)
+	return s, db
+}
+
+// waitFor polls cond until it is true or the deadline passes, for assertions
+// against state a background goroutine (the link pump, the chat actor)
+// updates asynchronously.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal("condition not met")
+}
+
+// seedChat links a fake chat account under devID, attaches it to the runtime,
+// and gives it one chat with one attendee — the minimum a chat-facing test
+// needs to have something to read. It also fills one slot of chat capacity,
+// which is exactly what the over-capacity test wants.
+func seedChat(t *testing.T, s *Server, db *store.Store, devID string) string {
+	t.Helper()
+	acct, err := s.accts.ConnectLinked(context.Background(), devID, "FAKECHAT",
+		provider.Identity{Identifier: "+919900000000", Name: "Seed"}, "j-seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.chat.Attach(acct.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return s.fakeChat.Sink(acct.ID) != nil })
+	if err := db.UpsertChat(model.Chat{ID: "c1", AccountID: acct.ID, Kind: "direct"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAttendee(model.Attendee{ID: "a1", Phone: "+919900000000", Name: "Seed"}, acct.ID); err != nil {
+		t.Fatal(err)
+	}
+	return acct.ID
 }
 
 type stubTokens struct{}
@@ -1038,5 +1104,138 @@ func TestLLMsTxtIsPublicMarkdownCoveringEveryRoute(t *testing.T) {
 	s.Routes().ServeHTTP(docs, httptest.NewRequest(http.MethodGet, "/docs", nil))
 	if !strings.Contains(docs.Body.String(), `href="/llms.txt"`) {
 		t.Error("/docs does not link to /llms.txt")
+	}
+}
+
+func TestLinkerConnectPageRequiresConsentThenServesQR(t *testing.T) {
+	s, db := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	mint := func(body string) string {
+		req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("hosted-auth: %d %s", rec.Code, rec.Body.String())
+		}
+		var r hostedAuthResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &r)
+		return r.State
+	}
+	state := mint(`{"provider":"FAKECHAT","notify_url":"https://api.example.com/hook","webhook":{"url":"https://api.example.com/wa"}}`)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state, nil))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `name="consent"`) || strings.Contains(rec.Body.String(), "login.microsoftonline.com") {
+		t.Fatalf("linker page: %d %s", rec.Code, rec.Body.String()[:200])
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("qr before consent: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+state+"/consent", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("consent: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+	var q struct {
+		Status string `json:"status"`
+		PNG    string `json:"png_base64"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &q)
+	if rec.Code != 200 || q.Status != "waiting" {
+		t.Fatalf("first qr poll: %d %+v", rec.Code, q)
+	}
+	s.fakeChat.EmitCode("qr-abc")
+	waitFor(t, func() bool {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+		_ = json.Unmarshal(rec.Body.Bytes(), &q)
+		return q.PNG != ""
+	})
+	// Pair -> account under the minting developer, notify + webhook bound, state consumed.
+	notified := make(chan map[string]any, 1)
+	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
+	s.fakeChat.Pair(provider.Identity{Identifier: "+919888000000", Name: "G"}, "919888000000:5@s.whatsapp.net")
+	waitFor(t, func() bool {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+		_ = json.Unmarshal(rec.Body.Bytes(), &q)
+		return q.Status == "paired"
+	})
+	dev, _, _ := db.DeveloperByEmail("a@x.com")
+	accts, _ := db.ListAccounts(dev.ID)
+	if len(accts) != 1 || accts[0].Kind != model.AccountKindChat || accts[0].Identifier != "+919888000000" {
+		t.Fatalf("accounts = %+v", accts)
+	}
+	select {
+	case p := <-notified:
+		if p["status"] != "CREATED" || p["account_id"] != accts[0].ID {
+			t.Fatalf("notify = %v", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("notify_url not called")
+	}
+	hooks, _ := db.ListAccountWebhooks(dev.ID, accts[0].ID)
+	if len(hooks) != 1 {
+		t.Fatalf("connect-time webhook not bound: %+v", hooks)
+	}
+	if _, err := db.PeekOAuthState(state); err == nil {
+		t.Fatal("state not consumed")
+	}
+	if _, ok := s.chat.HealthFor(accts[0].ID); !ok {
+		t.Fatal("runtime did not attach the new account")
+	}
+}
+
+func TestLinkTimeoutNotifiesFailed(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT","notify_url":"https://api.example.com/hook"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+	notified := make(chan map[string]any, 1)
+	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	s.fakeChat.FailLink(provider.ErrLinkTimeout)
+	select {
+	case p := <-notified:
+		if p["status"] != "FAILED" || p["error"] != "link_timeout" {
+			t.Fatalf("notify = %v", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("FAILED not notified")
+	}
+}
+
+func TestHostedAuthReturnsCapacityWhenRuntimeFull(t *testing.T) {
+	s, db := newTestServerWithChatCapacity(t, 1) // same as newTestServer but chatsync.Options{MaxAccounts: 1}
+	dev, key := seedDev(t, s, "a@x.com")
+	_ = seedChat(t, s, db, dev.ID) // links + attaches one account -> runtime full
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "capacity") {
+		t.Fatalf("over capacity: %d %s", rec.Code, rec.Body.String())
+	}
+	// Mail providers are unaffected by chat capacity.
+	req = withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"OUTLOOK"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mail hosted-auth under chat capacity: %d", rec.Code)
 	}
 }

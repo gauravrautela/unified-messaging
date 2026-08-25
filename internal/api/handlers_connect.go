@@ -100,10 +100,27 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pkce, err := provider.NewPKCE()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+	// Chat providers hold one live socket per account for as long as it stays
+	// connected, unlike a mail grant that costs nothing between syncs. Once
+	// this process is already serving as many as it is configured for, a new
+	// pairing attempt would either be refused at Attach time after the user
+	// has already scanned a code, or would silently evict someone else's
+	// connection — so it is refused here, before any QR is ever shown.
+	if p.Linker() != nil && s.chat != nil && s.chat.Count() >= s.chat.Max() {
+		writeError(w, http.StatusServiceUnavailable, "capacity", "connection capacity reached; try again later")
 		return
+	}
+
+	// PKCE only matters for the OAuth authorize/exchange dance; a Linker
+	// provider has no authorize URL for a challenge to protect.
+	var verifier string
+	if p.Linker() == nil {
+		pkce, err := provider.NewPKCE()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", err.Error())
+			return
+		}
+		verifier = pkce.Verifier
 	}
 	state, err := provider.RandomString(24)
 	if err != nil {
@@ -116,7 +133,7 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 		State:       state,
 		DeveloperID: dev.ID,
 		Provider:    p.Name(),
-		Verifier:    pkce.Verifier,
+		Verifier:    verifier,
 		SuccessURL:  req.SuccessRedirectURL,
 		FailureURL:  req.FailureRedirectURL,
 		NotifyURL:   req.NotifyURL,
@@ -141,13 +158,35 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// resolveProvider accepts an explicit name, or falls back to the only
-// registered provider when the caller did not choose.
+// resolveProvider accepts an explicit name, or falls back to a default when
+// the caller did not choose.
+//
+// The fallback only ever picks a mail provider: historically, before a chat
+// provider existed at all, an unnamed hosted-auth call meant "the one mail
+// backend", and every integrator's existing code depends on that. Pairing a
+// phone number is also the kind of thing a caller should always ask for by
+// name — there is no sense in which a bare hosted-auth call could mean
+// "whichever chat provider happens to be registered" the way it can for mail.
 func (s *Server) resolveProvider(name string) (provider.Provider, error) {
-	if name == "" {
-		return s.registry.Default()
+	if name != "" {
+		return s.registry.Get(strings.ToUpper(name))
 	}
-	return s.registry.Get(strings.ToUpper(name))
+	var mail provider.Provider
+	nMail := 0
+	for _, n := range s.registry.Names() {
+		p, err := s.registry.Get(n)
+		if err != nil {
+			continue
+		}
+		if p.Kind() == model.AccountKindMail {
+			mail = p
+			nMail++
+		}
+	}
+	if nMail == 1 {
+		return mail, nil
+	}
+	return s.registry.Default()
 }
 
 // handleConnectRedirect shows the end user a branded landing page before
@@ -178,6 +217,16 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		renderMessage(w, http.StatusInternalServerError, "Provider unavailable",
 			"This connection link refers to a backend that is no longer configured.")
+		return
+	}
+
+	// A chat provider has no authorize URL at all — Auth() is nil for it — so
+	// this must branch before ever calling it.
+	if p.Linker() != nil {
+		renderLink(w, linkPageData{
+			Provider: displayName(p.Name()),
+			State:    state,
+		})
 		return
 	}
 
@@ -313,6 +362,10 @@ func (s *Server) failConnect(w http.ResponseWriter, r *http.Request, pending sto
 }
 
 func (s *Server) notify(target string, payload map[string]any) {
+	if s.notifyTransport != nil {
+		s.notifyTransport(target, payload)
+		return
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return

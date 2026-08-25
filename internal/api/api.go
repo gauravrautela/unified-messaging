@@ -15,27 +15,49 @@ import (
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/auth"
+	"github.com/gauravrautela/unified-messaging/internal/chatsync"
 	"github.com/gauravrautela/unified-messaging/internal/config"
+	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
+	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
 )
 
 type Server struct {
-	cfg      *config.Config
-	store    *store.Store
-	registry *provider.Registry
-	accts    *accounts.Manager
-	syncer   *syncer.Syncer
-	auth     *auth.Service
-	log      *slog.Logger
+	cfg        *config.Config
+	store      *store.Store
+	registry   *provider.Registry
+	accts      *accounts.Manager
+	syncer     *syncer.Syncer
+	auth       *auth.Service
+	chat       *chatsync.Runtime
+	dispatcher *events.Dispatcher
+	log        *slog.Logger
+
+	// links tracks in-flight QR pairing attempts, keyed by connect state.
+	links *linkRegistry
+
+	// notifyTransport, when set, replaces the HTTP POST notify() would
+	// otherwise make. Tests use it to observe notify_url payloads without a
+	// real listener; production leaves it nil.
+	notifyTransport func(url string, payload map[string]any)
+
+	// fakeChat is wired only by the test harness, so it can drive a scripted
+	// chat provider's link sessions directly. Always nil in production.
+	fakeChat *providertest.FakeChat
 }
 
-func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry,
-	a *accounts.Manager, sy *syncer.Syncer, au *auth.Service, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, store: s, registry: reg, accts: a, syncer: sy, auth: au, log: log}
+func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry, a *accounts.Manager,
+	sy *syncer.Syncer, au *auth.Service, chat *chatsync.Runtime, dispatcher *events.Dispatcher, log *slog.Logger) *Server {
+	srv := &Server{
+		cfg: cfg, store: s, registry: reg, accts: a, syncer: sy, auth: au,
+		chat: chat, dispatcher: dispatcher, log: log, links: newLinkRegistry(),
+	}
+	go srv.sweepLinks()
+	return srv
 }
 
 const sessionCookie = "um_session"
@@ -95,6 +117,8 @@ func (s *Server) Routes() http.Handler {
 
 	// --- connection flow (browser-facing; no API key) ---
 	mux.HandleFunc("GET /connect/{state}", s.handleConnectRedirect)
+	mux.HandleFunc("POST /connect/{state}/consent", s.handleConsent)
+	mux.HandleFunc("GET /connect/{state}/qr", s.handleLinkQR)
 	mux.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
 
 	// --- developer sign-in (form posts, cookie session) ---

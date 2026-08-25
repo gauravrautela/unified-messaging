@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS oauth_states (
   notify_url     TEXT NOT NULL DEFAULT '',
   webhook_json   TEXT NOT NULL DEFAULT '',
   created_at     INTEGER NOT NULL,
-  expires_at     INTEGER NOT NULL
+  expires_at     INTEGER NOT NULL,
+  consented_at   INTEGER
 );
 
 -- Failed webhook deliveries waiting for a retry. A row is removed on success,
@@ -236,4 +237,5 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 // column existed. Each is safe to re-run: "duplicate column" is ignored.
 var migrations = []string{
 	`ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'mail'`,
+	`ALTER TABLE oauth_states ADD COLUMN consented_at INTEGER`,
 }

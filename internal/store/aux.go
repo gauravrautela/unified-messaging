@@ -272,6 +272,11 @@ type OAuthState struct {
 	// created by the callback.
 	Webhook   *PendingWebhook
 	ExpiresAt time.Time
+	// ConsentedAt is set once the end user has accepted the linker disclosure
+	// on the connect page. Nil means the QR endpoint must refuse with
+	// consent_required. Mail providers never set this; consent there is
+	// Microsoft's own screen.
+	ConsentedAt *time.Time
 }
 
 // PendingWebhook is a webhook requested at connect time, before the account
@@ -311,22 +316,35 @@ func (s *Store) SaveOAuthState(o OAuthState) error {
 	return err
 }
 
+// SetOAuthConsent records that the end user accepted the linker disclosure on
+// the connect page, which is what /connect/{state}/qr requires before it will
+// start a pairing session.
+func (s *Store) SetOAuthConsent(state string, at time.Time) error {
+	_, err := s.db.Exec(`UPDATE oauth_states SET consented_at = ? WHERE state = ?`, at.Unix(), state)
+	return err
+}
+
 // TakeOAuthState consumes the state single-use, which is what makes it a real
 // CSRF defence rather than decoration.
 func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 	var o OAuthState
 	var exp int64
 	var wh string
+	var consented sql.NullInt64
 	err := s.db.QueryRow(`
-		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
+		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
+		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented)
 	o.Webhook = decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
 	if err != nil {
 		return o, err
+	}
+	if consented.Valid {
+		t := time.Unix(consented.Int64, 0).UTC()
+		o.ConsentedAt = &t
 	}
 	if _, err := s.db.Exec(`DELETE FROM oauth_states WHERE state = ?`, state); err != nil {
 		return o, err
@@ -349,13 +367,18 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 	var o OAuthState
 	var exp int64
 	var wh string
+	var consented sql.NullInt64
 	err := s.db.QueryRow(`
-		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
+		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
+		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented)
 	o.Webhook = decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
+	}
+	if consented.Valid {
+		t := time.Unix(consented.Int64, 0).UTC()
+		o.ConsentedAt = &t
 	}
 	o.ExpiresAt = time.Unix(exp, 0).UTC()
 	return o, err

@@ -16,6 +16,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/api"
 	"github.com/gauravrautela/unified-messaging/internal/auth"
+	"github.com/gauravrautela/unified-messaging/internal/chatsync"
 	"github.com/gauravrautela/unified-messaging/internal/config"
 	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -90,9 +91,14 @@ func run(log *slog.Logger) error {
 	sync := syncer.New(db, registry, acctMgr, dispatcher, log, opts)
 	sync.Start(ctx)
 
+	// Full wiring of chat providers and their configuration is Task 11; this
+	// just gives the API server a live runtime to attach linked accounts to.
+	chat := chatsync.New(db, registry, acctMgr, dispatcher, log, chatsync.Options{MaxAccounts: 200})
+	chat.Start(ctx)
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, authSvc, log).Routes(),
+		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, dispatcher, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -125,6 +131,7 @@ func run(log *slog.Logger) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("http shutdown", "err", err)
 	}
+	chat.Wait()
 	dispatcher.Wait()
 	return nil
 }
