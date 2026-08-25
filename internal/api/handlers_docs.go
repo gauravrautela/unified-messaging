@@ -99,7 +99,7 @@ footer{margin-top:3rem;color:var(--muted);font-size:.85rem}
 <main>
 
 <h1>API integration guide</h1>
-<p class="sub">Everything an integrator needs to connect end users&rsquo; mailboxes, read and send mail through one API, and receive webhooks when new mail arrives. Base URL for this deployment: <code>{{.Base}}</code>.</p>
+<p class="sub">Everything an integrator needs to connect end users&rsquo; mailboxes, read and send mail through one API, and receive webhooks when new mail arrives. Base URL for this deployment: <code>{{.Base}}</code>. Building with an AI assistant? Give it <a href="/llms.txt"><code>/llms.txt</code></a> &mdash; the same guide as exact, machine-readable Markdown.</p>
 
 <h2 id="overview">1. Overview</h2>
 <p>The service sits between your application and your users&rsquo; mail providers (Outlook / Microsoft 365 today). You never see a provider payload &mdash; every message, folder and event comes back in one normalized shape.</p>

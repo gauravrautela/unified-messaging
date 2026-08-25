@@ -107,6 +107,7 @@ func (s *Server) Routes() http.Handler {
 	// --- account management + mail viewer UI (server-side session-gated; see handlers_auth.go) ---
 	// --- public integration guide ---
 	mux.HandleFunc("GET /docs", s.handleDocs)
+	mux.HandleFunc("GET /llms.txt", s.handleLLMsTxt)
 
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /mail", s.handleMailPage)

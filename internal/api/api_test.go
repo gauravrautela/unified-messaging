@@ -1007,3 +1007,36 @@ func TestDashboardAndMailLinkToDocs(t *testing.T) {
 		}
 	}
 }
+
+// llms.txt is the machine-readable twin of /docs: plain Markdown, public,
+// exact shapes, every route named.
+func TestLLMsTxtIsPublicMarkdownCoveringEveryRoute(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/llms.txt", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/markdown") {
+		t.Fatalf("content-type = %q, want text/markdown", ct)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<html") || strings.Contains(body, "<div") {
+		t.Fatal("llms.txt must not contain HTML")
+	}
+	for _, route := range apiRoutes {
+		if !strings.Contains(body, route) {
+			t.Errorf("llms.txt does not mention %q", route)
+		}
+	}
+	for _, want := range []string{"# ", "Authorization: Bearer", "X-Outlook-Signature", "mail_received", "session_required", "account_id"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("llms.txt missing %q", want)
+		}
+	}
+	docs := httptest.NewRecorder()
+	s.Routes().ServeHTTP(docs, httptest.NewRequest(http.MethodGet, "/docs", nil))
+	if !strings.Contains(docs.Body.String(), `href="/llms.txt"`) {
+		t.Error("/docs does not link to /llms.txt")
+	}
+}
