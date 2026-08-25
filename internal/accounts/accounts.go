@@ -42,7 +42,10 @@ type Manager struct {
 }
 
 func NewManager(s *store.Store, key []byte, log *slog.Logger) *Manager {
-	return &Manager{store: s, key: key, log: log, locks: map[string]*sync.Mutex{}}
+	// Tagged once, so every line this package writes off m.log carries its
+	// component without repeating the attribute at each call site.
+	return &Manager{store: s, key: key, log: log.With("component", "accounts"),
+		locks: map[string]*sync.Mutex{}}
 }
 
 // SetRegistry completes the wiring. It must be called before any Graph or
@@ -147,7 +150,11 @@ func (m *Manager) AccessToken(ctx context.Context, accountID string, force bool)
 
 	// Token values never appear here; only whether one was held, and for how
 	// much longer it would have been valid.
-	log := logx.From(ctx).With("component", "accounts", "account_id", accountID)
+	//
+	// Only component is added: the ids (run_id/request_id, account_id,
+	// developer_id) are already on the context logger, put there by whoever
+	// started the run or the request, and re-adding them would emit duplicates.
+	log := logx.From(ctx).With("component", "accounts")
 
 	rec, err := m.store.GetTokens(accountID)
 	if err != nil {

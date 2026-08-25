@@ -307,6 +307,43 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	if recs.Contains("test-token") {
 		t.Error("access token leaked into sync log")
 	}
+
+	// A failing run must be traceable to the run it belongs to.
+	s.runOnce(ctx, "acc_missing")
+	failed := ""
+	for _, l := range recs.All() {
+		if strings.Contains(l, "sync failed") {
+			failed = l
+		}
+	}
+	if failed == "" || !strings.Contains(failed, "run_id=") {
+		t.Errorf("sync failed line missing run_id: %q", failed)
+	}
+	if started := lineWith(recs, "sync run started"); !strings.Contains(started, "run_id=") {
+		t.Errorf("sync run started line missing run_id: %q", started)
+	}
+
+	// One line, one component: the context logger carries ids only, so a Graph
+	// or store line inside a sync must not print component twice.
+	for _, l := range recs.All() {
+		if n := strings.Count(l, "component="); n != 1 {
+			t.Errorf("line has %d component attributes, want 1: %s", n, strings.TrimSpace(l))
+		}
+		if n := strings.Count(l, "account_id="); n > 1 {
+			t.Errorf("line has %d account_id attributes, want at most 1: %s", n, strings.TrimSpace(l))
+		}
+	}
+}
+
+// lineWith returns the last captured line containing sub, or "".
+func lineWith(recs *logx.Records, sub string) string {
+	out := ""
+	for _, l := range recs.All() {
+		if strings.Contains(l, sub) {
+			out = l
+		}
+	}
+	return out
 }
 
 // A second wakeup while a sync is running must collapse into one follow-up run

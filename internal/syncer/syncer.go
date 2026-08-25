@@ -62,6 +62,7 @@ type Syncer struct {
 	accts    *accounts.Manager
 	events   *events.Dispatcher
 	log      *slog.Logger
+	base     *slog.Logger
 	opts     Options
 
 	wake chan string
@@ -77,7 +78,14 @@ func New(s *store.Store, reg *provider.Registry, a *accounts.Manager,
 		opts.PollInterval = 2 * time.Minute
 	}
 	return &Syncer{
-		store: s, registry: reg, accts: a, events: e, log: log, opts: opts,
+		// log is tagged once, so every line this package writes carries
+		// component=syncer without repeating the attribute at each call site.
+		// base is the untagged logger that goes into the context: a context
+		// logger carries correlation ids only and never a component, so a
+		// downstream package (outlook, accounts, store) can tag its own without
+		// emitting two component attributes on one line.
+		store: s, registry: reg, accts: a, events: e,
+		log: log.With("component", "syncer"), base: log, opts: opts,
 		wake:     make(chan string, 256),
 		inflight: map[string]bool{},
 		pending:  map[string]bool{},
@@ -134,8 +142,11 @@ func (s *Syncer) runOnce(ctx context.Context, accountID string) {
 	s.inflight[accountID] = true
 	s.mu.Unlock()
 
-	if err := s.SyncAccount(ctx, accountID); err != nil {
-		s.log.Error("sync failed", "account_id", accountID, "err", err)
+	// The run id is minted here rather than inside the run, so this ERROR line
+	// carries the same run_id as the run's own trail.
+	runID := newRunID()
+	if err := s.syncAccount(ctx, accountID, runID); err != nil {
+		s.log.Error("sync failed", "run_id", runID, "account_id", accountID, "err", err)
 	}
 
 	s.mu.Lock()
@@ -169,7 +180,7 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 					s.Wake(a.ID)
 				}
 			}
-			s.log.Debug("poll tick", "component", "syncer", "accounts", len(accts), "ok", n)
+			s.log.Debug("poll tick", "accounts", len(accts), "ok", n)
 		}
 	}
 }
@@ -183,13 +194,21 @@ func (s *Syncer) mailboxFor(acct model.Account) (provider.Mailbox, error) {
 	return p.Mailbox(), nil
 }
 
+// newRunID mints the id that ties every line of one sync run together, the way
+// request_id does for a request.
+func newRunID() string {
+	return "run_" + strings.TrimPrefix(logx.NewRequestID(), "req_")
+}
+
 // SyncAccount brings one account up to date: discover scopes, then walk each.
 func (s *Syncer) SyncAccount(ctx context.Context, accountID string) error {
-	// One id ties every line of a run together, the way request_id does for a
-	// request, so a run can be read end to end out of a busy log.
-	runID := "run_" + strings.TrimPrefix(logx.NewRequestID(), "req_")
-	log := s.log.With("component", "syncer", "run_id", runID, "account_id", accountID)
-	ctx = logx.With(ctx, log)
+	return s.syncAccount(ctx, accountID, newRunID())
+}
+
+func (s *Syncer) syncAccount(ctx context.Context, accountID, runID string) error {
+	ids := []any{"run_id", runID, "account_id", accountID}
+	log := s.log.With(ids...)
+	ctx = logx.With(ctx, s.base.With(ids...))
 	start := time.Now()
 	log.Info("sync run started")
 	defer func() { log.Info("sync run finished", "dur", time.Since(start).Round(time.Millisecond)) }()
@@ -202,8 +221,9 @@ func (s *Syncer) SyncAccount(ctx context.Context, accountID string) error {
 		log.Debug("skipping sync for non-OK account", "status", acct.Status)
 		return nil
 	}
-	log = log.With("developer_id", acct.DeveloperID, "provider", acct.Provider)
-	ctx = logx.With(ctx, log)
+	ids = append(ids, "developer_id", acct.DeveloperID, "provider", acct.Provider)
+	log = s.log.With(ids...)
+	ctx = logx.With(ctx, s.base.With(ids...))
 	mailbox, err := s.mailboxFor(acct)
 	if err != nil {
 		return err
@@ -243,7 +263,7 @@ func (s *Syncer) syncScopes(ctx context.Context, mailbox provider.Mailbox, accou
 		return nil, err
 	}
 
-	log := logx.From(ctx)
+	log := logx.From(ctx).With("component", "syncer")
 	log.Debug("scope listing", "cursor_present", cursor != "")
 
 	set, err := mailbox.SyncScopes(ctx, accountID, cursor)
@@ -302,7 +322,8 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 		since = time.Now().Add(-s.opts.BackfillWindow)
 	}
 
-	log := logx.From(ctx).With("scope", scope.Name, "scope_id", scope.ID, "role", scope.Role)
+	log := logx.From(ctx).With("component", "syncer",
+		"scope", scope.Name, "scope_id", scope.ID, "role", scope.Role)
 	log.Debug("scope decision", "cursor_present", cursor != "", "initial", initial,
 		"first_run", firstRun, "since", since)
 
@@ -404,7 +425,7 @@ func (s *Syncer) attachAttachments(ctx context.Context, mailbox provider.Mailbox
 	if !e.HasAttachments || len(e.Attachments) > 0 {
 		return
 	}
-	log := logx.From(ctx)
+	log := logx.From(ctx).With("component", "syncer")
 	log.Debug("attachment fetch", "email_id", e.ID)
 	atts, err := mailbox.ListAttachments(ctx, e.AccountID, e.ID)
 	if err != nil {

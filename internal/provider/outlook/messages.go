@@ -40,7 +40,8 @@ func (c *Client) SyncMessages(ctx context.Context, accountID string, scope provi
 		}
 	}
 
-	log := logx.From(ctx).With("component", "outlook", "account_id", accountID, "scope_id", scope.ID)
+	// component plus the one id the context cannot already know; see do().
+	log := logx.From(ctx).With("component", "outlook", "scope_id", scope.ID)
 	for pageNum := 1; next != ""; pageNum++ {
 		var page messagesPage
 		err := c.do(ctx, accountID, request{

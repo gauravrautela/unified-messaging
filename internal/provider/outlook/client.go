@@ -92,7 +92,12 @@ func (c *Client) do(ctx context.Context, accountID string, r request) error {
 	const maxAttempts = 4
 	forceRefresh := false
 	// The Authorization header set below is never logged, at any level.
-	log := logx.From(ctx).With("component", "outlook", "account_id", accountID)
+	//
+	// Only component is added here. The context logger already carries the
+	// correlation ids for whatever started this call — run_id and account_id
+	// for a sync, request_id and developer_id for an API request — and slog
+	// does not deduplicate, so re-adding them would print each one twice.
+	log := logx.From(ctx).With("component", "outlook")
 
 	for attempt := 1; ; attempt++ {
 		token, err := c.tokens.AccessToken(ctx, accountID, forceRefresh)

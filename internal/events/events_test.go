@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -175,6 +176,27 @@ func TestFailedDeliveryIsQueuedAndRetried(t *testing.T) {
 			t.Errorf("events log missing %q", want)
 		}
 	}
+
+	// Every delivery line, including the failures, carries the correlation set.
+	attempt := lineWith(recs, "delivery attempt")
+	if !strings.Contains(attempt, "account_id=acc_1") || !strings.Contains(attempt, "developer_id=dev_1") {
+		t.Errorf("delivery attempt line missing tenant ids: %q", attempt)
+	}
+	failed := lineWith(recs, "webhook delivery failed")
+	if !strings.Contains(failed, "delivery_id=") {
+		t.Errorf("failed delivery line missing delivery_id: %q", failed)
+	}
+}
+
+// lineWith returns the last captured line containing sub, or "".
+func lineWith(recs *logx.Records, sub string) string {
+	out := ""
+	for _, l := range recs.All() {
+		if strings.Contains(l, sub) {
+			out = l
+		}
+	}
+	return out
 }
 
 func TestDeliveryIsDeadAfterScheduleExhausted(t *testing.T) {

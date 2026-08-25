@@ -41,14 +41,14 @@ func (s *Syncer) subscriptionLoop(ctx context.Context) {
 }
 
 func (s *Syncer) reconcileSubscriptions(ctx context.Context) {
-	log := s.log.With("component", "syncer")
-	ctx = logx.With(ctx, log)
+	// The context gets the untagged logger: ids travel on it, components do not.
+	ctx = logx.With(ctx, s.base)
 	accts, err := s.store.ListAllAccounts()
 	if err != nil {
-		log.Error("listing accounts for subscription reconcile", "err", err)
+		s.log.Error("listing accounts for subscription reconcile", "err", err)
 		return
 	}
-	log.Debug("subscription reconcile", "accounts", len(accts))
+	s.log.Debug("subscription reconcile", "accounts", len(accts))
 	for _, a := range accts {
 		if a.Status != model.AccountOK {
 			continue
@@ -81,9 +81,13 @@ func (s *Syncer) EnsureSubscription(ctx context.Context, accountID string) error
 	}
 	// clientState is deliberately absent from every line below: it is the shared
 	// secret that authenticates inbound notifications.
-	log := logx.From(ctx).With("component", "syncer", "account_id", accountID,
-		"developer_id", acct.DeveloperID, "provider", acct.Provider)
-	ctx = logx.With(ctx, log)
+	//
+	// This is where the account first becomes known on this path, so the ids go
+	// onto the context logger here and nowhere downstream; component is added
+	// only to the local logger.
+	ctx = logx.With(ctx, logx.From(ctx).With("account_id", accountID,
+		"developer_id", acct.DeveloperID, "provider", acct.Provider))
+	log := logx.From(ctx).With("component", "syncer")
 
 	existing, err := s.store.SubscriptionsForAccount(accountID)
 	if err != nil {
@@ -141,7 +145,7 @@ func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName
 		return err
 	}
 
-	logx.From(ctx).Info("created subscription",
+	logx.From(ctx).With("component", "syncer").Info("created subscription",
 		"subscription_id", sub.ID, "resource", sub.Resource, "expires_at", sub.ExpiresAt)
 	return s.store.SaveSubscription(store.Subscription{
 		ID: sub.ID, AccountID: accountID, Resource: sub.Resource,
@@ -155,7 +159,7 @@ func (s *Syncer) adoptExisting(ctx context.Context, accountID string, pusher pro
 		return err
 	}
 	for _, r := range remote {
-		logx.From(ctx).Info("adopting pre-existing subscription",
+		logx.From(ctx).With("component", "syncer").Info("adopting pre-existing subscription",
 			"account_id", accountID, "subscription_id", r.ID,
 			"resource", r.Resource, "expires_at", r.ExpiresAt)
 		// The clientState of a subscription we did not create is unrecoverable,
@@ -183,7 +187,7 @@ func (s *Syncer) HandleNotifications(ctx context.Context, providerName string, r
 		return err
 	}
 
-	log := s.log.With("component", "syncer", "provider", providerName)
+	log := s.log.With("provider", providerName)
 	log.Debug("notifications received", "bytes", len(raw), "notifications", len(notifications))
 
 	for _, n := range notifications {
@@ -247,7 +251,7 @@ func (s *Syncer) handleLifecycle(ctx context.Context, sub store.Subscription, ac
 	if err != nil || pusher == nil {
 		return err
 	}
-	s.log.Info("lifecycle notification", "component", "syncer",
+	s.log.Info("lifecycle notification",
 		"subscription_id", sub.ID, "account_id", sub.AccountID, "action", action)
 
 	switch action {
@@ -286,7 +290,8 @@ func (s *Syncer) RemoveSubscriptions(ctx context.Context, accountID string) {
 	if err != nil {
 		return
 	}
-	log := logx.From(ctx).With("component", "syncer", "account_id", accountID)
+	ctx = logx.With(ctx, logx.From(ctx).With("account_id", accountID))
+	log := logx.From(ctx).With("component", "syncer")
 	for _, sub := range subs {
 		log.Debug("subscription decision", "decision", "delete",
 			"subscription_id", sub.ID, "resource", sub.Resource,

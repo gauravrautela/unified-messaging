@@ -120,7 +120,8 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 	d.log.Debug("dispatching", "event", ev.Type, "account_id", ev.AccountID, "hooks", len(hooks))
 	for _, h := range hooks {
 		if !subscribes(h, ev.Type) {
-			d.log.Debug("hook skipped", "webhook_id", h.ID, "reason", "event filter")
+			d.log.Debug("hook skipped", "webhook_id", h.ID, "account_id", ev.AccountID,
+				"developer_id", h.DeveloperID, "reason", "event filter")
 			continue
 		}
 		// Encoded per hook: the payload names the hook it went through.
@@ -143,8 +144,8 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 			d.enqueue(dl, err)
 			continue
 		}
-		d.log.Debug("delivery decision", "decision", "delivered",
-			"delivery_id", dl.ID, "webhook_id", h.ID, "event", dl.EventType, "attempts", 1)
+		d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
+			"decision", "delivered", "attempts", 1)
 	}
 }
 
@@ -166,7 +167,9 @@ func (d *Dispatcher) enqueue(dl store.Delivery, cause error) {
 // whether, the next one happens.
 func (d *Dispatcher) schedule(dl store.Delivery, cause error) {
 	dl.LastError = cause.Error()
-	log := d.log.With("delivery_id", dl.ID, "webhook_id", dl.WebhookID, "event", dl.EventType)
+	// developer_id is not reachable from a Delivery alone; the rest of the
+	// correlation set is.
+	log := d.deliveryLog(dl, "")
 	// Attempts counts the tries so far; retry N waits RetrySchedule[N-1].
 	if dl.Attempts-1 < len(d.RetrySchedule) {
 		dl.NextAttemptAt = time.Now().UTC().Add(d.RetrySchedule[dl.Attempts-1])
@@ -175,8 +178,7 @@ func (d *Dispatcher) schedule(dl store.Delivery, cause error) {
 	} else {
 		dl.Dead = true
 		log.Debug("delivery decision", "decision", "dead", "attempts", dl.Attempts)
-		d.log.Error("webhook delivery abandoned",
-			"webhook_id", dl.WebhookID, "event", dl.EventType, "attempts", dl.Attempts, "err", cause)
+		log.Error("webhook delivery abandoned", "attempts", dl.Attempts, "err", cause)
 	}
 	if err := d.store.SaveDelivery(dl); err != nil {
 		d.log.Error("saving delivery for retry", "webhook_id", dl.WebhookID, "err", err)
@@ -202,8 +204,8 @@ func (d *Dispatcher) retryDue(ctx context.Context) {
 		h, err := d.store.GetAnyWebhook(dl.WebhookID)
 		if err != nil {
 			// Hook was removed; the cascade normally handles this, but be safe.
-			d.log.Debug("delivery decision", "decision", "dropped",
-				"delivery_id", dl.ID, "webhook_id", dl.WebhookID, "reason", "webhook gone")
+			d.deliveryLog(dl, "").Debug("delivery decision",
+				"decision", "dropped", "reason", "webhook gone")
 			_ = d.store.DeleteDelivery(dl.ID)
 			continue
 		}
@@ -212,8 +214,8 @@ func (d *Dispatcher) retryDue(ctx context.Context) {
 			d.schedule(dl, err)
 			continue
 		}
-		d.log.Debug("delivery decision", "decision", "delivered",
-			"delivery_id", dl.ID, "webhook_id", h.ID, "event", dl.EventType, "attempts", dl.Attempts)
+		d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
+			"decision", "delivered", "attempts", dl.Attempts)
 		if err := d.store.DeleteDelivery(dl.ID); err != nil {
 			d.log.Error("clearing delivered event", "delivery_id", dl.ID, "err", err)
 		}
@@ -238,7 +240,7 @@ func subscribes(h model.Webhook, eventType string) bool {
 func (d *Dispatcher) post(ctx context.Context, h model.Webhook, dl store.Delivery, attempt int) error {
 	// signed reports only whether a secret exists; the secret itself and the
 	// signature derived from it stay out of the log.
-	log := d.log.With("delivery_id", dl.ID, "webhook_id", h.ID, "event", dl.EventType, "attempt", attempt)
+	log := d.deliveryLog(dl, h.DeveloperID).With("attempt", attempt)
 	log.Debug("delivery attempt", "url", h.URL, "payload_bytes", len(dl.Payload), "signed", h.Secret != "")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL, bytes.NewReader(dl.Payload))
@@ -268,7 +270,17 @@ func (d *Dispatcher) post(ctx context.Context, h model.Webhook, dl store.Deliver
 		log.Debug("delivery response", "status", 0,
 			"dur", time.Since(start).Round(time.Millisecond), "err", err)
 	}
-	d.log.Warn("webhook delivery failed",
-		"webhook_id", h.ID, "url", h.URL, "attempt", attempt, "err", err)
+	log.Warn("webhook delivery failed", "url", h.URL, "err", err)
 	return err
+}
+
+// deliveryLog is the correlation set every line about one delivery carries, so
+// a failure and the retries that follow it can be read as one story.
+func (d *Dispatcher) deliveryLog(dl store.Delivery, developerID string) *slog.Logger {
+	log := d.log.With("delivery_id", dl.ID, "webhook_id", dl.WebhookID,
+		"account_id", dl.AccountID, "event", dl.EventType)
+	if developerID != "" {
+		log = log.With("developer_id", developerID)
+	}
+	return log
 }
