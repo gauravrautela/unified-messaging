@@ -3,22 +3,38 @@
 # request/response pair to a report file.
 #
 #   set -a && source .env && set +a
-#   scripts/smoke.sh [account_id] [report_path]
+#   SMOKE_EMAIL=you@example.com SMOKE_PASSWORD=... scripts/smoke.sh [account_id] [report_path]
 #
-# Sends one email from the account to itself. Requires: curl, python3, API_KEY.
+# Signs up (or logs in) as SMOKE_EMAIL/SMOKE_PASSWORD and mints an API key for
+# the run. That developer needs a mailbox already connected via the dashboard
+# or hosted-auth — log in as them and click Connect account first.
+#
+# Sends one email from the account to itself. Requires: curl, python3.
 set -u
 
 BASE="${BASE_URL:-http://localhost:8080}"
 ACC="${1:-}"
 OUT="${2:-docs/smoke-report.md}"
-: "${API_KEY:?API_KEY is required}"
-AUTH="Authorization: Bearer $API_KEY"
 PASS=0; FAIL=0
+
+SMOKE_EMAIL="${SMOKE_EMAIL:-smoke@example.com}"
+SMOKE_PASSWORD="${SMOKE_PASSWORD:-smoke-test-password}"
+JAR=$(mktemp)
+# Sign up, or log in if this developer already exists.
+code=$(curl -s -o /dev/null -w '%{http_code}' -c "$JAR" -X POST "$BASE/signup" \
+  --data-urlencode "email=$SMOKE_EMAIL" --data-urlencode "password=$SMOKE_PASSWORD")
+if [ "$code" != "303" ]; then
+  curl -s -o /dev/null -c "$JAR" -X POST "$BASE/login" \
+    --data-urlencode "email=$SMOKE_EMAIL" --data-urlencode "password=$SMOKE_PASSWORD"
+fi
+API_KEY=$(curl -s -b "$JAR" -H 'Content-Type: application/json' -d '{"name":"smoke"}' "$BASE/api/v1/api-keys" | python3 -c 'import sys,json; print(json.load(sys.stdin)["key"])')
+[ -n "$API_KEY" ] || { echo "could not mint an API key"; exit 1; }
+AUTH="Authorization: Bearer $API_KEY"
 
 if [ -z "$ACC" ]; then
   ACC=$(curl -s -H "$AUTH" "$BASE/api/v1/accounts" | python3 -c 'import sys,json; i=json.load(sys.stdin)["items"]; print(i[0]["id"] if i else "")')
 fi
-[ -n "$ACC" ] || { echo "no connected account found"; exit 1; }
+[ -n "$ACC" ] || { echo "no connected account found for $SMOKE_EMAIL — log in as them and connect one first"; exit 1; }
 
 {
   echo "# API smoke test"
@@ -106,6 +122,12 @@ step "POST /api/v1/emails — send to self" 202 -X POST -H 'Content-Type: applic
   "$BASE/api/v1/emails"
 step "POST /api/v1/emails — missing recipients" 400 -X POST -H 'Content-Type: application/json' \
   -d "{\"account_id\":\"$ACC\",\"subject\":\"x\",\"body\":\"y\"}" "$BASE/api/v1/emails"
+
+JAR2=$(mktemp)
+curl -s -o /dev/null -c "$JAR2" -X POST "$BASE/signup" --data-urlencode "email=other-$RANDOM@example.com" --data-urlencode "password=$SMOKE_PASSWORD"
+OTHER_KEY=$(curl -s -b "$JAR2" -H 'Content-Type: application/json' -d '{"name":"smoke-other"}' "$BASE/api/v1/api-keys" | python3 -c 'import sys,json; print(json.load(sys.stdin)["key"])')
+AUTH="Authorization: Bearer $OTHER_KEY"
+step "GET /api/v1/accounts/{id} — as a different developer" 404 "$BASE/api/v1/accounts/$ACC"
 
 {
   echo "## Summary"

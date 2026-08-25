@@ -12,8 +12,9 @@ architecture. Nothing outside `internal/provider/outlook` knows Microsoft Graph
 exists.
 
 **Status: proof of concept.** It proves the mechanisms that carry real risk.
-Multi-tenancy, API-key management, billing, a developer dashboard and a hosted
-auth UI are deliberately absent.
+Multi-tenancy, API-key management and a developer dashboard are in; billing
+and a hosted auth UI for your own end users (as opposed to you, the
+developer) are still deliberately absent.
 
 ## Layout
 
@@ -93,12 +94,14 @@ set -a && source .env && set +a && go run ./cmd/server
 
 ### 4. Connect a mailbox
 
-The easiest path is the dashboard: open **`http://localhost:8080/dashboard`**,
-paste in `API_KEY`, and click **Connect account**. It walks the same flow below
-but does the `hosted-auth` call and redirect for you, and lists what's connected
-afterward — status, last synced, resync, disconnect.
+Open **`http://localhost:8080/signup`**, create your developer account, then
+on the dashboard create an API key (shown once — copy it somewhere) and click
+**Connect account**. It walks the same flow below but does the `hosted-auth`
+call and redirect for you, and lists what's connected afterward — status, last
+synced, resync, disconnect.
 
-To do it by hand instead:
+To do it by hand instead, export the key you created on the dashboard as
+`API_KEY` and:
 
 ```bash
 curl -s -X POST localhost:8080/api/v1/hosted-auth \
@@ -131,28 +134,36 @@ registration, point `MS_REDIRECT_URI` at it, and restart. Startup logs
 
 ## UI
 
-There is no mail client and no operator login system — everything is one API
-plus two small screens, both served by the same binary with no build step:
+There is no mail client — everything is one API plus a handful of small
+screens, all served by the same binary with no build step:
 
 | Screen | Route | Audience | Auth |
 |---|---|---|---|
+| Signup / login | `GET`/`POST /signup`, `GET`/`POST /login` | You / the integrating developer | None (that's the point) |
 | Connect landing page | `GET /connect/{state}` | The end user being connected (Priya) | The single-use state token in the URL |
-| Account dashboard | `GET /dashboard` | You / the integrating developer | API key pasted client-side, kept in `localStorage` |
+| Account dashboard | `GET /dashboard` | You / the integrating developer | Signed-in browser session (`um_session` cookie) |
 
 The landing page is what stands between "clicked a link from some app" and
 "typing a Microsoft password" — a bare redirect there looks like phishing. With
 one provider it's a single confirmation screen; with a second provider this is
 where a picker (à la Unipile's hosted auth wizard) would go.
 
-The dashboard is connection *lifecycle* management only — list accounts, see
-`OK` vs `CREDENTIALS` status, connect a new one, force a resync, disconnect.
-It does not browse mail or send anything; that's `/api/v1/emails*`, for a real
-caller's own app to build on. The page itself carries no secret — the API key
-lives only in the browser, exactly like any other API consumer.
+The dashboard requires signing in at `/signup` or `/login` first; it redirects
+there otherwise. It is connection *lifecycle* management plus API key
+issuance — list accounts, see `OK` vs `CREDENTIALS` status, connect a new one,
+force a resync, disconnect, create/revoke API keys. It does not browse mail or
+send anything; that's `/api/v1/emails*`, for a real caller's own app to build
+on. The dashboard's own fetches ride the session cookie; API keys it mints are
+for external callers (scripts, your own backend) to use as a bearer token.
 
 ## API
 
-All `/api/v1/*` routes require `Authorization: Bearer $API_KEY`.
+All `/api/v1/*` routes require `Authorization: Bearer $API_KEY`, where
+`$API_KEY` is a key you created on the dashboard (see "Developers, sessions
+and API keys" below) — it is not an environment variable. The `um_session`
+cookie from `/login` works too (a `POST`/`PUT`/`PATCH` riding the cookie must
+send `Content-Type: application/json`), except for managing API keys
+themselves, which is session-only — see below.
 All mail routes require `?account_id=…`.
 
 ### Connection
@@ -187,14 +198,15 @@ All mail routes require `?account_id=…`.
 
 Webhooks are configured **per account**: each connected mailbox belongs to a
 different end user, so their mail can go to a different endpoint. A hook with
-no account is global and receives every account's events.
+no account is developer-wide and receives every one of that developer's
+accounts' events.
 
 | Method | Path |
 |---|---|
 | `POST` | `/api/v1/accounts/{id}/webhooks` — `{"url": "...", "name": "...", "secret": "...", "events": ["mail_received"]}` (events default to `mail_received`) |
 | `GET` | `/api/v1/accounts/{id}/webhooks` |
 | `DELETE` | `/api/v1/accounts/{id}/webhooks/{wid}` |
-| `POST` | `/api/v1/webhooks` — global; empty `events` means everything |
+| `POST` | `/api/v1/webhooks` — developer-wide; empty `events` means everything |
 | `GET` | `/api/v1/webhooks` |
 | `DELETE` | `/api/v1/webhooks/{id}` |
 | `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones |
@@ -221,6 +233,25 @@ Delivery is **at-least-once** — dedupe on `(type, email.id)`.
 SQLite and retried on this schedule after the immediate first attempt:
 30s, 2m, 10m, 30m, 2h, 6h, 12h. After the last one it is marked `dead` and
 kept, visible via the `deliveries` endpoint. The queue survives restarts.
+
+### Developers, sessions and API keys
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET`/`POST` | `/signup` | HTML form (`application/x-www-form-urlencoded`). `303` + `um_session` cookie on success; `409` on a duplicate email |
+| `GET`/`POST` | `/login` | HTML form. `303` + `um_session` cookie on success |
+| `POST` | `/logout` | Clears the session |
+| `GET` | `/api/v1/me` | The signed-in developer plus `"auth": "session"` or `"auth": "api_key"` |
+| `GET` | `/api/v1/api-keys` | |
+| `POST` | `/api/v1/api-keys` | `{"name": "..."}` → `201` with the full key under `"key"` — shown once, never again |
+| `DELETE` | `/api/v1/api-keys/{id}` | |
+
+Everything a developer owns — accounts, webhooks, mail — is scoped to that
+developer; a request that names another developer's resource gets a plain
+`404`, not a `403`, so existence isn't leaked across tenants. **Managing API
+keys is session-only**: `POST`/`DELETE /api/v1/api-keys*` reject a bearer API
+key with `403 session_required`, so a leaked key alone can never mint or
+revoke keys — you have to be signed into the dashboard.
 
 ### Examples
 
@@ -340,9 +371,40 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   not replayed.
 - **Scope listing is not incremental** for Outlook — the folder tree is relisted
   each round. Cheap at mailbox scale, but it is a full listing, not a delta.
-- **Single tenant.** One API key, one shared account pool.
+- **Open signup, no password reset, no login rate limiting.** Anyone can
+  create a developer account; a forgotten password has no recovery path, and
+  repeated bad logins aren't throttled.
+- **Pre-tenancy databases are refused; there is no migration.** A database
+  created before multi-tenancy shipped fails to open (see "Logging" for the
+  message) — set up a fresh `DB_PATH` and reconnect mailboxes under it.
 
 ---
+
+## Logging
+
+Every request gets an `X-Request-Id`: the incoming header value if the caller
+sent one (capped at 64 characters), otherwise a generated one — either way
+it's echoed back on the response and attached to every log line the request
+produces, so a caller-supplied trace ID ties their logs to the server's.
+
+Set `DEBUG=1` (or any non-empty value) for exhaustive debug logging: request
+bodies, auth resolution (`auth: bearer present, resolving api key`,
+`auth: resolved`, `auth: api key rejected`, `auth: session rejected`, etc.),
+sync scope and message decisions (`decision=new`, `decision=suppressed`, …),
+webhook delivery decisions (`decision=delivered`, `decision=scheduled retry`,
+`decision=dead`), and token refresh decisions. Without it the server logs at
+`INFO` only.
+
+**Secrets are always redacted, even at DEBUG.** Request bodies logged at
+DEBUG are passed through a redactor first: any JSON field whose key looks like
+`password`, `secret`, `token`, `key`, `code`, `verifier`, `cookie`,
+`authorization`, `client_state` or `session` (substring match, so it
+over-redacts on purpose) is replaced with `[redacted]`. Elsewhere the code
+simply never logs the sensitive value in the first place — a minted API key
+is logged by its safe 12-character prefix, never in full; a session token is
+never logged at all. The net effect: passwords, full API keys, session cookie
+values, and `Authorization` header values do not appear in the log at any
+level.
 
 ## Development
 
@@ -356,3 +418,11 @@ Tests run entirely in-process, covering delta pagination, removal handling,
 event suppression on first sync, dedupe, cursor persistence, token sealing, the
 push validation handshake, the PKCE connect flow, and the provider contracts
 against a non-Outlook-shaped backend.
+
+`scripts/smoke.sh` exercises the running server end to end against a real
+mailbox: it signs up (or logs in) as `SMOKE_EMAIL`/`SMOKE_PASSWORD`, mints an
+API key, and drives the mail API, including one send. It needs a mailbox
+already connected under that developer — log in as `SMOKE_EMAIL` on the
+dashboard and click **Connect account** first — so it isn't run in CI; it's a
+manual, credentialed check you run locally before shipping a change that
+touches the mail path.
