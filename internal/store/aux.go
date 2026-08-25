@@ -88,37 +88,60 @@ func (s *Store) DeleteSubscription(id string) error {
 
 // ---------- outbound webhooks ----------
 
+const webhookSelect = `SELECT id, developer_id, account_id, name, url, secret, events_json, created_at FROM webhooks`
+
 func (s *Store) SaveWebhook(w model.Webhook) error {
 	ev, _ := json.Marshal(w.Events)
 	_, err := s.db.Exec(`
-		INSERT INTO webhooks (id, account_id, name, url, secret, events_json, created_at) VALUES (?,?,?,?,?,?,?)`,
-		w.ID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix())
+		INSERT INTO webhooks (id, developer_id, account_id, name, url, secret, events_json, created_at)
+		VALUES (?,?,?,?,?,?,?,?)`,
+		w.ID, w.DeveloperID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix())
 	return err
 }
 
-// ListWebhooks returns every registered hook, global and account-scoped.
-func (s *Store) ListWebhooks() ([]model.Webhook, error) {
-	return s.queryWebhooks(`SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks`)
+// ListWebhooks returns every hook a developer owns, developer-wide and
+// account-scoped.
+func (s *Store) ListWebhooks(developerID string) ([]model.Webhook, error) {
+	return s.queryWebhooks(webhookSelect+` WHERE developer_id = ? ORDER BY created_at`, developerID)
 }
 
-// ListWebhooksFor returns the hooks that should see an event from accountID:
-// those bound to it plus the global ones.
+// ListWebhooksFor is UNSCOPED by developer: the dispatcher resolves the
+// hooks an account's event should reach — those bound to the account plus
+// the developer-wide ones of the account's owner.
 func (s *Store) ListWebhooksFor(accountID string) ([]model.Webhook, error) {
-	return s.queryWebhooks(`
-		SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks
-		WHERE account_id = '' OR account_id = ?`, accountID)
+	return s.queryWebhooks(webhookSelect+`
+		WHERE account_id = ?
+		   OR (account_id = '' AND developer_id = (SELECT developer_id FROM accounts WHERE id = ?))`,
+		accountID, accountID)
 }
 
-// ListAccountWebhooks returns only the hooks bound to accountID.
-func (s *Store) ListAccountWebhooks(accountID string) ([]model.Webhook, error) {
-	return s.queryWebhooks(`
-		SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks
-		WHERE account_id = ?`, accountID)
+func (s *Store) ListAccountWebhooks(developerID, accountID string) ([]model.Webhook, error) {
+	return s.queryWebhooks(webhookSelect+` WHERE developer_id = ? AND account_id = ? ORDER BY created_at`,
+		developerID, accountID)
 }
 
-func (s *Store) GetWebhook(id string) (model.Webhook, error) {
-	hooks, err := s.queryWebhooks(`
-		SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks WHERE id = ?`, id)
+func (s *Store) GetWebhook(developerID, id string) (model.Webhook, error) {
+	return s.oneWebhook(webhookSelect+` WHERE developer_id = ? AND id = ?`, developerID, id)
+}
+
+// GetAnyWebhook is UNSCOPED: for the retry loop, which holds only a hook id.
+func (s *Store) GetAnyWebhook(id string) (model.Webhook, error) {
+	return s.oneWebhook(webhookSelect+` WHERE id = ?`, id)
+}
+
+func (s *Store) DeleteWebhook(developerID, id string) error {
+	res, err := s.db.Exec(`DELETE FROM webhooks WHERE developer_id = ? AND id = ?`, developerID, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) oneWebhook(q string, args ...any) (model.Webhook, error) {
+	hooks, err := s.queryWebhooks(q, args...)
 	if err != nil {
 		return model.Webhook{}, err
 	}
@@ -139,7 +162,7 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 		var w model.Webhook
 		var ev string
 		var created int64
-		if err := rows.Scan(&w.ID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created); err != nil {
+		if err := rows.Scan(&w.ID, &w.DeveloperID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(ev), &w.Events)
@@ -147,11 +170,6 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 		out = append(out, w)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) DeleteWebhook(id string) error {
-	_, err := s.db.Exec(`DELETE FROM webhooks WHERE id = ?`, id)
-	return err
 }
 
 // ---------- webhook delivery retry queue ----------
@@ -231,6 +249,8 @@ func (s *Store) queryDeliveries(q string, args ...any) ([]Delivery, error) {
 
 type OAuthState struct {
 	State string
+	// DeveloperID is the tenant who minted this connect attempt.
+	DeveloperID string
 	// Provider names which backend this connect attempt is for.
 	Provider   string
 	Verifier   string
@@ -273,9 +293,9 @@ func decodePendingWebhook(raw string) *PendingWebhook {
 
 func (s *Store) SaveOAuthState(o OAuthState) error {
 	_, err := s.db.Exec(`
-		INSERT INTO oauth_states (state, provider, verifier, success_url, failure_url, notify_url, webhook_json, created_at, expires_at)
-		VALUES (?,?,?,?,?,?,?,?,?)`,
-		o.State, o.Provider, o.Verifier, o.SuccessURL, o.FailureURL, o.NotifyURL,
+		INSERT INTO oauth_states (state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, created_at, expires_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		o.State, o.DeveloperID, o.Provider, o.Verifier, o.SuccessURL, o.FailureURL, o.NotifyURL,
 		encodePendingWebhook(o.Webhook), time.Now().Unix(), o.ExpiresAt.Unix())
 	return err
 }
@@ -287,9 +307,9 @@ func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 	var exp int64
 	var wh string
 	err := s.db.QueryRow(`
-		SELECT state, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
+		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
+		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
 	o.Webhook = decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
@@ -319,9 +339,9 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 	var exp int64
 	var wh string
 	err := s.db.QueryRow(`
-		SELECT state, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
+		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
+		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
 	o.Webhook = decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound

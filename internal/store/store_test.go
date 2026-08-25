@@ -20,10 +20,19 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+func seedDeveloper(t *testing.T, s *Store, id, email string) string {
+	t.Helper()
+	if err := s.CreateDeveloper(model.Developer{ID: id, Email: email, Name: "Dev"}, "$2a$12$hash"); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func seedAccount(t *testing.T, s *Store) string {
 	t.Helper()
+	dev := seedDeveloper(t, s, "dev_1", "dev1@example.com")
 	acct := model.Account{
-		ID: "acc_1", Provider: "OUTLOOK", Email: "user@outlook.com",
+		ID: "acc_1", DeveloperID: dev, Provider: "OUTLOOK", Email: "user@outlook.com",
 		Name: "User", Status: model.AccountOK,
 	}
 	if err := s.UpsertAccount(acct); err != nil {
@@ -146,13 +155,13 @@ func TestUpsertAccountConflictsOnEmail(t *testing.T) {
 	seedAccount(t, s)
 
 	if err := s.UpsertAccount(model.Account{
-		ID: "acc_2", Provider: "OUTLOOK", Email: "user@outlook.com",
+		ID: "acc_2", DeveloperID: "dev_1", Provider: "OUTLOOK", Email: "user@outlook.com",
 		Name: "Renamed", Status: model.AccountOK,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	all, err := s.ListAccounts()
+	all, err := s.ListAccounts("dev_1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +178,8 @@ func TestUpsertAccountConflictsOnEmail(t *testing.T) {
 
 func TestOAuthStateIsSingleUse(t *testing.T) {
 	s := newTestStore(t)
-	st := OAuthState{State: "abc", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute)}
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	st := OAuthState{State: "abc", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute)}
 	if err := s.SaveOAuthState(st); err != nil {
 		t.Fatal(err)
 	}
@@ -186,8 +196,9 @@ func TestOAuthStateIsSingleUse(t *testing.T) {
 
 func TestExpiredOAuthStateRejected(t *testing.T) {
 	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
 	if err := s.SaveOAuthState(OAuthState{
-		State: "old", Verifier: "v", ExpiresAt: time.Now().Add(-time.Minute),
+		State: "old", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(-time.Minute),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -201,16 +212,16 @@ func TestExpiredOAuthStateRejected(t *testing.T) {
 func TestListWebhooksForScopesByAccount(t *testing.T) {
 	s := newTestStore(t)
 	acct := seedAccount(t, s)
-	other := model.Account{ID: "acc_2", Provider: "OUTLOOK", Email: "other@outlook.com", Status: model.AccountOK}
+	other := model.Account{ID: "acc_2", DeveloperID: "dev_1", Provider: "OUTLOOK", Email: "other@outlook.com", Status: model.AccountOK}
 	if err := s.UpsertAccount(other); err != nil {
 		t.Fatal(err)
 	}
 
 	now := time.Now()
 	for _, w := range []model.Webhook{
-		{ID: "wh_global", URL: "https://g.example.com", CreatedAt: now},
-		{ID: "wh_a1", URL: "https://a1.example.com", AccountID: acct, CreatedAt: now},
-		{ID: "wh_a2", URL: "https://a2.example.com", AccountID: other.ID, CreatedAt: now},
+		{ID: "wh_global", DeveloperID: "dev_1", URL: "https://g.example.com", CreatedAt: now},
+		{ID: "wh_a1", DeveloperID: "dev_1", URL: "https://a1.example.com", AccountID: acct, CreatedAt: now},
+		{ID: "wh_a2", DeveloperID: "dev_1", URL: "https://a2.example.com", AccountID: other.ID, CreatedAt: now},
 	} {
 		if err := s.SaveWebhook(w); err != nil {
 			t.Fatal(err)
@@ -238,13 +249,13 @@ func TestListWebhooksForScopesByAccount(t *testing.T) {
 func TestAccountWebhooksCascadeOnDelete(t *testing.T) {
 	s := newTestStore(t)
 	acct := seedAccount(t, s)
-	if err := s.SaveWebhook(model.Webhook{ID: "wh_a1", URL: "https://a1.example.com", AccountID: acct, CreatedAt: time.Now()}); err != nil {
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_a1", DeveloperID: "dev_1", URL: "https://a1.example.com", AccountID: acct, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteAccount(acct); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.ListWebhooks()
+	got, err := s.ListWebhooks("dev_1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,8 +268,9 @@ func TestAccountWebhooksCascadeOnDelete(t *testing.T) {
 // so the callback can attach it to whatever account gets created.
 func TestOAuthStateCarriesPendingWebhook(t *testing.T) {
 	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
 	st := OAuthState{
-		State: "abc", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute),
+		State: "abc", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute),
 		Webhook: &PendingWebhook{URL: "https://hook.example.com", Secret: "s3", Events: []string{"mail_received"}},
 	}
 	if err := s.SaveOAuthState(st); err != nil {
@@ -274,7 +286,7 @@ func TestOAuthStateCarriesPendingWebhook(t *testing.T) {
 	}
 
 	// And absent stays absent.
-	if err := s.SaveOAuthState(OAuthState{State: "none", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+	if err := s.SaveOAuthState(OAuthState{State: "none", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.TakeOAuthState("none")
@@ -286,8 +298,9 @@ func TestOAuthStateCarriesPendingWebhook(t *testing.T) {
 // A failed delivery waits in the queue until its next_attempt_at passes.
 func TestDueDeliveriesHonoursSchedule(t *testing.T) {
 	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", URL: "https://x.example.com", CreatedAt: now}); err != nil {
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x.example.com", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SaveDelivery(Delivery{
@@ -345,8 +358,9 @@ func TestDueDeliveriesHonoursSchedule(t *testing.T) {
 // to an endpoint the caller unregistered.
 func TestDeleteWebhookDropsQueuedDeliveries(t *testing.T) {
 	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
 	now := time.Now()
-	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", URL: "https://x.example.com", CreatedAt: now}); err != nil {
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x.example.com", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SaveDelivery(Delivery{
@@ -355,7 +369,7 @@ func TestDeleteWebhookDropsQueuedDeliveries(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteWebhook("wh_1"); err != nil {
+	if err := s.DeleteWebhook("dev_1", "wh_1"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.ListDeliveries("wh_1"); len(got) != 0 {
@@ -368,10 +382,11 @@ func TestDeleteWebhookDropsQueuedDeliveries(t *testing.T) {
 // new columns.
 func TestWebhookNameRoundTrips(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", Name: "crm-sync", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Name: "crm-sync", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetWebhook("wh_1")
+	got, err := s.GetWebhook("dev_1", "wh_1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,5 +435,181 @@ func TestOpenRefusesPreTenancyDatabase(t *testing.T) {
 	}
 	if !errors.Is(err, ErrPreTenancy) {
 		t.Fatal("refusal must match ErrPreTenancy")
+	}
+}
+
+func TestDeveloperRoundTripAndUniqueEmail(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateDeveloper(model.Developer{ID: "dev_1", Email: "a@x.com", Name: "A"}, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateDeveloper(model.Developer{ID: "dev_2", Email: "a@x.com"}, "h2"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate email err = %v, want ErrConflict", err)
+	}
+	d, hash, err := s.DeveloperByEmail("a@x.com")
+	if err != nil || d.ID != "dev_1" || hash != "h1" || d.Name != "A" {
+		t.Fatalf("DeveloperByEmail = %+v %q %v", d, hash, err)
+	}
+	if _, _, err := s.DeveloperByEmail("nobody@x.com"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown email err = %v", err)
+	}
+}
+
+func TestSessionsExpireAndExtend(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateSession("sess1", "dev_1", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	d, exp, err := s.SessionDeveloper("sess1", now)
+	if err != nil || d.ID != "dev_1" || !exp.Equal(now.Add(time.Hour)) {
+		t.Fatalf("SessionDeveloper = %+v %v %v", d, exp, err)
+	}
+	if _, _, err := s.SessionDeveloper("sess1", now.Add(2*time.Hour)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired session err = %v", err)
+	}
+	if err := s.ExtendSession("sess1", now.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SessionDeveloper("sess1", now.Add(2*time.Hour)); err != nil {
+		t.Fatalf("extended session rejected: %v", err)
+	}
+	if err := s.DeleteSession("sess1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SessionDeveloper("sess1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatal("deleted session still resolves")
+	}
+}
+
+func TestAPIKeysResolveListAndRevoke(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	seedDeveloper(t, s, "dev_2", "b@x.com")
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateAPIKey(model.APIKey{ID: "key_1", Name: "prod", Prefix: "um_abcdefghi", CreatedAt: now}, "dev_1", "hash1"); err != nil {
+		t.Fatal(err)
+	}
+	d, k, err := s.DeveloperByKeyHash("hash1")
+	if err != nil || d.ID != "dev_1" || k.ID != "key_1" || k.Prefix != "um_abcdefghi" {
+		t.Fatalf("DeveloperByKeyHash = %+v %+v %v", d, k, err)
+	}
+	if err := s.TouchAPIKey("key_1", now); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := s.ListAPIKeys("dev_1")
+	if err != nil || len(keys) != 1 || keys[0].LastUsedAt == nil || !keys[0].LastUsedAt.Equal(now) {
+		t.Fatalf("ListAPIKeys = %+v %v", keys, err)
+	}
+	if other, _ := s.ListAPIKeys("dev_2"); len(other) != 0 {
+		t.Fatalf("dev_2 sees dev_1's keys: %+v", other)
+	}
+	if err := s.RevokeAPIKey("dev_2", "key_1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-developer revoke err = %v, want ErrNotFound", err)
+	}
+	if err := s.RevokeAPIKey("dev_1", "key_1", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.DeveloperByKeyHash("hash1"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("revoked key still resolves")
+	}
+	keys, _ = s.ListAPIKeys("dev_1")
+	if len(keys) != 1 || keys[0].RevokedAt == nil {
+		t.Fatalf("revoked key should still be listed with revoked_at: %+v", keys)
+	}
+}
+
+func TestAccountsAreScopedByDeveloper(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	seedDeveloper(t, s, "dev_2", "b@x.com")
+	for _, a := range []model.Account{
+		{ID: "acc_1", DeveloperID: "dev_1", Provider: "OUTLOOK", Email: "m@outlook.com", Status: model.AccountOK},
+		{ID: "acc_2", DeveloperID: "dev_2", Provider: "OUTLOOK", Email: "m@outlook.com", Status: model.AccountOK}, // same mailbox, other tenant
+	} {
+		if err := s.UpsertAccount(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.GetAccount("dev_1", "acc_2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("dev_1 read dev_2's account: %v", err)
+	}
+	if a, err := s.GetAccount("dev_1", "acc_1"); err != nil || a.DeveloperID != "dev_1" {
+		t.Fatalf("GetAccount own = %+v %v", a, err)
+	}
+	if l, _ := s.ListAccounts("dev_2"); len(l) != 1 || l[0].ID != "acc_2" {
+		t.Fatalf("ListAccounts(dev_2) = %+v", l)
+	}
+	if all, _ := s.ListAllAccounts(); len(all) != 2 {
+		t.Fatalf("ListAllAccounts = %d, want 2", len(all))
+	}
+	if id, _ := s.AccountIDByEmail("dev_2", "m@outlook.com"); id != "acc_2" {
+		t.Fatalf("AccountIDByEmail(dev_2) = %q", id)
+	}
+	if _, err := s.GetAnyAccount("acc_2"); err != nil {
+		t.Fatalf("GetAnyAccount: %v", err)
+	}
+}
+
+func TestDeletingDeveloperCascades(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s) // dev_1 / acc_1
+	if err := s.CreateAPIKey(model.APIKey{ID: "key_1", Name: "n", Prefix: "p", CreatedAt: time.Now()}, "dev_1", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession("sess1", "dev_1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "M1", Subject: "x", Date: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM developers WHERE id = 'dev_1'`); err != nil {
+		t.Fatal(err)
+	}
+	for table, want := range map[string]int{"api_keys": 0, "sessions": 0, "accounts": 0, "emails": 0, "webhooks": 0} {
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("%s has %d rows after developer delete", table, n)
+		}
+	}
+}
+
+func TestWebhooksAreScopedByDeveloper(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	seedDeveloper(t, s, "dev_2", "b@x.com")
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetWebhook("dev_2", "wh_1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-developer GetWebhook err = %v", err)
+	}
+	if err := s.DeleteWebhook("dev_2", "wh_1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-developer DeleteWebhook err = %v", err)
+	}
+	if l, _ := s.ListWebhooks("dev_2"); len(l) != 0 {
+		t.Fatalf("dev_2 lists dev_1's hooks: %+v", l)
+	}
+	if err := s.DeleteWebhook("dev_1", "wh_1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOAuthStateCarriesDeveloper(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.SaveOAuthState(OAuthState{State: "st", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.TakeOAuthState("st")
+	if err != nil || got.DeveloperID != "dev_1" {
+		t.Fatalf("TakeOAuthState = %+v %v", got, err)
 	}
 }

@@ -85,36 +85,54 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) UpsertAccount(a model.Account) error {
 	now := time.Now().Unix()
 	_, err := s.db.Exec(`
-		INSERT INTO accounts (id, provider, email, name, status, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?)
-		ON CONFLICT(email) DO UPDATE SET
+		INSERT INTO accounts (id, developer_id, provider, email, name, status, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(developer_id, email) DO UPDATE SET
 		  name = excluded.name, status = excluded.status, updated_at = excluded.updated_at`,
-		a.ID, a.Provider, a.Email, a.Name, a.Status, now, now)
+		a.ID, a.DeveloperID, a.Provider, a.Email, a.Name, a.Status, now, now)
 	return err
 }
 
 // AccountIDByEmail lets the OAuth callback reconnect an existing mailbox
-// instead of creating a duplicate account row.
-func (s *Store) AccountIDByEmail(email string) (string, error) {
+// instead of creating a duplicate account row — within one developer.
+func (s *Store) AccountIDByEmail(developerID, email string) (string, error) {
 	var id string
-	err := s.db.QueryRow(`SELECT id FROM accounts WHERE email = ?`, email).Scan(&id)
+	err := s.db.QueryRow(`SELECT id FROM accounts WHERE developer_id = ? AND email = ?`,
+		developerID, email).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	return id, err
 }
 
-func (s *Store) GetAccount(id string) (model.Account, error) {
-	row := s.db.QueryRow(`
-		SELECT id, provider, email, name, status, created_at, updated_at, last_synced_at
-		FROM accounts WHERE id = ?`, id)
-	return scanAccount(row)
+const accountSelect = `
+	SELECT id, developer_id, provider, email, name, status, created_at, updated_at, last_synced_at
+	FROM accounts`
+
+// GetAccount is the tenant-scoped read every API handler uses. A row owned
+// by another developer is ErrNotFound, not an authorization error, so ids
+// cannot be probed across tenants.
+func (s *Store) GetAccount(developerID, id string) (model.Account, error) {
+	return scanAccount(s.db.QueryRow(accountSelect+` WHERE developer_id = ? AND id = ?`, developerID, id))
 }
 
-func (s *Store) ListAccounts() ([]model.Account, error) {
-	rows, err := s.db.Query(`
-		SELECT id, provider, email, name, status, created_at, updated_at, last_synced_at
-		FROM accounts ORDER BY created_at`)
+// GetAnyAccount is UNSCOPED: for internal callers (sync, token custody,
+// push) that hold an account id and no tenant. Never call from a handler.
+func (s *Store) GetAnyAccount(id string) (model.Account, error) {
+	return scanAccount(s.db.QueryRow(accountSelect+` WHERE id = ?`, id))
+}
+
+func (s *Store) ListAccounts(developerID string) ([]model.Account, error) {
+	return s.queryAccounts(accountSelect+` WHERE developer_id = ? ORDER BY created_at`, developerID)
+}
+
+// ListAllAccounts is UNSCOPED: for the poll and subscription loops.
+func (s *Store) ListAllAccounts() ([]model.Account, error) {
+	return s.queryAccounts(accountSelect + ` ORDER BY created_at`)
+}
+
+func (s *Store) queryAccounts(q string, args ...any) ([]model.Account, error) {
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +173,7 @@ func scanAccount(r scanner) (model.Account, error) {
 	var a model.Account
 	var created, updated int64
 	var synced sql.NullInt64
-	err := r.Scan(&a.ID, &a.Provider, &a.Email, &a.Name, &a.Status, &created, &updated, &synced)
+	err := r.Scan(&a.ID, &a.DeveloperID, &a.Provider, &a.Email, &a.Name, &a.Status, &created, &updated, &synced)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
