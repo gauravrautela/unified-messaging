@@ -147,6 +147,13 @@ func hasCookie(r *http.Request, name string) bool {
 	return err == nil
 }
 
+// isStateChanging reports whether a method can carry a mutating request body.
+// DELETE is deliberately excluded: an HTML form cannot issue one, so it needs
+// no content-type defence.
+func isStateChanging(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch
+}
+
 // withDeveloper resolves the caller from an API key or a session cookie, in
 // that order, and rejects the request when neither is valid.
 func (s *Server) withDeveloper(next http.Handler) http.Handler {
@@ -179,6 +186,18 @@ func (s *Server) withDeveloper(next http.Handler) http.Handler {
 				writeError(w, http.StatusUnauthorized, "unauthorized", "session expired; sign in again")
 				return
 			}
+			// CSRF defence-in-depth: SameSite=Lax keeps the cookie off cross-site
+			// requests for anything but top-level navigation (a plain GET), so a
+			// state-changing write riding the session cookie can only originate
+			// same-site — except a classic HTML form, which SameSite does not
+			// stop and which cannot set a JSON content-type. Requiring one here
+			// closes that gap without affecting API-key callers.
+			if isStateChanging(r.Method) && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+				log.Debug("auth: session request refused", "reason", "non-json content-type")
+				writeError(w, http.StatusUnsupportedMediaType, "json_required",
+					"session requests must send Content-Type: application/json")
+				return
+			}
 			log.Debug("auth: resolved", "developer_id", dev.ID, "via", "session")
 			s.serveAs(w, r, next, dev, authKindSession)
 			return
@@ -190,21 +209,28 @@ func (s *Server) withDeveloper(next http.Handler) http.Handler {
 }
 
 // logBody logs a JSON request body at DEBUG with secrets masked, then hands
-// the bytes back to the handler. Bodies over 64 KB are logged by size only.
+// the bytes back to the handler. Bodies over 64 KB, or of unknown size (a
+// chunked request reports ContentLength == -1), are logged by size only —
+// and in either case the body is left completely untouched so the handler
+// still gets to read it. The whole thing is a no-op unless DEBUG logging is
+// enabled, so it never pays the read cost in production by default.
 func logBody(r *http.Request) {
 	log := logx.From(r.Context())
+	if !log.Enabled(r.Context(), slog.LevelDebug) {
+		return
+	}
 	if r.Body == nil || r.ContentLength == 0 || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		return
 	}
-	if r.ContentLength > 64<<10 {
+	if r.ContentLength < 0 || r.ContentLength > 64<<10 {
 		log.Debug("request body", "bytes", r.ContentLength, "logged", false)
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	r.Body = io.NopCloser(bytes.NewReader(raw))
 	if err != nil {
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
 	var v any
 	if json.Unmarshal(raw, &v) != nil {
 		log.Debug("request body", "bytes", len(raw), "json", false)

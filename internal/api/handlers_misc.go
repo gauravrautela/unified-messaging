@@ -48,8 +48,13 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	id := r.PathValue("id")
-	if _, err := s.store.GetAccount(dev.ID, id); errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "account_not_found", "no such account")
+	if _, err := s.store.GetAccount(dev.ID, id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "account_not_found", "no such account")
+			return
+		}
+		logx.From(r.Context()).Error("checking account ownership before delete", "account_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)

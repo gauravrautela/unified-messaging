@@ -154,6 +154,84 @@ func TestRevokedKeyIsRejected(t *testing.T) {
 	}
 }
 
+// A delete for an account owned by a different developer must fail closed:
+// 404, and the account (and its ownership check) must never be reached with
+// an unscoped ID, even on the non-ErrNotFound path.
+func TestDeleteAccountFailsClosedAcrossTenants(t *testing.T) {
+	s, db := newTestServer(t)
+	devA, _ := seedDev(t, s, "a@x.com")
+	_, keyB := seedDev(t, s, "b@x.com")
+	if err := db.UpsertAccount(model.Account{
+		ID: "acc_A", DeveloperID: devA.ID, Provider: "OUTLOOK", Email: "a@x.com", Status: model.AccountOK,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodDelete, "/api/v1/accounts/acc_A", nil), keyB))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant delete: status = %d, want 404", rec.Code)
+	}
+	if _, err := db.GetAccount(devA.ID, "acc_A"); err != nil {
+		t.Fatalf("account should have survived the cross-tenant delete attempt: %v", err)
+	}
+}
+
+// A request whose Content-Length is unknown (a chunked upload, reported as
+// -1) must still reach the handler with an intact body: logBody must not
+// consume it while deciding whether to log it.
+func TestUnsizedBodyIsStillDecoded(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`{"url":"https://x","secret":"hush"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = -1
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (an unsized body must still be decoded): %s", rec.Code, rec.Body.String())
+	}
+}
+
+// CSRF defence-in-depth: a session cookie may only authenticate a
+// state-changing write when the request declares Content-Type: application/json,
+// since an HTML form cannot set that header. API keys are not subject to
+// this check — a form can never carry one.
+func TestSessionWritesRequireJSONContentType(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+
+	form := withSession(t, s, httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`url=https://x&secret=hush`)), dev.ID)
+	form.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, form)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("session + form content-type: status = %d, want 415", rec.Code)
+	}
+
+	jsonReq := withSession(t, s, httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`{"url":"https://x","secret":"hush"}`)), dev.ID)
+	jsonReq.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, jsonReq)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("session + json content-type: status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+
+	keyForm := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`url=https://x&secret=hush`)), key)
+	keyForm.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, keyForm)
+	if rec.Code == http.StatusUnsupportedMediaType {
+		t.Fatalf("api key requests must not be subject to the session content-type gate")
+	}
+}
+
 // Graph refuses to create a subscription unless this exact handshake works:
 // a POST carrying ?validationToken must come back 200, text/plain, token echoed.
 // The route is namespaced per provider so each one's scheme stays addressable.
