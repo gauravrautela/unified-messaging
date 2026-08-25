@@ -65,17 +65,6 @@ func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry, a *ac
 
 const sessionCookie = "um_session"
 
-// mailboxFor resolves the provider that owns an account. Every mail handler
-// goes through here rather than holding a concrete client, which is what keeps
-// the HTTP layer free of provider knowledge.
-func (s *Server) mailboxFor(acct model.Account) (provider.Mailbox, error) {
-	p, err := s.registry.Get(acct.Provider)
-	if err != nil {
-		return nil, err
-	}
-	return p.Mailbox(), nil
-}
-
 // apiRoutes is every pattern registered under the developer middleware. It
 // is a package-level list so the isolation test can prove each one is
 // tenant-scoped.

@@ -531,6 +531,36 @@ func (s *Store) GetIdempotency(developerID, key string) ([]byte, error) {
 	return b, err
 }
 
+// ReserveIdempotency atomically claims (developerID, key) by inserting an
+// empty-response placeholder row, reporting whether this call was the one
+// that created it. A concurrent second caller for the same key loses (won =
+// false) and must not run the operation again — it should instead wait for
+// or read whatever the winner eventually stores via PutIdempotency, or the
+// key's removal via DeleteIdempotency if the winner's attempt failed.
+func (s *Store) ReserveIdempotency(developerID, key string) (bool, error) {
+	res, err := s.db.Exec(`
+		INSERT INTO idempotency_keys (developer_id, key, response, created_at)
+		VALUES (?,?,?,?)
+		ON CONFLICT(developer_id, key) DO NOTHING`,
+		developerID, key, []byte{}, time.Now().Unix())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// DeleteIdempotency removes one key outright. Used to release a reservation
+// after its operation failed, so a retry with the same key is free to try
+// again instead of being permanently told "in progress".
+func (s *Store) DeleteIdempotency(developerID, key string) error {
+	_, err := s.db.Exec(`DELETE FROM idempotency_keys WHERE developer_id = ? AND key = ?`, developerID, key)
+	return err
+}
+
 // PurgeIdempotency drops keys older than olderThan. Best-effort background
 // hygiene: a failure here is not worth surfacing to a caller.
 func (s *Store) PurgeIdempotency(olderThan time.Time) {

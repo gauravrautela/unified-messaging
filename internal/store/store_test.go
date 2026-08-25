@@ -816,6 +816,51 @@ func TestChatSessionAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestReserveIdempotency(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "dev1@example.com")
+	seedDeveloper(t, s, "dev_2", "dev2@example.com")
+
+	won, err := s.ReserveIdempotency("dev_1", "k1")
+	if err != nil || !won {
+		t.Fatalf("first reserve: won=%v err=%v", won, err)
+	}
+	if won, err := s.ReserveIdempotency("dev_1", "k1"); err != nil || won {
+		t.Fatalf("second reserve should lose: won=%v err=%v", won, err)
+	}
+	// Reservations are developer-scoped: the same key is free for another developer.
+	if won, err := s.ReserveIdempotency("dev_2", "k1"); err != nil || !won {
+		t.Fatalf("other developer reserve: won=%v err=%v", won, err)
+	}
+
+	// The placeholder response is empty (distinguishable from "no key at all"
+	// via GetIdempotency's ErrNotFound, and from a completed response, which
+	// is never empty JSON).
+	b, err := s.GetIdempotency("dev_1", "k1")
+	if err != nil || len(b) != 0 {
+		t.Fatalf("placeholder response = %q err=%v, want empty", b, err)
+	}
+
+	if err := s.PutIdempotency("dev_1", "k1", []byte(`{"ok":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.GetIdempotency("dev_1", "k1"); err != nil || string(b) != `{"ok":true}` {
+		t.Fatalf("get after put = %s %v", b, err)
+	}
+
+	if err := s.DeleteIdempotency("dev_1", "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetIdempotency("dev_1", "k1"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("delete did not remove key")
+	}
+	// A fresh reservation succeeds again once the old one is gone — this is
+	// what lets a retry proceed after an earlier attempt failed.
+	if won, err := s.ReserveIdempotency("dev_1", "k1"); err != nil || !won {
+		t.Fatalf("reserve after delete: won=%v err=%v", won, err)
+	}
+}
+
 func TestDeletingChatAccountCascadesChatTables(t *testing.T) {
 	s := newTestStore(t)
 	acct := seedChatAccount(t, s)

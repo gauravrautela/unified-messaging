@@ -19,18 +19,13 @@ import (
 )
 
 // resolveChatAccount is the chat-route counterpart to resolve/resolveID: it
-// validates ownership the same way, then insists the account's provider is a
-// chat one. resolveID itself already tolerates a chat account fine (Mailbox()
-// is nil, mailboxFor reports no error for that), so the only extra step here
-// is capability-checking Chat() rather than the mail contract.
+// shares resolveAccount's ownership check (never resolveID itself — that one
+// now enforces the mail capability and would 400 every chat account before
+// this function got a chance to run), then insists the account's provider is
+// a chat one.
 func (s *Server) resolveChatAccount(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Chatter, bool) {
-	acct, _, ok := s.resolveID(w, r, id)
+	acct, p, ok := s.resolveAccount(w, r, id)
 	if !ok {
-		return model.Account{}, nil, false
-	}
-	p, err := s.registry.Get(acct.Provider)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "unknown_provider", err.Error())
 		return model.Account{}, nil, false
 	}
 	chatter := p.Chat()
@@ -65,8 +60,8 @@ func apiErr(code, msg string) any {
 // A handler that needs Idempotency-Key support reads the body once, up
 // front, into a byte slice — both to decode its own request struct from and
 // to hand to withIdempotency for hashing. The bytes ride the request context
-// rather than a second parameter so the call site can stay the shape the
-// send-path design settled on: s.withIdempotency(w, r, dev.ID, do).
+// rather than an extra parameter so the call site can stay
+// s.withIdempotency(w, r, dev.ID, acct.ID, do).
 
 type rawBodyCtxKey struct{}
 
@@ -96,45 +91,63 @@ type idempotencyRecord struct {
 	Body   json.RawMessage `json:"body"`
 }
 
-// withIdempotency runs do exactly once per (developer, Idempotency-Key)
-// pair. No header at all means "not idempotent": do runs every time. A
-// header that was seen before with the same request body hash replays the
-// stored response without calling do again; a different hash under the same
-// key is a client bug and gets 409 idempotency_conflict. Keys are purged
-// lazily (anything older than 24h) on every successful write so the table
-// never grows unbounded without a separate sweep job.
-func (s *Server) withIdempotency(w http.ResponseWriter, r *http.Request, devID string, do func() (int, any)) {
+// operationHash scopes an Idempotency-Key to the specific operation it was
+// sent with: method, path, account and body. Hashing the raw body alone
+// would let the same key replay across two different chats (account_id often
+// rides the query string or a path segment, not the JSON body a message-send
+// route carries) or even two different accounts — a client bug that must be
+// rejected as a conflict, not silently served the wrong chat's cached reply.
+func operationHash(r *http.Request, acctID string) string {
+	h := sha256.New()
+	h.Write([]byte(r.Method))
+	h.Write([]byte{'\n'})
+	h.Write([]byte(r.URL.Path))
+	h.Write([]byte{'\n'})
+	h.Write([]byte(acctID))
+	h.Write([]byte{'\n'})
+	h.Write(rawBodyFrom(r.Context()))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// withIdempotency runs do exactly once per (developer, Idempotency-Key,
+// operation) triple. No header at all means "not idempotent": do runs every
+// time. A header seen before, with a matching operation hash, replays the
+// stored response without calling do again; a hash mismatch under the same
+// key is a client bug and gets 409 idempotency_conflict.
+//
+// Concurrent callers with the same key race on ReserveIdempotency, which is
+// a single atomic INSERT ... ON CONFLICT DO NOTHING: exactly one of them
+// "wins" and runs do; every loser goes to replayOrConflict, which either
+// replays the winner's completed response, reports the conflict, or — if it
+// arrives before the winner has finished — reports 409 "in progress" rather
+// than running the operation a second time. A losing operation deletes its
+// reservation instead of completing it, so a genuine retry after a failure
+// is not locked out forever. Keys are purged lazily (anything older than
+// 24h) on every successful write, so the table never grows unbounded
+// without a separate sweep job.
+func (s *Server) withIdempotency(w http.ResponseWriter, r *http.Request, devID, acctID string, do func() (int, any)) {
 	key := r.Header.Get("Idempotency-Key")
 	if key == "" {
 		status, body := do()
 		writeJSON(w, status, body)
 		return
 	}
+	hash := operationHash(r, acctID)
 
-	sum := sha256.Sum256(rawBodyFrom(r.Context()))
-	hash := hex.EncodeToString(sum[:])
-
-	if stored, err := s.store.GetIdempotency(devID, key); err == nil {
-		var rec idempotencyRecord
-		if json.Unmarshal(stored, &rec) == nil {
-			if rec.Hash != hash {
-				writeError(w, http.StatusConflict, "idempotency_conflict",
-					"this Idempotency-Key was already used with a different request body")
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(rec.Status)
-			_, _ = w.Write(rec.Body)
-			return
-		}
-	} else if !errors.Is(err, store.ErrNotFound) {
+	won, err := s.store.ReserveIdempotency(devID, key)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	if !won {
+		s.replayOrConflict(w, devID, key, hash)
 		return
 	}
 
 	status, body := do()
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
+		_ = s.store.DeleteIdempotency(devID, key)
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
@@ -143,10 +156,45 @@ func (s *Server) withIdempotency(w http.ResponseWriter, r *http.Request, devID s
 			s.store.PurgeIdempotency(time.Now().Add(-24 * time.Hour))
 			_ = s.store.PutIdempotency(devID, key, recJSON)
 		}
+	} else {
+		// The operation failed: release the reservation so a client that
+		// retries with the same key (the whole point of sending one) gets to
+		// try again instead of being told "in progress" indefinitely.
+		_ = s.store.DeleteIdempotency(devID, key)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(bodyJSON)
+}
+
+// replayOrConflict handles every caller that lost the ReserveIdempotency
+// race: the key belongs to someone else's request, either still running
+// (an empty placeholder response) or already finished (a real one).
+func (s *Server) replayOrConflict(w http.ResponseWriter, devID, key, hash string) {
+	stored, err := s.store.GetIdempotency(devID, key)
+	if err != nil || len(stored) == 0 {
+		// Either the reservation is still a placeholder (winner hasn't
+		// finished do() yet) or it just vanished — the winner's operation
+		// failed and released it in the instant between our lost reservation
+		// and this read. Both are transient "try again shortly", not a
+		// permanent conflict, but a 409 here is the safe answer either way:
+		// it never re-runs the operation and never fabricates a response.
+		writeError(w, http.StatusConflict, "idempotency_conflict", "a request with this key is in progress")
+		return
+	}
+	var rec idempotencyRecord
+	if json.Unmarshal(stored, &rec) != nil || rec.Status == 0 {
+		writeError(w, http.StatusConflict, "idempotency_conflict", "a request with this key is in progress")
+		return
+	}
+	if rec.Hash != hash {
+		writeError(w, http.StatusConflict, "idempotency_conflict",
+			"this Idempotency-Key was already used with a different request")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rec.Status)
+	_, _ = w.Write(rec.Body)
 }
 
 // ---- chats ----
@@ -208,8 +256,10 @@ func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dev, _ := developerFrom(r.Context())
-	s.withIdempotency(w, r, dev.ID, func() (int, any) {
+	s.withIdempotency(w, r, dev.ID, acct.ID, func() (int, any) {
 		phone := req.Phone
+		var existing model.Attendee
+		haveExisting := false
 		if req.AttendeeID != "" {
 			att, err := s.store.GetAttendee(acct.ID, req.AttendeeID)
 			if err != nil {
@@ -219,6 +269,7 @@ func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 				return http.StatusInternalServerError, apiErr("internal", err.Error())
 			}
 			phone = att.Phone
+			existing, haveExisting = att, true
 		}
 
 		chatID, err := chatter.StartDirect(r.Context(), acct.ID, phone)
@@ -228,19 +279,35 @@ func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.UpsertChat(model.Chat{ID: chatID, AccountID: acct.ID, Kind: "direct"}); err != nil {
 			return http.StatusInternalServerError, apiErr("internal", err.Error())
 		}
-		attID := req.AttendeeID
-		if attID == "" {
-			attID = chatID
-		}
-		if err := s.store.UpsertAttendee(model.Attendee{ID: attID, Phone: phone}, acct.ID); err != nil {
-			return http.StatusInternalServerError, apiErr("internal", err.Error())
+		switch {
+		case haveExisting:
+			// UpsertAttendee is a full profile overwrite, not a merge — reuse
+			// the attendee we already fetched (name, is_self intact) instead
+			// of writing back a bare {id, phone} that would blank it. Only
+			// write at all when there's something new to record.
+			if existing.Phone == "" && phone != "" {
+				existing.Phone = phone
+				if err := s.store.UpsertAttendee(existing, acct.ID); err != nil {
+					return http.StatusInternalServerError, apiErr("internal", err.Error())
+				}
+			}
+		default:
+			// No attendee_id was given: phone alone identified the recipient,
+			// so there is no existing profile to protect and chatID doubles
+			// as a serviceable attendee id for a brand-new direct chat.
+			if err := s.store.UpsertAttendee(model.Attendee{ID: chatID, Phone: phone}, acct.ID); err != nil {
+				return http.StatusInternalServerError, apiErr("internal", err.Error())
+			}
 		}
 
 		full, status, apierr := s.sendChatText(r.Context(), acct, chatter, chatID, req.Text, "")
 		if apierr != nil {
 			return status, apierr
 		}
-		c, _ := s.store.GetChat(acct.ID, chatID)
+		c, err := s.store.GetChat(acct.ID, chatID)
+		if err != nil {
+			return http.StatusInternalServerError, apiErr("internal", err.Error())
+		}
 		s.dispatcher.Emit(model.Event{Type: model.EventChatSent, AccountID: acct.ID, Message: &full, Chat: &c})
 		return http.StatusCreated, map[string]any{"chat": c, "message": full}
 	})
@@ -386,11 +453,26 @@ func (s *Server) sendChatText(ctx context.Context, acct model.Account, chatter p
 		_ = s.store.DeleteChatMessageRow(acct.ID, tmpID)
 		return model.ChatMessage{}, http.StatusBadGateway, apiErr("provider_error", err.Error())
 	}
-	_ = s.store.RenameChatMessage(acct.ID, tmpID, res.MessageID)
-	_ = s.store.SetMessageStatus(acct.ID, []string{res.MessageID}, "sent")
+	// Promote the tmp row to the provider's id. This can lose a race: the
+	// chat runtime's own socket may deliver this same send back as an
+	// inbound "echo" and insert it under res.MessageID before we get here,
+	// so the rename's UPDATE collides on the (account_id, id) primary key.
+	// When that happens the echo row already holds the right content, so the
+	// tmp row is now pure debris — discard it and report the echo row as the
+	// outcome instead of failing the request.
+	if err := s.store.RenameChatMessage(acct.ID, tmpID, res.MessageID); err != nil {
+		_ = s.store.DeleteChatMessageRow(acct.ID, tmpID)
+	}
+	if err := s.store.SetMessageStatus(acct.ID, []string{res.MessageID}, "sent"); err != nil {
+		return model.ChatMessage{}, http.StatusInternalServerError, apiErr("internal", err.Error())
+	}
 	_ = s.store.BumpChat(acct.ID, chatID, row.SentAt, 0)
 	full, err := s.store.GetChatMessage(acct.ID, res.MessageID)
 	if err != nil {
+		// Neither the renamed tmp row nor a pre-existing echo row exists —
+		// genuinely unexpected (SetMessageStatus above touched zero rows too
+		// in that case), so this is the one path that must surface as a 500
+		// rather than silently returning an empty message.
 		return model.ChatMessage{}, http.StatusInternalServerError, apiErr("internal", err.Error())
 	}
 	return full, http.StatusCreated, nil
@@ -424,7 +506,7 @@ func (s *Server) handleSendChatMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dev, _ := developerFrom(r.Context())
-	s.withIdempotency(w, r, dev.ID, func() (int, any) {
+	s.withIdempotency(w, r, dev.ID, acct.ID, func() (int, any) {
 		if _, err := s.store.GetChat(acct.ID, chatID); err != nil {
 			return http.StatusNotFound, apiErr("not_found", "no such chat")
 		}
@@ -432,7 +514,10 @@ func (s *Server) handleSendChatMessage(w http.ResponseWriter, r *http.Request) {
 		if apierr != nil {
 			return status, apierr
 		}
-		c, _ := s.store.GetChat(acct.ID, chatID)
+		c, err := s.store.GetChat(acct.ID, chatID)
+		if err != nil {
+			return http.StatusInternalServerError, apiErr("internal", err.Error())
+		}
 		s.dispatcher.Emit(model.Event{Type: model.EventChatSent, AccountID: acct.ID, Message: &full, Chat: &c})
 		return status, full
 	})
@@ -552,13 +637,24 @@ func (s *Server) handleReactToMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Emoji is a *string, not a string: the spec makes "" a meaningful,
+	// documented request ("remove this reaction"), so it must stay
+	// distinguishable from the field being left out of the body entirely,
+	// which is far more likely a client bug (a dropped field, an empty
+	// struct) than a deliberate removal.
 	var req struct {
-		Emoji string `json:"emoji"`
+		Emoji *string `json:"emoji"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
+	if req.Emoji == nil {
+		writeError(w, http.StatusBadRequest, "missing_emoji",
+			`emoji is required (send "" to remove an existing reaction)`)
+		return
+	}
+	emoji := *req.Emoji
 	if _, ok := s.messageAndChat(w, r, acct); !ok {
 		return
 	}
@@ -568,11 +664,11 @@ func (s *Server) handleReactToMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	if err := chatter.React(r.Context(), acct.ID, chatID, mid, req.Emoji); err != nil {
+	if err := chatter.React(r.Context(), acct.ID, chatID, mid, emoji); err != nil {
 		writeProviderError(w, err)
 		return
 	}
-	reaction := model.Reaction{AttendeeID: self.ID, Emoji: req.Emoji, At: time.Now().UTC()}
+	reaction := model.Reaction{AttendeeID: self.ID, Emoji: emoji, At: time.Now().UTC()}
 	if err := s.store.ApplyReaction(acct.ID, mid, reaction); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "no such message")

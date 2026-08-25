@@ -31,7 +31,13 @@ func accountID(r *http.Request, fromBody string) string {
 	return fromBody
 }
 
-func (s *Server) resolveID(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Mailbox, bool) {
+// resolveAccount validates ?account_id (or the given id) against the calling
+// developer and returns the owning provider, with no capability check yet.
+// It is the ownership-only core shared by resolveID (which adds the mailbox
+// check) and resolveChatAccount (which adds the chatter check) — capability
+// checks must happen after ownership so a cross-tenant probe always 404s
+// before it can learn anything about what kind of account it hit.
+func (s *Server) resolveAccount(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Provider, bool) {
 	log := logx.From(r.Context())
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing_account_id", "account_id is required")
@@ -49,9 +55,28 @@ func (s *Server) resolveID(w http.ResponseWriter, r *http.Request, id string) (m
 		return model.Account{}, nil, false
 	}
 	log.Debug("ownership check", "account_id", id, "result", "ok", "provider", acct.Provider, "status", acct.Status)
-	mailbox, err := s.mailboxFor(acct)
+	p, err := s.registry.Get(acct.Provider)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unknown_provider", err.Error())
+		return model.Account{}, nil, false
+	}
+	return acct, p, true
+}
+
+// resolveID is resolveAccount plus the mail capability check: a chat account
+// has no Mailbox(), so without this a mail handler would dereference a nil
+// interface. Every mail route goes through this (via resolve/accountID),
+// which is what makes "chats on a mail account" and "mail on a chat account"
+// both 400 unsupported_for_kind rather than a panic or a wrong-shaped 200.
+func (s *Server) resolveID(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Mailbox, bool) {
+	acct, p, ok := s.resolveAccount(w, r, id)
+	if !ok {
+		return model.Account{}, nil, false
+	}
+	mailbox := p.Mailbox()
+	if mailbox == nil {
+		writeError(w, http.StatusBadRequest, "unsupported_for_kind",
+			"this account is a chat account; use /api/v1/chats")
 		return model.Account{}, nil, false
 	}
 	return acct, mailbox, true

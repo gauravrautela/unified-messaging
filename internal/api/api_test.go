@@ -1733,3 +1733,204 @@ func TestSendFailureLeavesNoRow(t *testing.T) {
 		t.Fatalf("row left behind: %+v", msgs)
 	}
 }
+
+// TestSendRenameCollisionUsesEchoRow covers fix-round finding 1: the chat
+// runtime's own socket can deliver a send's "echo" and insert it under the
+// provider's real id before the HTTP handler gets to rename its tmp row, so
+// the rename's UPDATE collides on the (account_id, id) primary key. The
+// handler must discard its now-stale tmp row and report the pre-existing
+// echo row as the outcome, not orphan the tmp row or 500.
+func TestSendRenameCollisionUsesEchoRow(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.fake().SendResult = provider.SendResult{MessageID: "ECHO1"}
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "ECHO1", ChatID: "c1",
+		Sender: model.Attendee{ID: "seed-self", IsSelf: true}, IsFromMe: true,
+		Kind: "text", Text: "hello", SentAt: time.Now(), Status: "sending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := withKey(httptest.NewRequest("POST", "/api/v1/chats/c1/messages?account_id="+acc, strings.NewReader(`{"text":"hello"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"id":"ECHO1"`) || !strings.Contains(rec.Body.String(), `"status":"sent"`) {
+		t.Fatalf("send with rename collision: %d %s", rec.Code, rec.Body.String())
+	}
+	msgs, _, err := db.ListChatMessages(acc, "c1", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if strings.HasPrefix(m.ID, "tmp_") {
+			t.Fatalf("orphaned tmp row left behind: %+v", m)
+		}
+	}
+}
+
+// TestIdempotencyKeyScopedToOperation covers fix-round finding 2 (ruling):
+// the same Idempotency-Key reused across two different chats must conflict
+// rather than replay one chat's cached response into the other, since a
+// message-send route's account/chat identity rides the URL, not the JSON
+// body the hash used to cover alone.
+func TestIdempotencyKeyScopedToOperation(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	if err := db.UpsertChat(model.Chat{ID: "c2", AccountID: acc, Kind: "direct"}); err != nil {
+		t.Fatal(err)
+	}
+	s.fake().SendResult = provider.SendResult{MessageID: "R1"}
+	send := func(path string) *httptest.ResponseRecorder {
+		req := withKey(httptest.NewRequest("POST", path, strings.NewReader(`{"text":"hi"}`)), key)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "shared-key")
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, req)
+		return rec
+	}
+	first := send("/api/v1/chats/c1/messages?account_id=" + acc)
+	if first.Code != 201 {
+		t.Fatalf("first send: %d %s", first.Code, first.Body.String())
+	}
+	second := send("/api/v1/chats/c2/messages?account_id=" + acc)
+	if second.Code != 409 || !strings.Contains(second.Body.String(), "idempotency_conflict") {
+		t.Fatalf("cross-chat same key: %d %s", second.Code, second.Body.String())
+	}
+	if got := s.fake().Commands(); len(got) != 1 {
+		t.Fatalf("provider called %d times, want 1: %v", len(got), got)
+	}
+}
+
+// TestConcurrentIdempotentSendsCallProviderOnce covers fix-round finding 5
+// (ruling): two requests racing on the same Idempotency-Key must not both
+// reach the provider. Exactly one wins the reservation and calls SendText;
+// the other either replays the winner's response or gets a conflict — never
+// a 5xx, and never a second provider call.
+func TestConcurrentIdempotentSendsCallProviderOnce(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.fake().SendResult = provider.SendResult{MessageID: "ONE"}
+	h := s.Routes()
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := withKey(httptest.NewRequest("POST", "/api/v1/chats/c1/messages?account_id="+acc, strings.NewReader(`{"text":"race"}`)), key)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", "race-key")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for _, c := range codes {
+		if c >= 500 {
+			t.Fatalf("got a 5xx: %v", codes)
+		}
+		if c != 201 && c != 409 {
+			t.Fatalf("unexpected status: %v", codes)
+		}
+	}
+	if got := s.fake().Commands(); len(got) != 1 {
+		t.Fatalf("provider called %d times, want 1: %v", len(got), got)
+	}
+}
+
+// TestStartChatByAttendeeIDPreservesAttendeeProfile covers fix-round finding
+// 3: UpsertAttendee is a full profile overwrite, so starting a chat by
+// attendee_id must not blank the attendee's existing name/is_self by writing
+// back a bare {id, phone} stand-in.
+func TestStartChatByAttendeeIDPreservesAttendeeProfile(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID) // seeds a1: {ID:"a1", Phone:"+919900000000", Name:"Seed"}
+	before, err := db.GetAttendee(acc, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := withKey(httptest.NewRequest("POST", "/api/v1/chats", strings.NewReader(`{"account_id":"`+acc+`","attendee_id":"a1","text":"hey"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != 201 {
+		t.Fatalf("start by attendee_id: %d %s", rec.Code, rec.Body.String())
+	}
+	after, err := db.GetAttendee(acc, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Name != before.Name || after.IsSelf != before.IsSelf || after.Phone != before.Phone {
+		t.Fatalf("attendee profile changed: before=%+v after=%+v", before, after)
+	}
+}
+
+// TestMailRoutesRejectChatAccount covers fix-round finding 4: resolveID must
+// reject a chat account with 400 unsupported_for_kind rather than handing a
+// mail handler a nil Mailbox to dereference.
+func TestMailRoutesRejectChatAccount(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		var req *http.Request
+		if body != "" {
+			req = withKey(httptest.NewRequest(method, path, strings.NewReader(body)), key)
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req = withKey(httptest.NewRequest(method, path, nil), key)
+		}
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := do("GET", "/api/v1/emails?account_id="+acc, ""); rec.Code != 400 || !strings.Contains(rec.Body.String(), "unsupported_for_kind") {
+		t.Fatalf("get emails on chat account: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do("POST", "/api/v1/emails", `{"account_id":"`+acc+`","to":[{"email":"x@y.com"}],"subject":"s","body":"b"}`); rec.Code != 400 || !strings.Contains(rec.Body.String(), "unsupported_for_kind") {
+		t.Fatalf("post emails on chat account: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestReactionRequiresEmojiField covers the "quick minor": a body that omits
+// emoji entirely (or sends invalid JSON for it) is almost certainly a client
+// bug and must 400, while an explicit "" is the spec's documented way to
+// remove a reaction and must keep working.
+func TestReactionRequiresEmojiField(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.fake().SendResult = provider.SendResult{MessageID: "M1"}
+	send := withKey(httptest.NewRequest("POST", "/api/v1/chats/c1/messages?account_id="+acc, strings.NewReader(`{"text":"hi"}`)), key)
+	send.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, send)
+	if rec.Code != 201 {
+		t.Fatalf("seed message: %d %s", rec.Code, rec.Body.String())
+	}
+
+	missing := withKey(httptest.NewRequest("PUT", "/api/v1/chats/c1/messages/M1/reaction?account_id="+acc, strings.NewReader(`{}`)), key)
+	missing.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, missing)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "missing_emoji") {
+		t.Fatalf("missing emoji: %d %s", rec.Code, rec.Body.String())
+	}
+
+	remove := withKey(httptest.NewRequest("PUT", "/api/v1/chats/c1/messages/M1/reaction?account_id="+acc, strings.NewReader(`{"emoji":""}`)), key)
+	remove.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, remove)
+	if rec.Code != 204 {
+		t.Fatalf("explicit empty emoji (remove) should still work: %d %s", rec.Code, rec.Body.String())
+	}
+}
