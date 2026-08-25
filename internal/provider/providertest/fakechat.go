@@ -16,11 +16,12 @@ import (
 type FakeChat struct {
 	name string
 
-	mu        sync.Mutex
-	sessions  []*fakeSession
-	sinks     map[string]provider.EventSink
-	commands  []string
-	forgotten []string
+	mu             sync.Mutex
+	sessions       []*fakeSession
+	sinks          map[string]provider.EventSink
+	commands       []string
+	forgotten      []string
+	startLinkDelay time.Duration
 
 	// Script knobs.
 	Roster     func(accountID string) ([]model.Chat, []model.Attendee, []model.ChatMember, error)
@@ -90,7 +91,24 @@ func (s *fakeSession) resolve(r provider.LinkResult) bool {
 	return true
 }
 
+// SetStartLinkDelay makes every subsequent StartLink call sleep for d before
+// returning, so a test can simulate a slow (or, with a large d, effectively
+// hung) provider dial without any real network dependency. Guarded by mu:
+// unlike the other script knobs, tests mutate this one while a StartLink
+// call may already be reading it concurrently.
+func (f *FakeChat) SetStartLinkDelay(d time.Duration) {
+	f.mu.Lock()
+	f.startLinkDelay = d
+	f.mu.Unlock()
+}
+
 func (f *FakeChat) StartLink(ctx context.Context) (provider.LinkSession, error) {
+	f.mu.Lock()
+	delay := f.startLinkDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	s := &fakeSession{codes: make(chan provider.LinkCode, 16), result: make(chan provider.LinkResult, 1)}
 	f.mu.Lock()
 	f.sessions = append(f.sessions, s)

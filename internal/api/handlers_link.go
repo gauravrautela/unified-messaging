@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sync"
@@ -29,13 +30,19 @@ import (
 // notify_url / retry, not the pairing window.
 const linkTTL = 3 * time.Minute
 
-// link is one in-flight (or just-finished) pairing attempt. Everything after
-// creation is read or written through pumpLink's single goroutine except for
-// the mutex-guarded fields a concurrent /qr poll also touches.
+// link is one in-flight (or just-finished) pairing attempt. ready is closed
+// exactly once — when session has been set (StartLink succeeded) or startErr
+// has been set (it failed) — which is what lets a concurrent poll that lost
+// the create race wait for the outcome without ever touching the registry
+// lock. Everything after that is read or written through pumpLink's single
+// goroutine except for the mutex-guarded fields a concurrent /qr poll also
+// touches.
 type link struct {
-	session provider.LinkSession
+	ready chan struct{}
 
 	mu         sync.Mutex
+	session    provider.LinkSession
+	startErr   error
 	code       provider.LinkCode
 	result     *provider.LinkResult
 	accountID  string
@@ -90,40 +97,73 @@ func (lr *linkRegistry) get(state string) *link {
 	return lr.links[state]
 }
 
-// getOrStart returns the existing link for state, or starts one via start
-// and installs it. The whole check-then-create runs under lr.mu, so two
-// concurrent first polls for the same state can never both call start: the
-// loser gets the winner's link back with created=false and must not spend
-// its own session (the caller closes it). Holding the lock across start is
-// deliberate — StartLink only opens an in-memory pairing session, never a
-// blocking network round trip, so this cannot stall other states' polls for
-// longer than that.
-func (lr *linkRegistry) getOrStart(state string, start func() (provider.LinkSession, error), successURL string) (l *link, created bool, err error) {
+// getOrStart returns the existing link for state, or installs a placeholder
+// and starts one via start. Only the check-then-insert of the placeholder
+// runs under lr.mu; start itself (StartLink, for a real provider a blocking
+// network dial) runs after the lock is released, so one state's dial can
+// never stall another state's poll, or the sweeper, behind the registry
+// lock. created reports whether this call is the one that installed the
+// placeholder and ran start — the caller starts pumpLink only then, and only
+// once it has confirmed start actually succeeded (l.startErr == nil): a
+// concurrent caller that lost the create race gets the same *link back with
+// created=false and must wait on l.ready before trusting anything on it.
+func (lr *linkRegistry) getOrStart(state string, start func() (provider.LinkSession, error), successURL string) (l *link, created bool) {
 	lr.mu.Lock()
-	defer lr.mu.Unlock()
 	if existing, ok := lr.links[state]; ok {
-		return existing, false, nil
+		lr.mu.Unlock()
+		return existing, false
 	}
+	l = &link{ready: make(chan struct{}), successURL: successURL, started: time.Now()}
+	lr.links[state] = l
+	lr.mu.Unlock()
+
 	sess, err := start()
 	if err != nil {
-		return nil, false, err
+		lr.mu.Lock()
+		if lr.links[state] == l {
+			delete(lr.links, state)
+		}
+		lr.mu.Unlock()
+		l.mu.Lock()
+		l.startErr = err
+		l.mu.Unlock()
+		close(l.ready)
+		return l, true
 	}
-	l = &link{session: sess, successURL: successURL, started: time.Now()}
-	lr.links[state] = l
-	return l, true, nil
+
+	l.mu.Lock()
+	l.session = sess
+	l.mu.Unlock()
+	close(l.ready)
+	return l, true
 }
 
 // sweep closes and drops every link older than maxAge. It is the backstop
 // against a browser that never comes back to poll: without it, an abandoned
-// session's provider-side link would stay open indefinitely.
+// session's provider-side link would stay open indefinitely. Closing runs
+// after the registry lock is released — a session's Close can be exactly as
+// slow as StartLink was, and the lock must never be held across provider I/O.
+// A link whose StartLink is still in flight (session not yet set) has
+// nothing to close yet; it is still dropped from the registry, and whatever
+// StartLink eventually returns for it is simply never used.
 func (lr *linkRegistry) sweep(maxAge time.Duration) {
-	lr.mu.Lock()
-	defer lr.mu.Unlock()
 	now := time.Now()
+	lr.mu.Lock()
+	var stale []*link
 	for state, l := range lr.links {
 		if now.Sub(l.started) > maxAge {
-			l.session.Close()
+			stale = append(stale, l)
 			delete(lr.links, state)
+		}
+	}
+	lr.mu.Unlock()
+
+	for _, l := range stale {
+		l.mu.Lock()
+		sess := l.session
+		l.mu.Unlock()
+		if sess != nil {
+			sess.Close()
 		}
 	}
 }
@@ -199,16 +239,31 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 
 	// The session must outlive this request: the end user has not scanned
 	// anything yet, and the request/response round trip is over long before
-	// that happens. getOrStart guarantees only one caller ever wins the race
-	// to actually start one for this state; a loser's own session (if start
-	// somehow ran twice — it cannot, but defensively) would otherwise leak.
-	l, created, err := s.links.getOrStart(state, func() (provider.LinkSession, error) {
+	// that happens. getOrStart guarantees only one caller ever calls
+	// StartLink for this state; everyone else gets the same placeholder back
+	// and waits below.
+	l, created := s.links.getOrStart(state, func() (provider.LinkSession, error) {
 		return p.Linker().StartLink(context.Background())
 	}, pending.SuccessURL)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
+
+	if !created {
+		// Someone else's StartLink is in flight for this state. Wait for it
+		// to resolve, but only up to a bound: a hung dial must delay this one
+		// poll, never every poll for this state forever.
+		select {
+		case <-l.ready:
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	l.mu.Lock()
+	startErr := l.startErr
+	l.mu.Unlock()
+	if startErr != nil {
+		writeError(w, http.StatusBadGateway, "provider_error", startErr.Error())
 		return
 	}
+
 	if created {
 		go s.pumpLink(state, pending, l)
 	}
@@ -271,6 +326,10 @@ func (s *Server) finishLink(state string, pending store.OAuthState, l *link, res
 				"message": "connect link expired before pairing completed",
 			})
 		}
+		// The provider may have already paired successfully before the link
+		// itself expired; that device must not linger registered with no
+		// account behind it.
+		s.forgetDeviceOnFailure(ctx, log, pending.Provider, res.DeviceJID)
 		expired := provider.LinkResult{Err: provider.ErrLinkTimeout}
 		l.mu.Lock()
 		l.result = &expired
@@ -302,6 +361,10 @@ func (s *Server) finishLink(state string, pending store.OAuthState, l *link, res
 		if pending.NotifyURL != "" {
 			s.notify(pending.NotifyURL, map[string]any{"status": "FAILED", "error": "link_failed", "message": err.Error()})
 		}
+		// The provider paired this device; our own bookkeeping is what
+		// rejected it, so the device is real and must not be left registered
+		// with no account behind it.
+		s.forgetDeviceOnFailure(ctx, log, pending.Provider, res.DeviceJID)
 		failed := provider.LinkResult{Err: err}
 		l.mu.Lock()
 		l.result = &failed
@@ -336,6 +399,25 @@ func (s *Server) finishLink(state string, pending store.OAuthState, l *link, res
 	l.result = &res
 	l.accountID = acct.ID
 	l.mu.Unlock()
+}
+
+// forgetDeviceOnFailure drops a device's local credentials after a pairing
+// attempt is abandoned post-hoc — the connect link expired, or account
+// bookkeeping rejected an otherwise-successful pairing — even though the
+// provider itself considers the device paired. A no-op when the pairing
+// never actually produced a device (res.DeviceJID empty) or the provider is
+// no longer resolvable.
+func (s *Server) forgetDeviceOnFailure(ctx context.Context, log *slog.Logger, providerName, deviceJID string) {
+	if deviceJID == "" {
+		return
+	}
+	p, err := s.registry.Get(providerName)
+	if err != nil || p.Chat() == nil {
+		return
+	}
+	if err := p.Chat().Forget(ctx, deviceJID); err != nil {
+		log.Warn("forgetting device after failed link", "err", err)
+	}
 }
 
 // ---------- the linker connect page ----------

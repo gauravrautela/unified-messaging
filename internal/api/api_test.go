@@ -1422,6 +1422,17 @@ func TestFinishLinkNotifiesExpiredWhenLinkExpiresDuringPairing(t *testing.T) {
 		_ = json.Unmarshal(rec.Body.Bytes(), &q)
 		return q.Status == "expired"
 	})
+	// The provider had already paired the device before the link expired;
+	// leaving it registered with no account behind it would be a lingering
+	// credential, so finishLink must forget it.
+	waitFor(t, func() bool {
+		for _, jid := range s.fake().Forgotten() {
+			if jid == "919888000001:1@s.whatsapp.net" {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // A pairing that succeeds at the provider but fails to become an account
@@ -1471,6 +1482,16 @@ func TestFinishLinkNotifiesFailedWhenAccountCreationFails(t *testing.T) {
 		_ = json.Unmarshal(rec.Body.Bytes(), &q)
 		return q.Status == "failed"
 	})
+	// The provider paired "somejid"; our own bookkeeping rejected it, so that
+	// device must not be left registered with no account behind it.
+	waitFor(t, func() bool {
+		for _, jid := range s.fake().Forgotten() {
+			if jid == "somejid" {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // resolveProvider's mail-only fallback must never fall through to
@@ -1508,4 +1529,54 @@ func TestResolveProviderRequiresNameWithoutExactlyOneMailProvider(t *testing.T) 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("named provider among several: status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
+}
+
+// A slow (or hung) StartLink for one state must never stall a /qr poll for a
+// different state. Before the fix, getOrStart held the registry lock across
+// the entire StartLink call — for the real whatsmeow adapter, a blocking
+// network dial — so one slow dial serialized every other state's poll (and
+// the sweeper) behind it.
+func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	mint := func() string {
+		req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var r hostedAuthResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &r)
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+		return r.State
+	}
+
+	slowState := mint()
+	fastState := mint()
+
+	s.fake().SetStartLinkDelay(time.Second)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+slowState+"/qr", nil))
+	}()
+	// Give the slow poll time to actually enter StartLink (past the delay
+	// read) before the fast one races it.
+	time.Sleep(100 * time.Millisecond)
+	s.fake().SetStartLinkDelay(0)
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+fastState+"/qr", nil))
+	elapsed := time.Since(start)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fast state poll: %d %s", rec.Code, rec.Body.String())
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("fast state's /qr took %v while a different state's StartLink was in flight; the registry lock is still held across StartLink", elapsed)
+	}
+
+	<-done // avoid leaking the slow poll's goroutine past the test
 }
