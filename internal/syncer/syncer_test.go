@@ -71,6 +71,11 @@ func (f *fakeGraph) handler() http.Handler {
 		case r.URL.Path == "/me/mailFolders/F_INBOX/messages/delta":
 			f.serveInboxDelta(w, r)
 
+		// M3 arrives with an attachment; the webhook payload should list it
+		// without the subscriber making a second call.
+		case r.URL.Path == "/me/messages/M3/attachments":
+			writeJSON(w, `{"value":[{"id":"A1","name":"q3.pdf","contentType":"application/pdf","size":1234,"isInline":false}]}`)
+
 		case r.URL.Path == "/me/mailFolders/F_SENT/messages/delta":
 			writeJSON(w, fmt.Sprintf(`{"value":[],"@odata.deltaLink":%q}`,
 				f.url+"/me/mailFolders/F_SENT/messages/delta?$deltatoken=SD1"))
@@ -95,7 +100,9 @@ func (f *fakeGraph) serveInboxDelta(w http.ResponseWriter, r *http.Request) {
 	case q.Get("$deltatoken") == "D1":
 		// Incremental round: one arrival, one departure.
 		writeJSON(w, fmt.Sprintf(`{"value":[%s,{"id":"M1","@removed":{"reason":"deleted"}}],"@odata.deltaLink":%q}`,
-			messageJSON("M3", "Third", "2026-08-20T11:00:00Z"), base+"?$deltatoken=D2"))
+			strings.Replace(messageJSON("M3", "Third", "2026-08-20T11:00:00Z"),
+				`"hasAttachments":false`, `"hasAttachments":true`, 1),
+			base+"?$deltatoken=D2"))
 
 	case q.Get("$deltatoken") == "D2":
 		writeJSON(w, fmt.Sprintf(`{"value":[],"@odata.deltaLink":%q}`, base+"?$deltatoken=D2"))
@@ -258,16 +265,28 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	}
 
 	seen := map[string]string{}
+	var received *model.Email
 	for _, ev := range got {
 		switch {
 		case ev.Email != nil:
 			seen[ev.Type] = ev.Email.ID
+			if ev.Type == model.EventMailReceived {
+				received = ev.Email
+			}
 		default:
 			seen[ev.Type] = ev.EmailID
 		}
 	}
 	if seen[model.EventMailReceived] != "M3" {
 		t.Fatalf("expected mail_received for M3, got %+v", seen)
+	}
+	// The event carries what a subscriber needs to act without calling back:
+	// which well-known folder it landed in, and the attachment list.
+	if received.Role != "inbox" {
+		t.Fatalf("mail_received role = %q, want inbox", received.Role)
+	}
+	if len(received.Attachments) != 1 || received.Attachments[0].Name != "q3.pdf" {
+		t.Fatalf("mail_received attachments = %+v, want [q3.pdf]", received.Attachments)
 	}
 	if seen[model.EventMailDeleted] != "M1" {
 		t.Fatalf("expected mail_deleted for M1, got %+v", seen)

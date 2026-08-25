@@ -173,7 +173,7 @@ All mail routes require `?account_id=…`.
 | `GET` | `/api/v1/folders` | |
 | `GET` | `/api/v1/threads` | |
 | `GET` | `/api/v1/emails` | `folder_id`, `folder_role=inbox`, `thread_id`, `unread=true`, `q=`, `limit`, `offset`. Bodies omitted |
-| `GET` | `/api/v1/emails/{id}` | Full body; falls back to the provider on a local miss |
+| `GET` | `/api/v1/emails/{id}` | The complete message: full `body` + `body_plain`, folder `role`, and `attachments` metadata (fetched once from the provider, then cached). Falls back to the provider on a local miss |
 | `PATCH` | `/api/v1/emails/{id}` | `{"read":true}` / `{"flagged":true}` |
 | `POST` | `/api/v1/emails` | Send. `reply_to_email_id` routes it through the reply path |
 | `POST` | `/api/v1/emails/{id}/reply` | `{"reply_all":true}` supported |
@@ -185,15 +185,42 @@ All mail routes require `?account_id=…`.
 
 ### Webhooks
 
+Webhooks are configured **per account**: each connected mailbox belongs to a
+different end user, so their mail can go to a different endpoint. A hook with
+no account is global and receives every account's events.
+
 | Method | Path |
 |---|---|
-| `POST` | `/api/v1/webhooks` — `{"url": "...", "secret": "...", "events": ["mail_received"]}` |
+| `POST` | `/api/v1/accounts/{id}/webhooks` — `{"url": "...", "name": "...", "secret": "...", "events": ["mail_received"]}` (events default to `mail_received`) |
+| `GET` | `/api/v1/accounts/{id}/webhooks` |
+| `DELETE` | `/api/v1/accounts/{id}/webhooks/{wid}` |
+| `POST` | `/api/v1/webhooks` — global; empty `events` means everything |
 | `GET` | `/api/v1/webhooks` |
 | `DELETE` | `/api/v1/webhooks/{id}` |
+| `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones |
 
-Deliveries carry `X-Outlook-Event` and, when a secret is set,
-`X-Outlook-Signature: sha256=<hex hmac of the raw body>`. Delivery is
-**at-least-once** — dedupe on `(type, email.id)`.
+The easiest way to set one is at connect time: pass `"webhook": {"url": ...,
+"secret": ...}` to `POST /api/v1/hosted-auth` and it is bound to the account
+the moment the user finishes signing in — before the first sync, so nothing is
+missed. The dashboard's account card has a small **Set webhook** form for the
+same thing.
+
+Each delivery is `{"type", "account_id", "timestamp", "webhook": {"id", "name"},
+"email": {...}}` where `email` is the full normalized message: `body`,
+`body_plain` (markup stripped), `from`/`to`/`cc`/`bcc`/`reply_to`, `role`
+(well-known folder: `inbox`, `sentitems`, …), `internet_message_id`,
+`thread_id`, `has_attachments`, and for new mail the `attachments` list
+(id, name, mime_type, size) so no follow-up call is needed. `webhook.name` is
+whatever you passed as `name` when registering the hook.
+
+Deliveries carry `X-Outlook-Event`, `X-Outlook-Delivery` (attempt number) and,
+when a secret is set, `X-Outlook-Signature: sha256=<hex hmac of the raw body>`.
+Delivery is **at-least-once** — dedupe on `(type, email.id)`.
+
+**Retries.** Anything other than a 2xx is a failure. The delivery is written to
+SQLite and retried on this schedule after the immediate first attempt:
+30s, 2m, 10m, 30m, 2h, 6h, 12h. After the last one it is marked `dead` and
+kept, visible via the `deliveries` endpoint. The queue survives restarts.
 
 ### Examples
 
@@ -307,8 +334,10 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   the next sync surfaces it in Sent Items. Replies and forwards do return one.
 - **Adopted subscriptions** (after a `409`) have no known `clientState`, so
   their notifications are verified by subscription ID alone.
-- **Event queue is in-memory.** A crash loses undelivered webhooks; the poll
-  re-converges the data but those events are not replayed.
+- **First delivery attempt is in-memory.** A crash between an event being
+  emitted and its first POST loses it; once it has failed once it is in SQLite
+  and survives restarts. The poll re-converges the data but those events are
+  not replayed.
 - **Scope listing is not incremental** for Outlook — the folder tree is relisted
   each round. Cheap at mailbox scale, but it is a full listing, not a delta.
 - **Single tenant.** One API key, one shared account pool.

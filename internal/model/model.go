@@ -70,6 +70,11 @@ type Email struct {
 	Snippet  string    `json:"snippet"`
 	Body     string    `json:"body,omitempty"`
 	BodyType string    `json:"body_type,omitempty"` // "html" or "text"
+	// BodyPlain is the body as text, with markup stripped when BodyType is html.
+	BodyPlain string `json:"body_plain,omitempty"`
+	// Role is the well-known role of the folder the message is in (inbox,
+	// sentitems, ...), when the folder has one. Set on events, not stored.
+	Role string `json:"role,omitempty"`
 
 	Read           bool `json:"read"`
 	Flagged        bool `json:"flagged"`
@@ -120,7 +125,13 @@ type SendAttachment struct {
 
 // Webhook is a caller-registered endpoint we deliver normalized events to.
 type Webhook struct {
-	ID        string    `json:"id"`
+	ID string `json:"id"`
+	// Name is a caller-chosen label echoed in every delivery, so one endpoint
+	// fed by several hooks can tell them apart.
+	Name string `json:"name,omitempty"`
+	// AccountID scopes the hook to one connected mailbox. Empty means global:
+	// the hook receives events from every account.
+	AccountID string    `json:"account_id,omitempty"`
 	URL       string    `json:"url"`
 	Secret    string    `json:"secret,omitempty"`
 	Events    []string  `json:"events"`
@@ -136,11 +147,28 @@ const (
 	EventAccountError = "account_status"
 )
 
+// KnownEvent reports whether name is one we emit (or the "*" wildcard).
+func KnownEvent(name string) bool {
+	switch name {
+	case "*", EventMailReceived, EventMailSent, EventMailUpdated, EventMailDeleted, EventAccountError:
+		return true
+	}
+	return false
+}
+
+// WebhookRef identifies, inside a delivery, the hook it was sent through.
+type WebhookRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
 type Event struct {
 	Type      string    `json:"type"`
 	AccountID string    `json:"account_id"`
 	Timestamp time.Time `json:"timestamp"`
-	Email     *Email    `json:"email,omitempty"`
-	EmailID   string    `json:"email_id,omitempty"`
-	Account   *Account  `json:"account,omitempty"`
+	// Webhook is filled in per delivery by the dispatcher.
+	Webhook *WebhookRef `json:"webhook,omitempty"`
+	Email   *Email      `json:"email,omitempty"`
+	EmailID string      `json:"email_id,omitempty"`
+	Account *Account    `json:"account,omitempty"`
 }

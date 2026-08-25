@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -79,30 +81,75 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 
 // ---- webhooks ----
 
-type createWebhookRequest struct {
+// webhookRequest is the body for registering a hook, global or per-account.
+type webhookRequest struct {
+	Name   string   `json:"name,omitempty"`
 	URL    string   `json:"url"`
 	Secret string   `json:"secret,omitempty"`
 	Events []string `json:"events,omitempty"`
 }
 
+func (r webhookRequest) validate() error {
+	if r.URL == "" {
+		return errors.New("url is required")
+	}
+	u, err := url.Parse(r.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("url %q must be an absolute http(s) URL", r.URL)
+	}
+	for _, e := range r.Events {
+		if !model.KnownEvent(e) {
+			return fmt.Errorf("unknown event %q", e)
+		}
+	}
+	return nil
+}
+
+// eventsOrDefault narrows an unspecified filter to new mail. Account-level
+// hooks are configured by callers who want "tell me when this user gets
+// mail"; the global endpoint keeps its historical "empty means everything".
+func (r webhookRequest) eventsOrDefault() []string {
+	if len(r.Events) == 0 {
+		return []string{model.EventMailReceived}
+	}
+	return r.Events
+}
+
+func newWebhook(accountID string, req webhookRequest) (model.Webhook, error) {
+	id, err := accounts.NewID("wh")
+	if err != nil {
+		return model.Webhook{}, err
+	}
+	return model.Webhook{
+		ID: id, AccountID: accountID, Name: req.Name, URL: req.URL, Secret: req.Secret,
+		Events: req.Events, CreatedAt: time.Now().UTC(),
+	}, nil
+}
+
+// createAccountWebhook is shared by the REST handler and the OAuth callback.
+func (s *Server) createAccountWebhook(accountID string, req webhookRequest) (model.Webhook, error) {
+	req.Events = req.eventsOrDefault()
+	hook, err := newWebhook(accountID, req)
+	if err != nil {
+		return hook, err
+	}
+	return hook, s.store.SaveWebhook(hook)
+}
+
 func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
-	var req createWebhookRequest
+	var req webhookRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	if req.URL == "" {
-		writeError(w, http.StatusBadRequest, "missing_url", "url is required")
+	if err := req.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
 		return
 	}
-	id, err := accounts.NewID("wh")
+	hook, err := newWebhook("", req)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
-	}
-	hook := model.Webhook{
-		ID: id, URL: req.URL, Secret: req.Secret,
-		Events: req.Events, CreatedAt: time.Now().UTC(),
 	}
 	if err := s.store.SaveWebhook(hook); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
@@ -111,6 +158,77 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	// Echo the secret back once so the caller can configure verification, then
 	// never again.
 	writeJSON(w, http.StatusCreated, hook)
+}
+
+// handleListWebhookDeliveries shows what is still waiting for a retry and what
+// was abandoned, so a caller can tell an outage's cost.
+func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.GetWebhook(id); err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		return
+	}
+	items, err := s.store.ListDeliveries(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, listResponse[store.Delivery]{Items: items})
+}
+
+// ---- per-account webhooks ----
+
+func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	if _, err := s.store.GetAccount(accountID); err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "account not found")
+		return
+	}
+	var req webhookRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	if err := req.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
+		return
+	}
+	hook, err := s.createAccountWebhook(accountID, req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, hook)
+}
+
+func (s *Server) handleListAccountWebhooks(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	if _, err := s.store.GetAccount(accountID); err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "account not found")
+		return
+	}
+	hooks, err := s.store.ListAccountWebhooks(accountID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	for i := range hooks {
+		hooks[i].Secret = ""
+	}
+	writeJSON(w, http.StatusOK, listResponse[model.Webhook]{Items: hooks})
+}
+
+func (s *Server) handleDeleteAccountWebhook(w http.ResponseWriter, r *http.Request) {
+	hook, err := s.store.GetWebhook(r.PathValue("wid"))
+	if err != nil || hook.AccountID != r.PathValue("id") {
+		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		return
+	}
+	if err := s.store.DeleteWebhook(hook.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleListWebhooks(w http.ResponseWriter, r *http.Request) {

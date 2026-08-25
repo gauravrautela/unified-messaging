@@ -27,7 +27,11 @@ type hostedAuthRequest struct {
 	// so the caller learns the account_id without depending on the browser
 	// completing its redirect.
 	NotifyURL string `json:"notify_url,omitempty"`
-	ExpiresIn int    `json:"expires_in_minutes,omitempty"`
+	// Webhook, when set, is registered against the account the moment it
+	// connects, so the caller starts receiving that user's mail with no second
+	// API call. Events default to mail_received.
+	Webhook   *webhookRequest `json:"webhook,omitempty"`
+	ExpiresIn int             `json:"expires_in_minutes,omitempty"`
 	// ForceConsent re-prompts even if Microsoft would otherwise sign the user in
 	// silently. Useful when scopes changed.
 	ForceConsent bool `json:"force_consent,omitempty"`
@@ -57,6 +61,17 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	if req.ExpiresIn <= 0 {
 		req.ExpiresIn = 30
 	}
+	var pendingHook *store.PendingWebhook
+	if req.Webhook != nil {
+		if err := req.Webhook.validate(); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
+			return
+		}
+		pendingHook = &store.PendingWebhook{
+			Name: req.Webhook.Name, URL: req.Webhook.URL, Secret: req.Webhook.Secret,
+			Events: req.Webhook.eventsOrDefault(),
+		}
+	}
 
 	p, err := s.resolveProvider(req.Provider)
 	if err != nil {
@@ -83,6 +98,7 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 		SuccessURL: req.SuccessRedirectURL,
 		FailureURL: req.FailureRedirectURL,
 		NotifyURL:  req.NotifyURL,
+		Webhook:    pendingHook,
 		ExpiresAt:  expiresAt,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
@@ -201,6 +217,17 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("account connected",
 		"account_id", acct.ID, "provider", acct.Provider, "email", acct.Email)
+
+	// Bind the connect-time webhook before the first sync runs, so nothing
+	// that backfill emits is missed.
+	if pending.Webhook != nil {
+		if _, err := s.createAccountWebhook(acct.ID, webhookRequest{
+			Name: pending.Webhook.Name, URL: pending.Webhook.URL,
+			Secret: pending.Webhook.Secret, Events: pending.Webhook.Events,
+		}); err != nil {
+			s.log.Error("registering connect-time webhook", "account_id", acct.ID, "err", err)
+		}
+	}
 
 	// Kick off the first sync and register for push. Detached from the request
 	// so the user's browser is not held open through a full backfill.

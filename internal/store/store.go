@@ -29,6 +29,14 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+	if _, err := db.Exec(postMigration); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -96,6 +104,9 @@ func (s *Store) MarkSynced(id string) error {
 }
 
 func (s *Store) DeleteAccount(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM webhooks WHERE account_id = ?`, id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`DELETE FROM accounts WHERE id = ?`, id)
 	return err
 }
@@ -389,6 +400,9 @@ func scanEmail(r scanner) (model.Email, error) {
 	_ = json.Unmarshal([]byte(bccJ), &e.Bcc)
 	_ = json.Unmarshal([]byte(rtJ), &e.ReplyTo)
 	_ = json.Unmarshal([]byte(attJ), &e.Attachments)
+	if e.Body != "" {
+		e.BodyPlain = model.PlainText(e.Body, e.BodyType)
+	}
 	e.Date = time.Unix(date, 0).UTC()
 	e.Read, e.Flagged, e.Draft, e.HasAttachments = read == 1, flagged == 1, draft == 1, hasAtt == 1
 	return e, nil

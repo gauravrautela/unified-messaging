@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -138,6 +139,7 @@ func (s *Server) handleGetEmail(w http.ResponseWriter, r *http.Request) {
 
 	email, err := s.store.GetEmail(acct.ID, id)
 	if err == nil {
+		s.complete(r.Context(), mailbox, &email)
 		writeJSON(w, http.StatusOK, email)
 		return
 	}
@@ -154,7 +156,34 @@ func (s *Server) handleGetEmail(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpsertEmail(email); err != nil {
 		s.log.Warn("caching fetched email", "err", err)
 	}
+	s.complete(r.Context(), mailbox, &email)
 	writeJSON(w, http.StatusOK, email)
+}
+
+// complete fills in what a single-message response should carry beyond the
+// stored row: the folder's well-known role, and attachment metadata (fetched
+// once from the provider, then cached on the row). Failures degrade to the
+// bare fields rather than failing the read.
+func (s *Server) complete(ctx context.Context, mailbox provider.Mailbox, e *model.Email) {
+	if folders, err := s.store.ListFolders(e.AccountID); err == nil {
+		for _, f := range folders {
+			if f.ID == e.FolderID {
+				e.Role = f.Role
+				break
+			}
+		}
+	}
+	if e.HasAttachments && len(e.Attachments) == 0 {
+		atts, err := mailbox.ListAttachments(ctx, e.AccountID, e.ID)
+		if err != nil {
+			s.log.Warn("listing attachments", "account_id", e.AccountID, "email_id", e.ID, "err", err)
+			return
+		}
+		e.Attachments = atts
+		if err := s.store.UpsertEmail(*e); err != nil {
+			s.log.Warn("caching attachments", "err", err)
+		}
+	}
 }
 
 type patchEmailRequest struct {

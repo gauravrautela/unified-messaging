@@ -86,7 +86,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 h1{font-size:1.35rem;margin:0}
 .sub{color:var(--muted);font-size:.85rem;margin-top:.15rem}
 button,.btn{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--text);
-  padding:.5rem .9rem;border-radius:8px}
+  padding:.5rem .9rem;border-radius:8px;text-decoration:none;font-size:.85rem}
 button:hover{border-color:var(--accent)}
 .primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
 .primary:hover{opacity:.92}
@@ -97,7 +97,7 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
 .gate{max-width:24rem;margin:4rem auto;text-align:center}
 .gate p{color:var(--muted);font-size:.9rem}
 .gate form{display:flex;flex-direction:column;gap:.75rem;margin-top:1rem}
-.row{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.9rem 0;border-bottom:1px solid var(--border)}
+.row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;padding:.9rem 0;border-bottom:1px solid var(--border)}
 .row:last-child{border-bottom:none}
 .who{min-width:0}
 .email{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -106,6 +106,14 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
 .status.ok{color:var(--ok);background:color-mix(in srgb, var(--ok) 15%, transparent)}
 .status.bad{color:var(--warn);background:color-mix(in srgb, var(--warn) 15%, transparent)}
 .actions{display:flex;gap:.4rem;flex-shrink:0}
+.hook{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin-top:.6rem;
+  padding-top:.6rem;border-top:1px dashed var(--border);font-size:.8rem;color:var(--muted)}
+.hook code{color:var(--text);word-break:break-all}
+.hook input{font:inherit;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;
+  background:var(--bg);color:var(--text);min-width:0}
+.hook input[name=url]{flex:1 1 14rem}
+.hook input[name=secret]{flex:0 1 9rem}
+.hook button{padding:.35rem .7rem;font-size:.8rem}
 .empty{color:var(--muted);text-align:center;padding:3rem 1rem;font-size:.9rem}
 .err{color:var(--danger);background:var(--danger-bg);border-radius:8px;padding:.6rem .8rem;font-size:.85rem;margin-bottom:1rem}
 .hidden{display:none}
@@ -214,11 +222,40 @@ function renderAccounts(items) {
       "</div>" +
       statusBadge(a.status) +
       '<div class="actions">' +
+        '<a class="btn" href="/mail?account_id=' + a.id + '">View mail</a>' +
         '<button data-action="resync">Resync</button>' +
         '<button data-action="disconnect" class="danger">Disconnect</button>' +
       "</div>" +
+      '<div class="hook" data-hook>Loading webhook&hellip;</div>' +
     "</div>"
   )).join("");
+  items.forEach((a) => loadWebhook(a.id));
+}
+
+// Each account has at most one webhook from this UI: new mail for that user
+// is POSTed there. The API allows several; the dashboard keeps it simple.
+async function loadWebhook(id) {
+  const el = document.querySelector('.row[data-id="' + id + '"] [data-hook]');
+  if (!el) return;
+  try {
+    const data = await api("/api/v1/accounts/" + id + "/webhooks");
+    renderWebhook(el, (data.items || [])[0]);
+  } catch (e) {
+    el.textContent = "Could not load webhook: " + e.message;
+  }
+}
+
+function renderWebhook(el, hook) {
+  if (hook) {
+    el.innerHTML =
+      "Webhook: <code>" + escapeHtml(hook.url) + "</code>" +
+      '<button data-action="remove-webhook" data-wid="' + hook.id + '" class="danger">Remove</button>';
+    return;
+  }
+  el.innerHTML =
+    '<input name="url" type="url" placeholder="https://your-app.example.com/hooks/mail" required>' +
+    '<input name="secret" type="text" placeholder="secret (optional)">' +
+    '<button data-action="set-webhook">Set webhook</button>';
 }
 
 function escapeHtml(s) {
@@ -236,6 +273,36 @@ $("list").addEventListener("click", async (e) => {
     try { await api("/api/v1/accounts/" + id + "/resync", { method: "POST" }); }
     catch (e) { alert("Resync failed: " + e.message); }
     btn.disabled = false;
+    return;
+  }
+  if (action === "set-webhook") {
+    const box = btn.closest("[data-hook]");
+    const url = box.querySelector('input[name=url]').value.trim();
+    const secret = box.querySelector('input[name=secret]').value.trim();
+    if (!url) return;
+    btn.disabled = true;
+    try {
+      await api("/api/v1/accounts/" + id + "/webhooks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, secret })
+      });
+      loadWebhook(id);
+    } catch (e) {
+      alert("Could not set webhook: " + e.message);
+      btn.disabled = false;
+    }
+    return;
+  }
+  if (action === "remove-webhook") {
+    btn.disabled = true;
+    try {
+      await api("/api/v1/accounts/" + id + "/webhooks/" + btn.dataset.wid, { method: "DELETE" });
+      loadWebhook(id);
+    } catch (e) {
+      alert("Could not remove webhook: " + e.message);
+      btn.disabled = false;
+    }
     return;
   }
   if (action === "disconnect") {

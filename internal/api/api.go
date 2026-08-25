@@ -55,8 +55,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /connect/{state}", s.handleConnectRedirect)
 	mux.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
 
-	// --- account management UI (gated client-side by the API key) ---
+	// --- account management + mail viewer UI (gated client-side by the API key) ---
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
+	mux.HandleFunc("GET /mail", s.handleMailPage)
 
 	// --- inbound push from providers ---
 	// Deliberately unauthenticated by API key: providers cannot send custom
@@ -74,6 +75,9 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("GET /api/v1/accounts/{id}", s.handleGetAccount)
 	api.HandleFunc("DELETE /api/v1/accounts/{id}", s.handleDeleteAccount)
 	api.HandleFunc("POST /api/v1/accounts/{id}/resync", s.handleResync)
+	api.HandleFunc("GET /api/v1/accounts/{id}/webhooks", s.handleListAccountWebhooks)
+	api.HandleFunc("POST /api/v1/accounts/{id}/webhooks", s.handleCreateAccountWebhook)
+	api.HandleFunc("DELETE /api/v1/accounts/{id}/webhooks/{wid}", s.handleDeleteAccountWebhook)
 
 	api.HandleFunc("GET /api/v1/folders", s.handleListFolders)
 	api.HandleFunc("GET /api/v1/threads", s.handleListThreads)
@@ -93,6 +97,7 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("GET /api/v1/webhooks", s.handleListWebhooks)
 	api.HandleFunc("POST /api/v1/webhooks", s.handleCreateWebhook)
 	api.HandleFunc("DELETE /api/v1/webhooks/{id}", s.handleDeleteWebhook)
+	api.HandleFunc("GET /api/v1/webhooks/{id}/deliveries", s.handleListWebhookDeliveries)
 
 	mux.Handle("/api/v1/", s.requireAPIKey(api))
 

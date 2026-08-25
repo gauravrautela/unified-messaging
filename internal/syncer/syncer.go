@@ -304,10 +304,13 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 			continue
 		}
 		email := e
+		email.Role = scope.Role
 		switch {
 		case !existed && scope.Role == "sentitems":
+			s.attachAttachments(ctx, mailbox, &email)
 			s.events.Emit(model.Event{Type: model.EventMailSent, AccountID: accountID, Email: &email})
 		case !existed && !e.Draft:
+			s.attachAttachments(ctx, mailbox, &email)
 			s.events.Emit(model.Event{Type: model.EventMailReceived, AccountID: accountID, Email: &email})
 		case existed:
 			s.events.Emit(model.Event{Type: model.EventMailUpdated, AccountID: accountID, Email: &email})
@@ -329,4 +332,20 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 		return s.store.SetCursor(accountID, scope.ID, changes.Cursor)
 	}
 	return nil
+}
+
+// attachAttachments fills in the attachment list for a new-mail event, so a
+// subscriber can act on it without a second call. One provider round-trip
+// per new message that has attachments; a failure degrades to the bare
+// has_attachments flag rather than blocking the sync.
+func (s *Syncer) attachAttachments(ctx context.Context, mailbox provider.Mailbox, e *model.Email) {
+	if !e.HasAttachments || len(e.Attachments) > 0 {
+		return
+	}
+	atts, err := mailbox.ListAttachments(ctx, e.AccountID, e.ID)
+	if err != nil {
+		s.log.Warn("listing attachments for event", "account_id", e.AccountID, "email_id", e.ID, "err", err)
+		return
+	}
+	e.Attachments = atts
 }

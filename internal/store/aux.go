@@ -91,13 +91,45 @@ func (s *Store) DeleteSubscription(id string) error {
 func (s *Store) SaveWebhook(w model.Webhook) error {
 	ev, _ := json.Marshal(w.Events)
 	_, err := s.db.Exec(`
-		INSERT INTO webhooks (id, url, secret, events_json, created_at) VALUES (?,?,?,?,?)`,
-		w.ID, w.URL, w.Secret, string(ev), w.CreatedAt.Unix())
+		INSERT INTO webhooks (id, account_id, name, url, secret, events_json, created_at) VALUES (?,?,?,?,?,?,?)`,
+		w.ID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix())
 	return err
 }
 
+// ListWebhooks returns every registered hook, global and account-scoped.
 func (s *Store) ListWebhooks() ([]model.Webhook, error) {
-	rows, err := s.db.Query(`SELECT id, url, secret, events_json, created_at FROM webhooks`)
+	return s.queryWebhooks(`SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks`)
+}
+
+// ListWebhooksFor returns the hooks that should see an event from accountID:
+// those bound to it plus the global ones.
+func (s *Store) ListWebhooksFor(accountID string) ([]model.Webhook, error) {
+	return s.queryWebhooks(`
+		SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks
+		WHERE account_id = '' OR account_id = ?`, accountID)
+}
+
+// ListAccountWebhooks returns only the hooks bound to accountID.
+func (s *Store) ListAccountWebhooks(accountID string) ([]model.Webhook, error) {
+	return s.queryWebhooks(`
+		SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks
+		WHERE account_id = ?`, accountID)
+}
+
+func (s *Store) GetWebhook(id string) (model.Webhook, error) {
+	hooks, err := s.queryWebhooks(`
+		SELECT id, account_id, name, url, secret, events_json, created_at FROM webhooks WHERE id = ?`, id)
+	if err != nil {
+		return model.Webhook{}, err
+	}
+	if len(hooks) == 0 {
+		return model.Webhook{}, ErrNotFound
+	}
+	return hooks[0], nil
+}
+
+func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +139,7 @@ func (s *Store) ListWebhooks() ([]model.Webhook, error) {
 		var w model.Webhook
 		var ev string
 		var created int64
-		if err := rows.Scan(&w.ID, &w.URL, &w.Secret, &ev, &created); err != nil {
+		if err := rows.Scan(&w.ID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(ev), &w.Events)
@@ -122,6 +154,79 @@ func (s *Store) DeleteWebhook(id string) error {
 	return err
 }
 
+// ---------- webhook delivery retry queue ----------
+
+// Delivery is one webhook POST that has failed at least once and is waiting
+// for its next attempt.
+type Delivery struct {
+	ID            string    `json:"id"`
+	WebhookID     string    `json:"webhook_id"`
+	AccountID     string    `json:"account_id,omitempty"`
+	EventType     string    `json:"event_type"`
+	Payload       []byte    `json:"-"`
+	Attempts      int       `json:"attempts"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	LastError     string    `json:"last_error,omitempty"`
+	Dead          bool      `json:"dead"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// SaveDelivery inserts or replaces a queued delivery.
+func (s *Store) SaveDelivery(d Delivery) error {
+	_, err := s.db.Exec(`
+		INSERT INTO webhook_deliveries
+		  (id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+		  attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at,
+		  last_error = excluded.last_error, dead = excluded.dead`,
+		d.ID, d.WebhookID, d.AccountID, d.EventType, d.Payload, d.Attempts,
+		d.NextAttemptAt.Unix(), d.LastError, d.Dead, d.CreatedAt.Unix())
+	return err
+}
+
+// DueDeliveries returns live deliveries whose retry time has passed, oldest
+// first.
+func (s *Store) DueDeliveries(now time.Time, limit int) ([]Delivery, error) {
+	return s.queryDeliveries(`
+		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
+		FROM webhook_deliveries WHERE dead = 0 AND next_attempt_at <= ?
+		ORDER BY next_attempt_at LIMIT ?`, now.Unix(), limit)
+}
+
+// ListDeliveries returns everything queued or dead for one webhook.
+func (s *Store) ListDeliveries(webhookID string) ([]Delivery, error) {
+	return s.queryDeliveries(`
+		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
+		FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at`, webhookID)
+}
+
+func (s *Store) DeleteDelivery(id string) error {
+	_, err := s.db.Exec(`DELETE FROM webhook_deliveries WHERE id = ?`, id)
+	return err
+}
+
+func (s *Store) queryDeliveries(q string, args ...any) ([]Delivery, error) {
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Delivery{}
+	for rows.Next() {
+		var d Delivery
+		var next, created int64
+		if err := rows.Scan(&d.ID, &d.WebhookID, &d.AccountID, &d.EventType, &d.Payload,
+			&d.Attempts, &next, &d.LastError, &d.Dead, &created); err != nil {
+			return nil, err
+		}
+		d.NextAttemptAt = time.Unix(next, 0).UTC()
+		d.CreatedAt = time.Unix(created, 0).UTC()
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // ---------- OAuth PKCE state ----------
 
 type OAuthState struct {
@@ -132,15 +237,46 @@ type OAuthState struct {
 	SuccessURL string
 	FailureURL string
 	NotifyURL  string
-	ExpiresAt  time.Time
+	// Webhook, when set, is registered against the account the moment it is
+	// created by the callback.
+	Webhook   *PendingWebhook
+	ExpiresAt time.Time
+}
+
+// PendingWebhook is a webhook requested at connect time, before the account
+// it will belong to exists.
+type PendingWebhook struct {
+	Name   string   `json:"name,omitempty"`
+	URL    string   `json:"url"`
+	Secret string   `json:"secret,omitempty"`
+	Events []string `json:"events,omitempty"`
+}
+
+func encodePendingWebhook(w *PendingWebhook) string {
+	if w == nil {
+		return ""
+	}
+	b, _ := json.Marshal(w)
+	return string(b)
+}
+
+func decodePendingWebhook(raw string) *PendingWebhook {
+	if raw == "" {
+		return nil
+	}
+	var w PendingWebhook
+	if err := json.Unmarshal([]byte(raw), &w); err != nil {
+		return nil
+	}
+	return &w
 }
 
 func (s *Store) SaveOAuthState(o OAuthState) error {
 	_, err := s.db.Exec(`
-		INSERT INTO oauth_states (state, provider, verifier, success_url, failure_url, notify_url, created_at, expires_at)
-		VALUES (?,?,?,?,?,?,?,?)`,
+		INSERT INTO oauth_states (state, provider, verifier, success_url, failure_url, notify_url, webhook_json, created_at, expires_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
 		o.State, o.Provider, o.Verifier, o.SuccessURL, o.FailureURL, o.NotifyURL,
-		time.Now().Unix(), o.ExpiresAt.Unix())
+		encodePendingWebhook(o.Webhook), time.Now().Unix(), o.ExpiresAt.Unix())
 	return err
 }
 
@@ -149,10 +285,12 @@ func (s *Store) SaveOAuthState(o OAuthState) error {
 func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 	var o OAuthState
 	var exp int64
+	var wh string
 	err := s.db.QueryRow(`
-		SELECT state, provider, verifier, success_url, failure_url, notify_url, expires_at
+		SELECT state, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &exp)
+		Scan(&o.State, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
+	o.Webhook = decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -179,10 +317,12 @@ func (s *Store) PurgeExpiredOAuthStates() {
 func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 	var o OAuthState
 	var exp int64
+	var wh string
 	err := s.db.QueryRow(`
-		SELECT state, provider, verifier, success_url, failure_url, notify_url, expires_at
+		SELECT state, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &exp)
+		Scan(&o.State, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp)
+	o.Webhook = decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}

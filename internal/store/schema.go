@@ -86,8 +86,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 );
 CREATE INDEX IF NOT EXISTS subs_by_account ON subscriptions(account_id);
 
+-- account_id '' means global. Account-scoped rows are removed by hand in
+-- DeleteAccount rather than by FK cascade, since '' cannot reference a row.
 CREATE TABLE IF NOT EXISTS webhooks (
   id          TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL DEFAULT '',
+  name        TEXT NOT NULL DEFAULT '',
   url         TEXT NOT NULL,
   secret      TEXT NOT NULL DEFAULT '',
   events_json TEXT NOT NULL DEFAULT '[]',
@@ -102,7 +106,39 @@ CREATE TABLE IF NOT EXISTS oauth_states (
   success_url    TEXT NOT NULL DEFAULT '',
   failure_url    TEXT NOT NULL DEFAULT '',
   notify_url     TEXT NOT NULL DEFAULT '',
+  webhook_json   TEXT NOT NULL DEFAULT '',
   created_at     INTEGER NOT NULL,
   expires_at     INTEGER NOT NULL
 );
+-- Failed webhook deliveries waiting for a retry. A row is removed on success,
+-- rescheduled on failure, and kept with dead = 1 once the schedule is used up
+-- so the caller can see what never arrived.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id              TEXT PRIMARY KEY,
+  webhook_id      TEXT NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+  account_id      TEXT NOT NULL DEFAULT '',
+  event_type      TEXT NOT NULL,
+  payload         BLOB NOT NULL,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL,
+  last_error      TEXT NOT NULL DEFAULT '',
+  dead            INTEGER NOT NULL DEFAULT 0,
+  created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deliveries_due ON webhook_deliveries(dead, next_attempt_at);
+CREATE INDEX IF NOT EXISTS deliveries_by_webhook ON webhook_deliveries(webhook_id);
+`
+
+// migrations are additive column changes for databases created before the
+// column existed. Each is safe to re-run: "duplicate column" is ignored.
+// Indexes on migrated columns live in postMigration, not schema, because
+// schema runs first and the column may not exist yet.
+var migrations = []string{
+	`ALTER TABLE webhooks ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE oauth_states ADD COLUMN webhook_json TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE webhooks ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
+}
+
+const postMigration = `
+CREATE INDEX IF NOT EXISTS webhooks_by_account ON webhooks(account_id);
 `
