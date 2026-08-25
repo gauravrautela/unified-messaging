@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +65,14 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 	return srv, db, recs
 }
 
+// fake recovers the concrete FakeChat the test harness wired onto Server.
+// Server itself only knows fakeChat as `any` (so the test-only providertest
+// package never enters the production import graph); every test goes through
+// this instead of asserting the type at each call site.
+func (s *Server) fake() *providertest.FakeChat {
+	return s.fakeChat.(*providertest.FakeChat)
+}
+
 func newTestServerWithLog(t *testing.T) (*Server, *store.Store, *logx.Records) {
 	return newTestServerCore(t, 10)
 }
@@ -79,6 +88,45 @@ func newTestServerWithChatCapacity(t *testing.T, maxChatAccounts int) (*Server, 
 	s, db, _ := newTestServerCore(t, maxChatAccounts)
 	return s, db
 }
+
+// newTestServerWithProviders builds a server around a caller-chosen provider
+// set, for tests that need to control provider registration itself (an empty
+// mail slate, or more than one mail provider) rather than the standard
+// Outlook+FAKECHAT registry every other test uses. Nothing in the resolveProvider
+// path this exercises touches chat, sync or accounts, so those are left nil/zero.
+func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*Server, *store.Store) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	cfg := &config.Config{
+		ClientID: "client-123", Tenant: "consumers",
+		RedirectURI: "http://localhost:8080/oauth/callback",
+		Scopes:      []string{"offline_access"},
+		SessionTTL:  30 * 24 * time.Hour,
+	}
+	log, _ := logx.Capture()
+	registry := provider.NewRegistry(providers...)
+	disp := events.NewDispatcher(db, log)
+	sync := syncer.New(db, registry, nil, disp, log, syncer.Options{PollInterval: time.Hour})
+	authSvc := auth.New(db, log, cfg.SessionTTL)
+	return NewServer(cfg, db, registry, nil, sync, authSvc, nil, disp, log), db
+}
+
+// mailStub is a bare-bones mail-kind provider.Provider for exercising
+// resolveProvider's default-selection logic. It is never actually connected
+// to, so every capability but Name/Kind is nil.
+type mailStub struct{ name string }
+
+func (m mailStub) Name() string                 { return m.name }
+func (m mailStub) Kind() string                 { return model.AccountKindMail }
+func (m mailStub) Auth() provider.Authenticator { return nil }
+func (m mailStub) Linker() provider.Linker      { return nil }
+func (m mailStub) Mailbox() provider.Mailbox    { return nil }
+func (m mailStub) Chat() provider.Chatter       { return nil }
+func (m mailStub) Push() provider.Pusher        { return nil }
 
 // waitFor polls cond until it is true or the deadline passes, for assertions
 // against state a background goroutine (the link pump, the chat actor)
@@ -107,7 +155,7 @@ func seedChat(t *testing.T, s *Server, db *store.Store, devID string) string {
 	if err := s.chat.Attach(acct.ID); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { return s.fakeChat.Sink(acct.ID) != nil })
+	waitFor(t, func() bool { return s.fake().Sink(acct.ID) != nil })
 	if err := db.UpsertChat(model.Chat{ID: "c1", AccountID: acct.ID, Kind: "direct"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1150,7 +1198,7 @@ func TestLinkerConnectPageRequiresConsentThenServesQR(t *testing.T) {
 	if rec.Code != 200 || q.Status != "waiting" {
 		t.Fatalf("first qr poll: %d %+v", rec.Code, q)
 	}
-	s.fakeChat.EmitCode("qr-abc")
+	s.fake().EmitCode("qr-abc")
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
@@ -1160,7 +1208,7 @@ func TestLinkerConnectPageRequiresConsentThenServesQR(t *testing.T) {
 	// Pair -> account under the minting developer, notify + webhook bound, state consumed.
 	notified := make(chan map[string]any, 1)
 	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
-	s.fakeChat.Pair(provider.Identity{Identifier: "+919888000000", Name: "G"}, "919888000000:5@s.whatsapp.net")
+	s.fake().Pair(provider.Identity{Identifier: "+919888000000", Name: "G"}, "919888000000:5@s.whatsapp.net")
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
@@ -1208,7 +1256,7 @@ func TestLinkTimeoutNotifiesFailed(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
-	s.fakeChat.FailLink(provider.ErrLinkTimeout)
+	s.fake().FailLink(provider.ErrLinkTimeout)
 	select {
 	case p := <-notified:
 		if p["status"] != "FAILED" || p["error"] != "link_timeout" {
@@ -1237,5 +1285,227 @@ func TestHostedAuthReturnsCapacityWhenRuntimeFull(t *testing.T) {
 	s.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("mail hosted-auth under chat capacity: %d", rec.Code)
+	}
+}
+
+// A burst of concurrent first polls for the same state must start exactly
+// one pairing session. Before the fix, linkRegistry.put let every racing poll
+// call StartLink and then overwrite the registry entry, orphaning every
+// loser's session (unreachable by the sweeper) and eventually double-firing
+// notify_url / TakeOAuthState from more than one pumpLink goroutine.
+func TestLinkQRConcurrentPollsStartExactlyOneSession(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("consent: %d", rec.Code)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for _, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("a concurrent /qr poll failed: %d", c)
+		}
+	}
+	if n := s.fake().SessionCount(); n != 1 {
+		t.Fatalf("StartLink called %d times across concurrent pollers, want 1", n)
+	}
+}
+
+// /consent and /qr must both refuse a connect link whose own expires_at has
+// passed, the same way handleConnectRedirect already does — even though the
+// three-minute pairing window (linkTTL) has nothing to do with it.
+func TestConsentAndQRRejectExpiredLink(t *testing.T) {
+	s, db := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT","expires_in_minutes":1}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	if err := db.SetOAuthStateExpiry(r.State, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	if rec.Code != http.StatusGone {
+		t.Fatalf("consent on expired link: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	if rec.Code != http.StatusGone {
+		t.Fatalf("qr on expired link: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// If the connect link's own expiry elapses while a pairing session is still
+// open (a race distinct from the one above: consent and the first /qr poll
+// both happened before expiry, but the user took long enough scanning that
+// TakeOAuthState fails once they finally do), finishLink must notify FAILED
+// link_expired and must not create an account.
+func TestFinishLinkNotifiesExpiredWhenLinkExpiresDuringPairing(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT","notify_url":"https://api.example.com/hook"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	notified := make(chan map[string]any, 1)
+	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	// Starts the pairing session (and pumpLink) while the state is still valid.
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+
+	// Simulate the user taking so long to scan that the connect link's own
+	// expiry passes before pairing resolves.
+	if err := db.SetOAuthStateExpiry(r.State, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	s.fake().Pair(provider.Identity{Identifier: "+919888000001", Name: "G"}, "919888000001:1@s.whatsapp.net")
+
+	select {
+	case p := <-notified:
+		if p["status"] != "FAILED" || p["error"] != "link_expired" {
+			t.Fatalf("notify = %v", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("FAILED link_expired not notified")
+	}
+
+	if accts, _ := db.ListAccounts(dev.ID); len(accts) != 0 {
+		t.Fatalf("account should not have been created: %+v", accts)
+	}
+	waitFor(t, func() bool {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+		var q struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &q)
+		return q.Status == "expired"
+	})
+}
+
+// A pairing that succeeds at the provider but fails to become an account
+// (the custodian rejects an empty identifier) must still notify the caller —
+// silently dropping it would leave notify_url's contract with "exactly one
+// terminal notification per link" broken.
+func TestFinishLinkNotifiesFailedWhenAccountCreationFails(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT","notify_url":"https://api.example.com/hook"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	notified := make(chan map[string]any, 1)
+	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+
+	// An empty Identifier is what accounts.ConnectLinked rejects.
+	s.fake().Pair(provider.Identity{Identifier: "", Name: "G"}, "somejid")
+
+	select {
+	case p := <-notified:
+		if p["status"] != "FAILED" || p["error"] != "link_failed" {
+			t.Fatalf("notify = %v", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("FAILED link_failed not notified")
+	}
+
+	if accts, _ := db.ListAccounts(dev.ID); len(accts) != 0 {
+		t.Fatalf("account should not have been created: %+v", accts)
+	}
+	waitFor(t, func() bool {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+		var q struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &q)
+		return q.Status == "failed"
+	})
+}
+
+// resolveProvider's mail-only fallback must never fall through to
+// registry.Default(): an unnamed hosted-auth call must be refused, never
+// silently resolved to a Linker, whenever there is not exactly one mail
+// provider registered.
+func TestResolveProviderRequiresNameWithoutExactlyOneMailProvider(t *testing.T) {
+	// Only a chat provider registered: zero mail providers.
+	sChatOnly, _ := newTestServerWithProviders(t, providertest.NewFakeChat("FAKECHAT"))
+	_, keyChatOnly := seedDev(t, sChatOnly, "a@x.com")
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{}`)), keyChatOnly)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	sChatOnly.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("no mail provider registered: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	// Two mail providers registered: ambiguous, not "pick one".
+	sTwoMail, _ := newTestServerWithProviders(t, mailStub{name: "MAILA"}, mailStub{name: "MAILB"})
+	_, keyTwoMail := seedDev(t, sTwoMail, "b@x.com")
+	req = withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{}`)), keyTwoMail)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	sTwoMail.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("two mail providers registered: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	// A named provider still resolves regardless of how many are registered.
+	req = withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"MAILA"}`)), keyTwoMail)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	sTwoMail.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("named provider among several: status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 }

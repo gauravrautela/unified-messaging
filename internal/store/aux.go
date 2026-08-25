@@ -324,6 +324,15 @@ func (s *Store) SetOAuthConsent(state string, at time.Time) error {
 	return err
 }
 
+// SetOAuthStateExpiry backdates (or extends) a pending connect attempt's
+// expiry. Production code never needs to move an expiry once minted; this
+// exists so tests can simulate a connect link expiring out from under an
+// in-flight pairing session without reaching into the database directly.
+func (s *Store) SetOAuthStateExpiry(state string, at time.Time) error {
+	_, err := s.db.Exec(`UPDATE oauth_states SET expires_at = ? WHERE state = ?`, at.Unix(), state)
+	return err
+}
+
 // TakeOAuthState consumes the state single-use, which is what makes it a real
 // CSRF defence rather than decoration.
 func (s *Store) TakeOAuthState(state string) (OAuthState, error) {

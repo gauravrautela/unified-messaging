@@ -107,6 +107,15 @@ func (f *FakeChat) latest() *fakeSession {
 	return f.sessions[len(f.sessions)-1]
 }
 
+// SessionCount reports how many link sessions StartLink has produced in
+// total. Tests use it to prove that a burst of concurrent /qr polls started
+// pairing exactly once rather than once per poll.
+func (f *FakeChat) SessionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sessions)
+}
+
 // EmitCode pushes a QR code to the most recent link session. A no-op, not a
 // panic, once that session has been paired, failed or closed — later tasks'
 // tests rely on QR rotation racing pairing being safe.

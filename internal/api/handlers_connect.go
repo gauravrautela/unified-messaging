@@ -161,12 +161,16 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 // resolveProvider accepts an explicit name, or falls back to a default when
 // the caller did not choose.
 //
-// The fallback only ever picks a mail provider: historically, before a chat
-// provider existed at all, an unnamed hosted-auth call meant "the one mail
-// backend", and every integrator's existing code depends on that. Pairing a
-// phone number is also the kind of thing a caller should always ask for by
-// name — there is no sense in which a bare hosted-auth call could mean
-// "whichever chat provider happens to be registered" the way it can for mail.
+// The fallback only ever picks a mail provider, and only when exactly one is
+// registered: historically, before a chat provider existed at all, an
+// unnamed hosted-auth call meant "the one mail backend", and every
+// integrator's existing code depends on that. It never falls further to
+// registry.Default() — that would let an unnamed call resolve to a Linker
+// once the sole-mail-provider case doesn't hold (no mail provider, several of
+// them, or only chat providers registered), and pairing a phone number is
+// always something a caller must ask for by name. There is no sense in which
+// a bare hosted-auth call could mean "whichever chat provider happens to be
+// registered" the way it can for mail.
 func (s *Server) resolveProvider(name string) (provider.Provider, error) {
 	if name != "" {
 		return s.registry.Get(strings.ToUpper(name))
@@ -183,10 +187,10 @@ func (s *Server) resolveProvider(name string) (provider.Provider, error) {
 			nMail++
 		}
 	}
-	if nMail == 1 {
-		return mail, nil
+	if nMail != 1 {
+		return nil, errors.New("provider is required")
 	}
-	return s.registry.Default()
+	return mail, nil
 }
 
 // handleConnectRedirect shows the end user a branded landing page before

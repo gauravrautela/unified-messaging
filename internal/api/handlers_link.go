@@ -90,12 +90,27 @@ func (lr *linkRegistry) get(state string) *link {
 	return lr.links[state]
 }
 
-func (lr *linkRegistry) put(state string, sess provider.LinkSession, successURL string) *link {
+// getOrStart returns the existing link for state, or starts one via start
+// and installs it. The whole check-then-create runs under lr.mu, so two
+// concurrent first polls for the same state can never both call start: the
+// loser gets the winner's link back with created=false and must not spend
+// its own session (the caller closes it). Holding the lock across start is
+// deliberate — StartLink only opens an in-memory pairing session, never a
+// blocking network round trip, so this cannot stall other states' polls for
+// longer than that.
+func (lr *linkRegistry) getOrStart(state string, start func() (provider.LinkSession, error), successURL string) (l *link, created bool, err error) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
-	l := &link{session: sess, successURL: successURL, started: time.Now()}
+	if existing, ok := lr.links[state]; ok {
+		return existing, false, nil
+	}
+	sess, err := start()
+	if err != nil {
+		return nil, false, err
+	}
+	l = &link{session: sess, successURL: successURL, started: time.Now()}
 	lr.links[state] = l
-	return l
+	return l, true, nil
 }
 
 // sweep closes and drops every link older than maxAge. It is the backstop
@@ -130,8 +145,13 @@ func (s *Server) sweepLinks() {
 // a device link the end user never agreed to.
 func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	state := r.PathValue("state")
-	if _, err := s.store.PeekOAuthState(state); err != nil {
+	pending, err := s.store.PeekOAuthState(state)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "unknown link")
+		return
+	}
+	if time.Now().After(pending.ExpiresAt) {
+		writeError(w, http.StatusGone, "expired", "this connection link has expired")
 		return
 	}
 	if err := s.store.SetOAuthConsent(state, time.Now().UTC()); err != nil {
@@ -148,6 +168,9 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 // in-memory link rather than the store — the store's copy of this state is
 // gone the moment pairing succeeds or fails.
 func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
+	// The pairing state changes underneath a fixed URL every couple of
+	// seconds; nothing about this response is ever safe to cache.
+	w.Header().Set("Cache-Control", "no-store")
 	state := r.PathValue("state")
 
 	if l := s.links.get(state); l != nil {
@@ -158,6 +181,10 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 	pending, err := s.store.PeekOAuthState(state)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "unknown link")
+		return
+	}
+	if time.Now().After(pending.ExpiresAt) {
+		writeError(w, http.StatusGone, "expired", "this connection link has expired")
 		return
 	}
 	if pending.ConsentedAt == nil {
@@ -172,14 +199,19 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 
 	// The session must outlive this request: the end user has not scanned
 	// anything yet, and the request/response round trip is over long before
-	// that happens.
-	sess, err := p.Linker().StartLink(context.Background())
+	// that happens. getOrStart guarantees only one caller ever wins the race
+	// to actually start one for this state; a loser's own session (if start
+	// somehow ran twice — it cannot, but defensively) would otherwise leak.
+	l, created, err := s.links.getOrStart(state, func() (provider.LinkSession, error) {
+		return p.Linker().StartLink(context.Background())
+	}, pending.SuccessURL)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
 		return
 	}
-	l := s.links.put(state, sess, pending.SuccessURL)
-	go s.pumpLink(state, pending, l)
+	if created {
+		go s.pumpLink(state, pending, l)
+	}
 
 	writeJSON(w, http.StatusOK, l.statusResponse())
 }
@@ -227,7 +259,23 @@ func (s *Server) finishLink(state string, pending store.OAuthState, l *link, res
 	log := logx.From(ctx)
 
 	if _, err := s.store.TakeOAuthState(state); err != nil {
-		log.Warn("link state already consumed", "err", err)
+		// The connect link itself (independent of the 3-minute pairing
+		// window) expired, or something else already consumed it, while this
+		// session was in flight. Either way there is no pending state left to
+		// create an account against, so this is fatal — not a bookkeeping
+		// warning — and must not fall through to ConnectLinked.
+		log.Warn("link state expired or already consumed before pairing completed", "err", err)
+		if pending.NotifyURL != "" {
+			s.notify(pending.NotifyURL, map[string]any{
+				"status": "FAILED", "error": "link_expired",
+				"message": "connect link expired before pairing completed",
+			})
+		}
+		expired := provider.LinkResult{Err: provider.ErrLinkTimeout}
+		l.mu.Lock()
+		l.result = &expired
+		l.mu.Unlock()
+		return
 	}
 
 	if res.Err != nil {
@@ -251,6 +299,9 @@ func (s *Server) finishLink(state string, pending store.OAuthState, l *link, res
 	acct, err := s.accts.ConnectLinked(ctx, pending.DeveloperID, pending.Provider, res.Identity, res.DeviceJID)
 	if err != nil {
 		log.Error("recording linked account", "err", err)
+		if pending.NotifyURL != "" {
+			s.notify(pending.NotifyURL, map[string]any{"status": "FAILED", "error": "link_failed", "message": err.Error()})
+		}
 		failed := provider.LinkResult{Err: err}
 		l.mu.Lock()
 		l.result = &failed

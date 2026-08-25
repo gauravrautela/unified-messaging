@@ -21,7 +21,6 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
-	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
 )
@@ -46,8 +45,12 @@ type Server struct {
 	notifyTransport func(url string, payload map[string]any)
 
 	// fakeChat is wired only by the test harness, so it can drive a scripted
-	// chat provider's link sessions directly. Always nil in production.
-	fakeChat *providertest.FakeChat
+	// chat provider's link sessions directly. Always nil in production. Typed
+	// as any (rather than *providertest.FakeChat) so the test-only
+	// providertest package never enters the production import graph; the test
+	// harness recovers the concrete type through (*Server).fake() in
+	// api_test.go.
+	fakeChat any
 }
 
 func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry, a *accounts.Manager,
