@@ -8,10 +8,11 @@ import (
 
 func TestRedactMasksSecretFields(t *testing.T) {
 	in := map[string]any{
-		"email":    "a@b.com",
-		"password": "hunter22",
-		"nested":   map[string]any{"secret": "s3", "token": "t0k", "key": "k", "code": "c0de", "ok": "fine"},
-		"list":     []any{map[string]any{"refresh_token": "rt"}},
+		"email":      "a@b.com",
+		"password":   "hunter22",
+		"session_id": "sess-abc",
+		"nested":     map[string]any{"secret": "s3", "token": "t0k", "key": "k", "code": "c0de", "ok": "fine"},
+		"list":       []any{map[string]any{"refresh_token": "rt"}},
 	}
 	out := Redact(in).(map[string]any)
 	if out["email"] != "a@b.com" {
@@ -19,6 +20,9 @@ func TestRedactMasksSecretFields(t *testing.T) {
 	}
 	if out["password"] != "[redacted]" {
 		t.Fatalf("password not redacted: %v", out["password"])
+	}
+	if out["session_id"] != "[redacted]" {
+		t.Fatalf("session_id not redacted: %v", out["session_id"])
 	}
 	n := out["nested"].(map[string]any)
 	for _, k := range []string{"secret", "token", "key", "code"} {

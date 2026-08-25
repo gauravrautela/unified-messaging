@@ -34,7 +34,9 @@ func NewRequestID() string {
 }
 
 // secretKeys are matched as substrings of lower-cased map keys.
-var secretKeys = []string{"password", "secret", "token", "key", "code", "verifier", "cookie", "authorization", "client_state", "clientstate"}
+// Substring matching deliberately over-redacts (e.g., keyword, zip_code) because
+// under-redaction is the worse failure mode for security.
+var secretKeys = []string{"password", "secret", "token", "key", "code", "verifier", "cookie", "authorization", "client_state", "clientstate", "session"}
 
 // Redact returns a copy of v with secret-looking map values replaced. It
 // walks maps and slices produced by encoding/json; other values pass through.
