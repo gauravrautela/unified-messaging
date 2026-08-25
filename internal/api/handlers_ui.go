@@ -3,15 +3,16 @@ package api
 import (
 	"html/template"
 	"net/http"
+	"net/url"
 )
 
 // This file holds the two screens a human being actually looks at.
 //
 // The landing page is end-user facing: it appears once, mid-OAuth, and has no
 // login of its own — its only authority is the single-use state token already
-// embedded in its URL. The dashboard is operator/developer facing: it is a
-// static shell with no server-side session, and everything it shows is gated
-// by the caller pasting in the API key, which is held in the browser only.
+// embedded in its URL. The dashboard is operator/developer facing: it requires
+// a signed-in browser session (the um_session cookie), and its own fetches
+// ride that same cookie, so account data stays gated by the API middleware.
 //
 // Both are plain html/template + vanilla JS. No build step, no framework, no
 // external assets — this ships inside the Go binary.
@@ -61,15 +62,20 @@ func renderLanding(w http.ResponseWriter, d landingData) {
 
 // ---------- dashboard ----------
 
-// handleDashboard serves the static shell. It is deliberately not behind
-// requireAPIKey: the HTML itself carries nothing sensitive. Every fetch the
-// page makes carries the key the visitor pastes in, so the account data stays
-// gated exactly where the REST API already gates it.
+// handleDashboard requires a browser session. The page's own fetches then
+// ride the same cookie, so account data stays gated by the API middleware.
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	dev, ok := s.sessionDeveloper(r)
+	if !ok {
+		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(dashboardHTML))
+	_ = dashboardTmpl.Execute(w, struct{ Email string }{dev.Email})
 }
+
+var dashboardTmpl = template.Must(template.New("dashboard").Parse(dashboardHTML))
 
 const dashboardHTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -94,9 +100,6 @@ button:hover{border-color:var(--accent)}
 input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--card);
   color:var(--text);width:100%}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.25rem}
-.gate{max-width:24rem;margin:4rem auto;text-align:center}
-.gate p{color:var(--muted);font-size:.9rem}
-.gate form{display:flex;flex-direction:column;gap:.75rem;margin-top:1rem}
 .row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;padding:.9rem 0;border-bottom:1px solid var(--border)}
 .row:last-child{border-bottom:none}
 .who{min-width:0}
@@ -122,25 +125,16 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
 <body>
 <div class="wrap">
 
-  <div id="gate" class="gate">
-    <h1>Connected accounts</h1>
-    <p>Paste the service's API key to manage connections.</p>
-    <form id="gate-form">
-      <input id="key-input" type="password" placeholder="API key" autocomplete="off" required>
-      <button class="primary" type="submit">Continue</button>
-    </form>
-    <p id="gate-err" class="err hidden"></p>
-  </div>
-
-  <div id="app" class="hidden">
+  <div id="app">
     <header>
       <div>
         <h1>Connected accounts</h1>
         <div class="sub" id="provider-line"></div>
       </div>
-      <div style="display:flex;gap:.5rem;align-items:center">
+      <div style="display:flex;gap:.75rem;align-items:center">
+        <span class="sub">{{.Email}}</span>
         <button id="connect-btn" class="primary">+ Connect account</button>
-        <button id="signout-btn" class="signout">Sign out</button>
+        <form id="logout-form" method="post" action="/logout" style="margin:0"><button class="signout" type="submit">Log out</button></form>
       </div>
     </header>
     <p id="banner" class="err hidden" style="color:var(--ok);background:color-mix(in srgb, var(--ok) 12%, transparent)"></p>
@@ -148,21 +142,30 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
     <div class="card">
       <div id="list"></div>
     </div>
+
+    <h2 style="font-size:1.05rem;margin:2rem 0 .5rem">API keys</h2>
+    <p class="sub" style="margin-bottom:.75rem">Use a key as <code>Authorization: Bearer &lt;key&gt;</code>. Keys are shown once.</p>
+    <div class="card">
+      <div id="new-key" class="hidden" style="margin-bottom:1rem">
+        <p class="sub">Copy this key now — it will not be shown again.</p>
+        <code id="new-key-value" style="display:block;padding:.6rem;border:1px dashed var(--border);border-radius:8px;word-break:break-all"></code>
+      </div>
+      <form id="key-form" style="display:flex;gap:.5rem;margin-bottom:1rem">
+        <input id="key-name" placeholder="Key name, e.g. production" required style="flex:1;font:inherit;padding:.5rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">
+        <button class="primary" data-action="create-key" type="submit">Create key</button>
+      </form>
+      <div id="keys"></div>
+    </div>
   </div>
 
 </div>
 
 <script>
-const KEY_STORAGE = "um_api_key";
 const $ = (id) => document.getElementById(id);
 
-function apiKey() { return localStorage.getItem(KEY_STORAGE) || ""; }
-
 async function api(path, opts) {
-  const res = await fetch(path, Object.assign({}, opts, {
-    headers: Object.assign({ "Authorization": "Bearer " + apiKey() }, (opts && opts.headers) || {})
-  }));
-  if (res.status === 401) { signOut(); throw new Error("unauthorized"); }
+  const res = await fetch(path, Object.assign({ credentials: "same-origin" }, opts));
+  if (res.status === 401) { location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search); throw new Error("unauthorized"); }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error.message; } catch (e) {}
@@ -170,12 +173,6 @@ async function api(path, opts) {
   }
   if (res.status === 204) return null;
   return res.json();
-}
-
-function signOut() {
-  localStorage.removeItem(KEY_STORAGE);
-  $("app").classList.add("hidden");
-  $("gate").classList.remove("hidden");
 }
 
 function statusBadge(status) {
@@ -270,7 +267,7 @@ $("list").addEventListener("click", async (e) => {
 
   if (action === "resync") {
     btn.disabled = true;
-    try { await api("/api/v1/accounts/" + id + "/resync", { method: "POST" }); }
+    try { await api("/api/v1/accounts/" + id + "/resync", { method: "POST", headers: { "Content-Type": "application/json" } }); }
     catch (e) { alert("Resync failed: " + e.message); }
     btn.disabled = false;
     return;
@@ -334,42 +331,50 @@ $("connect-btn").addEventListener("click", async () => {
   }
 });
 
-$("signout-btn").addEventListener("click", signOut);
+async function loadKeys() {
+  const data = await api("/api/v1/api-keys");
+  const items = data.items || [];
+  if (!items.length) { $("keys").innerHTML = '<div class="empty">No API keys yet.</div>'; return; }
+  $("keys").innerHTML = items.map((k) =>
+    '<div class="row" data-kid="' + k.id + '">' +
+      '<div class="who"><div class="email">' + escapeHtml(k.name) + '</div>' +
+      '<div class="meta"><code>' + escapeHtml(k.prefix) + '…</code> &middot; created ' + new Date(k.created_at).toLocaleDateString() +
+      (k.last_used_at ? ' &middot; last used ' + new Date(k.last_used_at).toLocaleString() : ' &middot; never used') + '</div></div>' +
+      (k.revoked_at ? '<span class="status bad">Revoked</span>' :
+        '<div class="actions"><button data-action="revoke-key" class="danger">Revoke</button></div>') +
+    '</div>').join("");
+}
 
-$("gate-form").addEventListener("submit", async (e) => {
+$("key-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  $("gate-err").classList.add("hidden");
-  const key = $("key-input").value.trim();
-  if (!key) return;
-  localStorage.setItem(KEY_STORAGE, key);
+  const name = $("key-name").value.trim();
+  if (!name) return;
   try {
-    await enter();
-  } catch (err) {
-    localStorage.removeItem(KEY_STORAGE);
-    $("gate-err").textContent = "That key was rejected.";
-    $("gate-err").classList.remove("hidden");
-  }
+    const k = await api("/api/v1/api-keys", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    $("new-key-value").textContent = k.key;
+    $("new-key").classList.remove("hidden");
+    $("key-name").value = "";
+    loadKeys();
+  } catch (err) { alert("Could not create key: " + err.message); }
 });
 
-async function enter() {
-  await loadProviders();
-  $("gate").classList.add("hidden");
-  $("app").classList.remove("hidden");
+$("keys").addEventListener("click", async (e) => {
+  const btn = e.target.closest('button[data-action="revoke-key"]');
+  if (!btn) return;
+  if (!confirm("Revoke this key? Anything using it stops working immediately.")) return;
+  btn.disabled = true;
+  try { await api("/api/v1/api-keys/" + btn.closest(".row").dataset.kid, { method: "DELETE" }); loadKeys(); }
+  catch (err) { alert("Could not revoke: " + err.message); btn.disabled = false; }
+});
+
+(async function init() {
   if (new URLSearchParams(location.search).get("connected")) {
     $("banner").textContent = "Account connected.";
     $("banner").classList.remove("hidden");
     history.replaceState(null, "", location.pathname);
   }
-  await loadAccounts();
-}
-
-(function init() {
-  if (apiKey()) {
-    enter().catch(() => {
-      $("gate").classList.remove("hidden");
-      $("app").classList.add("hidden");
-    });
-  }
+  await loadProviders();
+  await Promise.all([loadAccounts(), loadKeys()]);
 })();
 </script>
 </body></html>`

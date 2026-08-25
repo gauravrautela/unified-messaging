@@ -1,13 +1,21 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+	"net/url"
+)
 
 // The mail viewer is the third human-facing screen: a read-only, three-pane
-// client over the synced mirror. Like the dashboard it is a static shell with
-// no server-side session — every fetch carries the API key the visitor pastes
-// in (shared with the dashboard via the same localStorage slot), so data stays
-// gated exactly where the REST API already gates it.
+// client over the synced mirror. Like the dashboard it requires a browser
+// session; the page's own fetches then ride the same cookie, so data stays
+// gated exactly where the REST API already gates it. It has no
+// developer-specific content, so unlike the dashboard it stays a plain string
+// rather than a template.
 func (s *Server) handleMailPage(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.sessionDeveloper(r); !ok {
+		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(mailHTML))
@@ -32,11 +40,6 @@ button:disabled{opacity:.5;cursor:default}
 input,select{padding:.45rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--card)}
 .err{color:var(--danger);background:var(--danger-bg);border-radius:8px;padding:.6rem .8rem;font-size:.85rem}
 .hidden{display:none !important}
-
-.gate{max-width:24rem;margin:4rem auto;text-align:center;padding:0 1rem}
-.gate p{color:var(--muted);font-size:.9rem}
-.gate form{display:flex;flex-direction:column;gap:.75rem;margin-top:1rem}
-.gate input{width:100%}
 
 #app{display:flex;flex-direction:column;height:100vh}
 header{display:flex;align-items:center;gap:.75rem;padding:.7rem 1rem;border-bottom:1px solid var(--border);
@@ -85,23 +88,14 @@ nav{width:220px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--borde
 </style></head>
 <body>
 
-<div id="gate" class="gate">
-  <h1>Mail</h1>
-  <p>Paste the service's API key to browse synced mail.</p>
-  <form id="gate-form">
-    <input id="key-input" type="password" placeholder="API key" autocomplete="off" required>
-    <button class="primary" type="submit">Continue</button>
-  </form>
-  <p id="gate-err" class="err hidden"></p>
-</div>
-
-<div id="app" class="hidden">
+<div id="app">
   <header>
     <h1>Mail</h1>
     <select id="accounts"></select>
     <input id="search" type="search" placeholder="Search mail&hellip;">
     <label class="toggle"><input id="unread-only" type="checkbox">Unread only</label>
     <a href="/dashboard">Accounts</a>
+    <form method="post" action="/logout" style="display:inline"><button type="submit">Log out</button></form>
   </header>
   <p id="err" class="err hidden" style="margin:.6rem 1rem"></p>
   <main>
@@ -119,19 +113,14 @@ nav{width:220px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--borde
 </div>
 
 <script>
-const KEY_STORAGE = "um_api_key";
 const PAGE = 50;
 const $ = (id) => document.getElementById(id);
 
 const state = { account: "", folder: "", q: "", unread: false, offset: 0, selected: "", count: 0 };
 
-function apiKey() { return localStorage.getItem(KEY_STORAGE) || ""; }
-
 async function api(path, opts) {
-  const res = await fetch(path, Object.assign({}, opts, {
-    headers: Object.assign({ "Authorization": "Bearer " + apiKey() }, (opts && opts.headers) || {})
-  }));
-  if (res.status === 401) { signOut(); throw new Error("unauthorized"); }
+  const res = await fetch(path, Object.assign({ credentials: "same-origin" }, opts));
+  if (res.status === 401) { location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search); throw new Error("unauthorized"); }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error.message; } catch (e) {}
@@ -140,12 +129,6 @@ async function api(path, opts) {
   return res;
 }
 const apiJSON = (path, opts) => api(path, opts).then((r) => r.json());
-
-function signOut() {
-  localStorage.removeItem(KEY_STORAGE);
-  $("app").classList.add("hidden");
-  $("gate").classList.remove("hidden");
-}
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -365,25 +348,8 @@ $("next").addEventListener("click", () => {
   loadMessages().catch((e) => showErr(e.message));
 });
 
-$("gate-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  $("gate-err").classList.add("hidden");
-  const key = $("key-input").value.trim();
-  if (!key) return;
-  localStorage.setItem(KEY_STORAGE, key);
-  try {
-    await enter();
-  } catch (err) {
-    localStorage.removeItem(KEY_STORAGE);
-    $("gate-err").textContent = "That key was rejected.";
-    $("gate-err").classList.remove("hidden");
-  }
-});
-
 async function enter() {
   const any = await loadAccounts();
-  $("gate").classList.add("hidden");
-  $("app").classList.remove("hidden");
   if (!any) {
     $("messages").innerHTML = '<div class="empty">No accounts connected. <a href="/dashboard">Connect one</a> first.</div>';
     return;
@@ -393,12 +359,7 @@ async function enter() {
 }
 
 (function init() {
-  if (apiKey()) {
-    enter().catch(() => {
-      $("gate").classList.remove("hidden");
-      $("app").classList.add("hidden");
-    });
-  }
+  enter().catch((e) => showErr(e.message));
 })();
 </script>
 </body></html>`

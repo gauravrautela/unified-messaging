@@ -357,8 +357,43 @@ func TestDashboardServesWithSession(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `id="gate-form"`) {
-		t.Fatal("dashboard did not render the API key gate")
+}
+
+// Without a session, both the dashboard and the mail viewer redirect to
+// /login with a next= back to the page the visitor asked for.
+func TestPagesRedirectToLoginWithoutSession(t *testing.T) {
+	s, _ := newTestServer(t)
+	for _, path := range []string{"/dashboard", "/mail?account_id=acc_1"} {
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusFound {
+			t.Fatalf("%s: status = %d, want 302", path, rec.Code)
+		}
+		loc, _ := url.Parse(rec.Header().Get("Location"))
+		if loc.Path != "/login" || loc.Query().Get("next") != path {
+			t.Fatalf("%s: location = %q", path, rec.Header().Get("Location"))
+		}
+	}
+}
+
+// The dashboard shows which developer is signed in and lets them manage their
+// own API keys; it no longer carries the client-side localStorage key gate.
+func TestDashboardShowsDeveloperAndKeysPanel(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "dev@x.com")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"dev@x.com", `id="keys"`, `data-action="create-key"`, `id="logout-form"`, "/api/v1/api-keys"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard missing %q", want)
+		}
+	}
+	if strings.Contains(body, "um_api_key") || strings.Contains(body, `id="gate-form"`) {
+		t.Fatal("dashboard still has the localStorage API-key gate")
 	}
 }
 
