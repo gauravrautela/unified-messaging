@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -876,5 +877,86 @@ func TestSelfAttendee(t *testing.T) {
 	got, err := s.SelfAttendee(acct)
 	if err != nil || got.ID != "self" || !got.IsSelf {
 		t.Fatalf("SelfAttendee = %+v %v", got, err)
+	}
+}
+
+// ApplyReaction must be safe when multiple goroutines merge into the same
+// message concurrently: a chat-runtime actor applying an inbound reaction and
+// an API handler applying a local one must not race and lose an update. Each
+// goroutine here reacts as a distinct attendee, so a correct implementation
+// keeps every one of them.
+func TestApplyReactionIsAtomicUnderConcurrency(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "direct"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: "m1", ChatID: "c1",
+		Sender: model.Attendee{ID: "a1"}, Kind: "text", Text: "x", SentAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- s.ApplyReaction(acct, "m1", model.Reaction{
+				AttendeeID: fmt.Sprintf("a%d", i), Emoji: "👍", At: time.Now(),
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m, err := s.GetChatMessage(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Reactions) != n {
+		t.Fatalf("reactions = %d, want %d: %+v", len(m.Reactions), n, m.Reactions)
+	}
+}
+
+// A duplicate attendee id in the input violates the chat_members primary key
+// partway through ReplaceChatMembers' insert loop; the whole replace must
+// roll back rather than leave a half-written roster.
+func TestReplaceChatMembersIsAllOrNothing(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "group"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceChatMembers(acct, "c1", []model.ChatMember{
+		{ChatID: "c1", AttendeeID: "a1"}, {ChatID: "c1", AttendeeID: "a2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.ReplaceChatMembers(acct, "c1", []model.ChatMember{
+		{ChatID: "c1", AttendeeID: "b1"},
+		{ChatID: "c1", AttendeeID: "b1"}, // duplicate: violates the primary key
+	})
+	if err == nil {
+		t.Fatal("expected an error from the duplicate attendee id")
+	}
+
+	c, err := s.GetChat(acct, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, m := range c.Members {
+		got[m.ID] = true
+	}
+	if len(got) != 2 || !got["a1"] || !got["a2"] {
+		t.Fatalf("previous roster not intact after a failed replace: %+v", c.Members)
 	}
 }

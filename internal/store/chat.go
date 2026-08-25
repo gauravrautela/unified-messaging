@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,31 @@ import (
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
 )
+
+// inTx runs fn inside a transaction: commits on success, rolls back on any
+// error (and re-panics after rolling back on a panic). The pool is capped at
+// one connection (see Open), so a transaction holds the pool's only
+// connection for its whole lifetime — a concurrent caller's db.Exec/Query
+// blocks waiting for a connection rather than interleaving with fn's reads
+// and writes. That is what makes a multi-statement read-modify-write (or a
+// delete-then-insert loop) atomic here without any SQLite-specific locking.
+func (s *Store) inTx(fn func(*sql.Tx) error) (err error) {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
 // ---------- chats ----------
 
@@ -251,18 +277,23 @@ func scanAttendee(r scanner) (model.Attendee, error) {
 
 // ReplaceChatMembers overwrites a chat's roster wholesale: simpler and safer
 // than diffing against whatever a provider's group-metadata event reports.
+// The delete and the insert loop run in one transaction, so a mid-loop
+// failure (e.g. a duplicate attendee id violating the primary key) leaves
+// the previous roster intact rather than a half-replaced one.
 func (s *Store) ReplaceChatMembers(accountID, chatID string, members []model.ChatMember) error {
-	if _, err := s.db.Exec(`DELETE FROM chat_members WHERE account_id = ? AND chat_id = ?`, accountID, chatID); err != nil {
-		return err
-	}
-	for _, m := range members {
-		if _, err := s.db.Exec(`
-			INSERT INTO chat_members (account_id, chat_id, attendee_id, role) VALUES (?,?,?,?)`,
-			accountID, chatID, m.AttendeeID, m.Role); err != nil {
+	return s.inTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM chat_members WHERE account_id = ? AND chat_id = ?`, accountID, chatID); err != nil {
 			return err
 		}
-	}
-	return nil
+		for _, m := range members {
+			if _, err := tx.Exec(`
+				INSERT INTO chat_members (account_id, chat_id, attendee_id, role) VALUES (?,?,?,?)`,
+				accountID, chatID, m.AttendeeID, m.Role); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ---------- chat messages ----------
@@ -375,29 +406,35 @@ func (s *Store) SetMessageStatus(accountID string, ids []string, status string) 
 
 // ApplyReaction replaces the given attendee's earlier reaction to a message
 // (if any) with r. An empty emoji removes that attendee's reaction outright.
+// The read of reactions_json and the write back run in one transaction, so
+// two concurrent callers merging into the same message (a chat-runtime actor
+// applying an inbound reaction, an API handler applying a local one) cannot
+// interleave and lose one of the two updates.
 func (s *Store) ApplyReaction(accountID, id string, r model.Reaction) error {
-	var reactionsJSON string
-	err := s.db.QueryRow(`SELECT reactions_json FROM chat_messages WHERE account_id = ? AND id = ?`, accountID, id).Scan(&reactionsJSON)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
-	}
-	var reactions []model.Reaction
-	_ = json.Unmarshal([]byte(reactionsJSON), &reactions)
-	filtered := make([]model.Reaction, 0, len(reactions)+1)
-	for _, x := range reactions {
-		if x.AttendeeID != r.AttendeeID {
-			filtered = append(filtered, x)
+	return s.inTx(func(tx *sql.Tx) error {
+		var reactionsJSON string
+		err := tx.QueryRow(`SELECT reactions_json FROM chat_messages WHERE account_id = ? AND id = ?`, accountID, id).Scan(&reactionsJSON)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
 		}
-	}
-	if r.Emoji != "" {
-		filtered = append(filtered, r)
-	}
-	rj, _ := json.Marshal(filtered)
-	_, err = s.db.Exec(`UPDATE chat_messages SET reactions_json = ? WHERE account_id = ? AND id = ?`, string(rj), accountID, id)
-	return err
+		if err != nil {
+			return err
+		}
+		var reactions []model.Reaction
+		_ = json.Unmarshal([]byte(reactionsJSON), &reactions)
+		filtered := make([]model.Reaction, 0, len(reactions)+1)
+		for _, x := range reactions {
+			if x.AttendeeID != r.AttendeeID {
+				filtered = append(filtered, x)
+			}
+		}
+		if r.Emoji != "" {
+			filtered = append(filtered, r)
+		}
+		rj, _ := json.Marshal(filtered)
+		_, err = tx.Exec(`UPDATE chat_messages SET reactions_json = ? WHERE account_id = ? AND id = ?`, string(rj), accountID, id)
+		return err
+	})
 }
 
 func (s *Store) EditChatMessage(accountID, id, text string, at time.Time) error {
