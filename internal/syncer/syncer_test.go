@@ -19,6 +19,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
+	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -344,6 +345,27 @@ func lineWith(recs *logx.Records, sub string) string {
 		}
 	}
 	return out
+}
+
+// The poll loop must not try to delta-sync a chat account: it has no Mailbox.
+func TestPollSkipsChatAccounts(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_ = db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash")
+	_ = db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "+91", Status: model.AccountOK})
+	fake := providertest.NewFakeChat("FAKECHAT")
+	log, recs := logx.Capture()
+	s := New(db, provider.NewRegistry(fake), nil, events.NewDispatcher(db, log), log, Options{PollInterval: time.Hour})
+	s.pollOnce(context.Background())
+	if recs.Contains("sync run started") {
+		t.Fatalf("chat account was polled: %v", recs.All())
+	}
+	if !recs.Contains("skipping non-mail account") {
+		t.Fatalf("expected skip decision: %v", recs.All())
+	}
 }
 
 // A second wakeup while a sync is running must collapse into one follow-up run

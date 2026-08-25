@@ -203,6 +203,89 @@ func (m *Manager) AccessToken(ctx context.Context, accountID string, force bool)
 	return tok.AccessToken, nil
 }
 
+// ConnectLinked records a chat account after a successful device link. The
+// device's credentials live in the provider's own store; we keep only the
+// mapping account -> device JID. Relinking the same number under the same
+// developer reuses the account id and replaces the device.
+func (m *Manager) ConnectLinked(ctx context.Context, developerID, providerName string, id provider.Identity, deviceJID string) (model.Account, error) {
+	log := logx.From(ctx).With("component", "accounts", "developer_id", developerID, "provider", providerName)
+	if id.Identifier == "" {
+		return model.Account{}, errors.New("accounts: provider did not report an identifier")
+	}
+	accountID, err := m.store.AccountIDByEmail(developerID, id.Identifier)
+	relink := err == nil
+	if errors.Is(err, store.ErrNotFound) {
+		if accountID, err = newID("acc"); err != nil {
+			return model.Account{}, err
+		}
+	} else if err != nil {
+		return model.Account{}, err
+	}
+	if err := m.store.UpsertAccount(model.Account{
+		ID: accountID, DeveloperID: developerID, Kind: model.AccountKindChat, Provider: providerName,
+		Email: id.Identifier, Name: id.Name, Status: model.AccountOK,
+	}); err != nil {
+		return model.Account{}, err
+	}
+	realID, err := m.store.AccountIDByEmail(developerID, id.Identifier)
+	if err != nil {
+		return model.Account{}, err
+	}
+	if relink {
+		// Drop the previous device so its keys do not linger.
+		if old, err := m.store.ChatSession(realID); err == nil && old != deviceJID {
+			m.forget(ctx, providerName, old)
+		}
+	}
+	if err := m.store.SaveChatSession(realID, providerName, deviceJID); err != nil {
+		return model.Account{}, err
+	}
+	log.Info("chat account linked", "account_id", realID, "relink", relink)
+	return m.store.GetAnyAccount(realID)
+}
+
+func (m *Manager) DeviceJID(accountID string) (string, error) { return m.store.ChatSession(accountID) }
+
+// DeleteLinked removes a chat account and its device credentials.
+func (m *Manager) DeleteLinked(ctx context.Context, accountID string) error {
+	acct, err := m.store.GetAnyAccount(accountID)
+	if err != nil {
+		return err
+	}
+	if jid, err := m.store.ChatSession(accountID); err == nil {
+		m.forget(ctx, acct.Provider, jid)
+	}
+	if err := m.store.DeleteChatSession(accountID); err != nil {
+		return err
+	}
+	return m.store.DeleteAccount(accountID)
+}
+
+// MarkLoggedOut is the chat counterpart of a rejected refresh token: the
+// phone removed the linked device, so only the end user can fix it.
+func (m *Manager) MarkLoggedOut(accountID, reason string) {
+	acct, err := m.store.GetAnyAccount(accountID)
+	if err != nil {
+		return
+	}
+	if jid, err := m.store.ChatSession(accountID); err == nil {
+		m.forget(context.Background(), acct.Provider, jid)
+	}
+	_ = m.store.DeleteChatSession(accountID)
+	m.log.Warn("chat account logged out", "account_id", accountID, "reason", reason)
+	m.markCredentials(accountID)
+}
+
+func (m *Manager) forget(ctx context.Context, providerName, deviceJID string) {
+	p, err := m.registry.Get(providerName)
+	if err != nil || p.Chat() == nil {
+		return
+	}
+	if err := p.Chat().Forget(ctx, deviceJID); err != nil {
+		m.log.Warn("forgetting device", "provider", providerName, "err", err)
+	}
+}
+
 func (m *Manager) markCredentials(accountID string) {
 	if err := m.store.SetAccountStatus(accountID, model.AccountCredentials); err != nil {
 		m.log.Error("marking account as needing re-consent", "account_id", accountID, "err", err)

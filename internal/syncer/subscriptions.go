@@ -53,6 +53,11 @@ func (s *Syncer) reconcileSubscriptions(ctx context.Context) {
 		if a.Status != model.AccountOK {
 			continue
 		}
+		p, err := s.registry.Get(a.Provider)
+		if err != nil || p.Kind() != model.AccountKindMail {
+			s.log.Debug("skipping non-mail account", "account_id", a.ID, "provider", a.Provider)
+			continue
+		}
 		if err := s.EnsureSubscription(ctx, a.ID); err != nil {
 			if errors.Is(err, provider.ErrReauthRequired) {
 				continue

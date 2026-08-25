@@ -168,21 +168,31 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			accts, err := s.store.ListAllAccounts()
-			if err != nil {
-				s.log.Error("listing accounts for poll", "err", err)
-				continue
-			}
-			n := 0
-			for _, a := range accts {
-				if a.Status == model.AccountOK {
-					n++
-					s.Wake(a.ID)
-				}
-			}
-			s.log.Debug("poll tick", "accounts", len(accts), "ok", n)
+			s.pollOnce(ctx)
 		}
 	}
+}
+
+func (s *Syncer) pollOnce(ctx context.Context) {
+	accts, err := s.store.ListAllAccounts()
+	if err != nil {
+		s.log.Error("listing accounts for poll", "err", err)
+		return
+	}
+	n := 0
+	for _, a := range accts {
+		if a.Status != model.AccountOK {
+			continue
+		}
+		p, err := s.registry.Get(a.Provider)
+		if err != nil || p.Kind() != model.AccountKindMail {
+			s.log.Debug("skipping non-mail account", "account_id", a.ID, "provider", a.Provider)
+			continue
+		}
+		n++
+		s.Wake(a.ID)
+	}
+	s.log.Debug("poll tick", "accounts", len(accts), "ok", n)
 }
 
 // mailboxFor resolves the provider that owns an account.
