@@ -4,7 +4,10 @@
 // parameter, or a Microsoft error code exists.
 package outlook
 
-import "github.com/gauravrautela/unified-messaging/internal/provider"
+import (
+	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/provider"
+)
 
 // Name is the identifier recorded on every account this provider owns.
 const Name = "OUTLOOK"
@@ -26,8 +29,11 @@ func New(auth *Auth, tokens provider.TokenSource) *Provider {
 }
 
 func (p *Provider) Name() string                 { return Name }
+func (p *Provider) Kind() string                 { return model.AccountKindMail }
 func (p *Provider) Auth() provider.Authenticator { return p.auth }
+func (p *Provider) Linker() provider.Linker      { return nil }
 func (p *Provider) Mailbox() provider.Mailbox    { return p.client }
+func (p *Provider) Chat() provider.Chatter       { return nil }
 func (p *Provider) Push() provider.Pusher        { return p.client }
 
 // Compile-time proof the implementation satisfies every contract. Without these

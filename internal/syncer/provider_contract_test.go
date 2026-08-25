@@ -76,8 +76,11 @@ func (m *simpleMailbox) SendDraft(context.Context, string, string) error { retur
 type simpleProvider struct{ mb *simpleMailbox }
 
 func (p *simpleProvider) Name() string                 { return "SIMPLE" }
+func (p *simpleProvider) Kind() string                 { return model.AccountKindMail }
 func (p *simpleProvider) Auth() provider.Authenticator { return nil }
+func (p *simpleProvider) Linker() provider.Linker      { return nil }
 func (p *simpleProvider) Mailbox() provider.Mailbox    { return p.mb }
+func (p *simpleProvider) Chat() provider.Chatter       { return nil }
 
 // Push returns nil: this provider has no push mechanism, so the core must fall
 // back to polling instead of erroring.

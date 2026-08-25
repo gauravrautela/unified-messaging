@@ -24,12 +24,16 @@ type Account struct {
 	DeveloperID string    `json:"-"`
 	Provider    string    `json:"provider"` // always "OUTLOOK" in this POC
 	Email       string    `json:"email"`
+	Kind        string    `json:"kind"`
+	Identifier  string    `json:"identifier"`
 	Name        string    `json:"name"`
 	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	// LastSyncedAt is nil until the first backfill completes.
 	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"`
+	// Connection is the live socket state for a chat account. Nil for mail.
+	Connection *Connection `json:"connection,omitempty"`
 }
 
 type Recipient struct {
@@ -154,7 +158,8 @@ const (
 // KnownEvent reports whether name is one we emit (or the "*" wildcard).
 func KnownEvent(name string) bool {
 	switch name {
-	case "*", EventMailReceived, EventMailSent, EventMailUpdated, EventMailDeleted, EventAccountError:
+	case "*", EventMailReceived, EventMailSent, EventMailUpdated, EventMailDeleted, EventAccountError,
+		EventChatReceived, EventChatSent, EventChatUpdated, EventChatReaction, EventChatDeleted:
 		return true
 	}
 	return false
@@ -175,6 +180,14 @@ type Event struct {
 	Email   *Email      `json:"email,omitempty"`
 	EmailID string      `json:"email_id,omitempty"`
 	Account *Account    `json:"account,omitempty"`
+
+	// Chat fields, set only on chat_* events.
+	Message    *ChatMessage `json:"message,omitempty"`
+	Chat       *Chat        `json:"chat,omitempty"`
+	MessageIDs []string     `json:"message_ids,omitempty"`
+	Status     string       `json:"status,omitempty"`
+	Change     string       `json:"change,omitempty"`
+	Reaction   *Reaction    `json:"reaction,omitempty"`
 }
 
 // Developer is a tenant: the integrator who signs in, holds API keys, and

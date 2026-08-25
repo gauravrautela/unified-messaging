@@ -92,7 +92,7 @@ func (a *Auth) Identify(ctx context.Context, accessToken string) (provider.Ident
 	if email == "" {
 		return provider.Identity{}, fmt.Errorf("outlook: could not determine mailbox address")
 	}
-	return provider.Identity{Email: email, Name: p.DisplayName}, nil
+	return provider.Identity{Identifier: email, Email: email, Name: p.DisplayName}, nil
 }
 
 type tokenResponse struct {
