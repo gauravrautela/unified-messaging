@@ -1649,3 +1649,87 @@ func TestLinkQRSecondPollerSeesStartLinkFailure(t *testing.T) {
 		t.Fatalf("SessionCount = %d, want 1 after the retry succeeds", n)
 	}
 }
+
+func TestChatRoutesHappyPath(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	h := s.Routes()
+	j := func(method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+		req := withKey(httptest.NewRequest(method, path, strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		for i := 0; i+1 < len(hdr); i += 2 {
+			req.Header.Set(hdr[i], hdr[i+1])
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := j("GET", "/api/v1/chats?account_id="+acc, ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"c1"`) {
+		t.Fatalf("list chats: %d %s", rec.Code, rec.Body.String())
+	}
+	s.fake().SendResult = provider.SendResult{MessageID: "REAL1"}
+	rec := j("POST", "/api/v1/chats/c1/messages?account_id="+acc, `{"text":"hello"}`, "Idempotency-Key", "k1")
+	if rec.Code != 201 || !strings.Contains(rec.Body.String(), `"id":"REAL1"`) || !strings.Contains(rec.Body.String(), `"status":"sent"`) {
+		t.Fatalf("send: %d %s", rec.Code, rec.Body.String())
+	}
+	replay := j("POST", "/api/v1/chats/c1/messages?account_id="+acc, `{"text":"hello"}`, "Idempotency-Key", "k1")
+	if replay.Code != 201 || replay.Body.String() != rec.Body.String() {
+		t.Fatalf("idempotent replay differs: %d %s", replay.Code, replay.Body.String())
+	}
+	if got := s.fake().Commands(); len(got) != 1 {
+		t.Fatalf("send called %d times", len(got))
+	}
+	if c := j("POST", "/api/v1/chats/c1/messages?account_id="+acc, `{"text":"different"}`, "Idempotency-Key", "k1"); c.Code != 409 {
+		t.Fatalf("conflict: %d", c.Code)
+	}
+	if rec := j("GET", "/api/v1/chats/c1/messages?account_id="+acc+"&limit=10", ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"REAL1"`) {
+		t.Fatalf("list messages: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := j("PUT", "/api/v1/chats/c1/messages/REAL1/reaction?account_id="+acc, `{"emoji":"👍"}`); rec.Code != 204 {
+		t.Fatalf("react: %d", rec.Code)
+	}
+	if rec := j("PATCH", "/api/v1/chats/c1/messages/REAL1?account_id="+acc, `{"text":"hello!"}`); rec.Code != 200 {
+		t.Fatalf("edit: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := j("DELETE", "/api/v1/chats/c1/messages/REAL1?account_id="+acc, ""); rec.Code != 204 {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	if rec := j("PATCH", "/api/v1/chats/c1?account_id="+acc, `{"read":true}`); rec.Code != 200 {
+		t.Fatalf("mark read: %d", rec.Code)
+	}
+	if rec := j("POST", "/api/v1/chats", `{"account_id":"`+acc+`","phone":"+919888000001","text":"hey"}`); rec.Code != 201 || !strings.Contains(rec.Body.String(), `"chat"`) {
+		t.Fatalf("start direct: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := j("GET", "/api/v1/attendees?account_id="+acc, ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"a1"`) {
+		t.Fatalf("attendees: %d", rec.Code)
+	}
+	// Editing someone else's message is the one legitimate 403.
+	_, _ = db.UpsertChatMessage(model.ChatMessage{AccountID: acc, ID: "THEIRS", ChatID: "c1", Sender: model.Attendee{ID: "a1"}, Kind: "text", Text: "x", SentAt: time.Now()})
+	if rec := j("PATCH", "/api/v1/chats/c1/messages/THEIRS?account_id="+acc, `{"text":"nope"}`); rec.Code != 403 || !strings.Contains(rec.Body.String(), "not_own_message") {
+		t.Fatalf("edit theirs: %d", rec.Code)
+	}
+	// A mail account cannot use chat routes.
+	_ = db.UpsertAccount(model.Account{ID: "acc_mail", DeveloperID: dev.ID, Provider: "OUTLOOK", Email: "m@x.com", Status: model.AccountOK})
+	if rec := j("GET", "/api/v1/chats?account_id=acc_mail", ""); rec.Code != 400 || !strings.Contains(rec.Body.String(), "unsupported_for_kind") {
+		t.Fatalf("mail on chat route: %d", rec.Code)
+	}
+}
+
+func TestSendFailureLeavesNoRow(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.fake().CommandErr = errors.New("socket closed")
+	req := withKey(httptest.NewRequest("POST", "/api/v1/chats/c1/messages?account_id="+acc, strings.NewReader(`{"text":"x"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != 502 {
+		t.Fatalf("send failure: %d", rec.Code)
+	}
+	msgs, _, _ := db.ListChatMessages(acc, "c1", "", 10)
+	if len(msgs) != 0 {
+		t.Fatalf("row left behind: %+v", msgs)
+	}
+}

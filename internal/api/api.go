@@ -109,6 +109,19 @@ var apiRoutes = []string{
 	"POST /api/v1/webhooks",
 	"DELETE /api/v1/webhooks/{id}",
 	"GET /api/v1/webhooks/{id}/deliveries",
+
+	"GET /api/v1/chats",
+	"POST /api/v1/chats",
+	"GET /api/v1/chats/{id}",
+	"PATCH /api/v1/chats/{id}",
+	"GET /api/v1/chats/{id}/messages",
+	"POST /api/v1/chats/{id}/messages",
+	"GET /api/v1/chats/{id}/messages/{mid}",
+	"PATCH /api/v1/chats/{id}/messages/{mid}",
+	"DELETE /api/v1/chats/{id}/messages/{mid}",
+	"PUT /api/v1/chats/{id}/messages/{mid}/reaction",
+	"GET /api/v1/attendees",
+	"GET /api/v1/attendees/{id}",
 }
 
 func (s *Server) Routes() http.Handler {
@@ -184,6 +197,19 @@ func (s *Server) Routes() http.Handler {
 		"POST /api/v1/webhooks":                s.handleCreateWebhook,
 		"DELETE /api/v1/webhooks/{id}":         s.handleDeleteWebhook,
 		"GET /api/v1/webhooks/{id}/deliveries": s.handleListWebhookDeliveries,
+
+		"GET /api/v1/chats":                              s.handleListChats,
+		"POST /api/v1/chats":                             s.handleStartChat,
+		"GET /api/v1/chats/{id}":                         s.handleGetChat,
+		"PATCH /api/v1/chats/{id}":                       s.handlePatchChat,
+		"GET /api/v1/chats/{id}/messages":                s.handleListChatMessages,
+		"POST /api/v1/chats/{id}/messages":               s.handleSendChatMessage,
+		"GET /api/v1/chats/{id}/messages/{mid}":          s.handleGetChatMessage,
+		"PATCH /api/v1/chats/{id}/messages/{mid}":        s.handlePatchChatMessage,
+		"DELETE /api/v1/chats/{id}/messages/{mid}":       s.handleDeleteChatMessage,
+		"PUT /api/v1/chats/{id}/messages/{mid}/reaction": s.handleReactToMessage,
+		"GET /api/v1/attendees":                          s.handleListAttendees,
+		"GET /api/v1/attendees/{id}":                     s.handleGetAttendee,
 	}
 	for _, pattern := range apiRoutes {
 		hf, ok := handlers[pattern]

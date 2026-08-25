@@ -41,6 +41,18 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 	if err := db.SaveDelivery(store.Delivery{ID: "dl_A", WebhookID: "wh_A", EventType: "mail_received", Payload: []byte(`{}`), NextAttemptAt: now, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: devA.ID, Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "wa@x.com", Status: model.AccountOK}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertChat(model.Chat{ID: "c1", AccountID: "acc_wa", Kind: "direct"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAttendee(model.Attendee{ID: "a1", Phone: "+15550000001", Name: "A One"}, "acc_wa"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertChatMessage(model.ChatMessage{AccountID: "acc_wa", ID: "M1", ChatID: "c1", Sender: model.Attendee{ID: "acc_wa", IsSelf: true}, IsFromMe: true, Kind: "text", Text: "secret", SentAt: now}); err != nil {
+		t.Fatal(err)
+	}
 	keysA, _ := db.ListAPIKeys(devA.ID)
 
 	body := func(s string) *strings.Reader { return strings.NewReader(s) }
@@ -70,6 +82,18 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		{"POST /api/v1/drafts/{id}/send", "POST", "/api/v1/drafts/D1/send?account_id=acc_A", nil, 404},
 		{"DELETE /api/v1/webhooks/{id}", "DELETE", "/api/v1/webhooks/wh_A", nil, 404},
 		{"GET /api/v1/webhooks/{id}/deliveries", "GET", "/api/v1/webhooks/wh_A/deliveries", nil, 404},
+		{"GET /api/v1/chats", "GET", "/api/v1/chats?account_id=acc_wa", nil, 404},
+		{"POST /api/v1/chats", "POST", "/api/v1/chats", body(`{"account_id":"acc_wa","phone":"+15551234567","text":"hi"}`), 404},
+		{"GET /api/v1/chats/{id}", "GET", "/api/v1/chats/c1?account_id=acc_wa", nil, 404},
+		{"PATCH /api/v1/chats/{id}", "PATCH", "/api/v1/chats/c1?account_id=acc_wa", body(`{"read":true}`), 404},
+		{"GET /api/v1/chats/{id}/messages", "GET", "/api/v1/chats/c1/messages?account_id=acc_wa", nil, 404},
+		{"POST /api/v1/chats/{id}/messages", "POST", "/api/v1/chats/c1/messages?account_id=acc_wa", body(`{"text":"hi"}`), 404},
+		{"GET /api/v1/chats/{id}/messages/{mid}", "GET", "/api/v1/chats/c1/messages/M1?account_id=acc_wa", nil, 404},
+		{"PATCH /api/v1/chats/{id}/messages/{mid}", "PATCH", "/api/v1/chats/c1/messages/M1?account_id=acc_wa", body(`{"text":"nope"}`), 404},
+		{"DELETE /api/v1/chats/{id}/messages/{mid}", "DELETE", "/api/v1/chats/c1/messages/M1?account_id=acc_wa", nil, 404},
+		{"PUT /api/v1/chats/{id}/messages/{mid}/reaction", "PUT", "/api/v1/chats/c1/messages/M1/reaction?account_id=acc_wa", body(`{"emoji":"👍"}`), 404},
+		{"GET /api/v1/attendees", "GET", "/api/v1/attendees?account_id=acc_wa", nil, 404},
+		{"GET /api/v1/attendees/{id}", "GET", "/api/v1/attendees/a1?account_id=acc_wa", nil, 404},
 		// Session-only endpoint refuses the key before any lookup.
 		{"DELETE /api/v1/api-keys/{id}", "DELETE", "/api/v1/api-keys/" + keysA[0].ID, nil, 403},
 	}
