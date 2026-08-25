@@ -51,6 +51,41 @@ func (s *Server) mailboxFor(acct model.Account) (provider.Mailbox, error) {
 	return p.Mailbox(), nil
 }
 
+// apiRoutes is every pattern registered under the developer middleware. It
+// is a package-level list so the isolation test can prove each one is
+// tenant-scoped.
+var apiRoutes = []string{
+	"POST /api/v1/hosted-auth",
+	"GET /api/v1/me",
+	"GET /api/v1/api-keys",
+	"POST /api/v1/api-keys",
+	"DELETE /api/v1/api-keys/{id}",
+	"GET /api/v1/providers",
+	"GET /api/v1/accounts",
+	"GET /api/v1/accounts/{id}",
+	"DELETE /api/v1/accounts/{id}",
+	"POST /api/v1/accounts/{id}/resync",
+	"GET /api/v1/accounts/{id}/webhooks",
+	"POST /api/v1/accounts/{id}/webhooks",
+	"DELETE /api/v1/accounts/{id}/webhooks/{wid}",
+	"GET /api/v1/folders",
+	"GET /api/v1/threads",
+	"GET /api/v1/emails",
+	"POST /api/v1/emails",
+	"GET /api/v1/emails/{id}",
+	"PATCH /api/v1/emails/{id}",
+	"POST /api/v1/emails/{id}/reply",
+	"POST /api/v1/emails/{id}/forward",
+	"GET /api/v1/emails/{id}/attachments",
+	"GET /api/v1/emails/{id}/attachments/{aid}",
+	"POST /api/v1/drafts",
+	"POST /api/v1/drafts/{id}/send",
+	"GET /api/v1/webhooks",
+	"POST /api/v1/webhooks",
+	"DELETE /api/v1/webhooks/{id}",
+	"GET /api/v1/webhooks/{id}/deliveries",
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -82,41 +117,50 @@ func (s *Server) Routes() http.Handler {
 
 	// --- the API proper ---
 	api := http.NewServeMux()
-	api.HandleFunc("POST /api/v1/hosted-auth", s.handleHostedAuth)
+	handlers := map[string]http.HandlerFunc{
+		"POST /api/v1/hosted-auth": s.handleHostedAuth,
 
-	api.HandleFunc("GET /api/v1/me", s.handleMe)
-	api.HandleFunc("GET /api/v1/api-keys", s.handleListAPIKeys)
-	api.HandleFunc("POST /api/v1/api-keys", s.handleCreateAPIKey)
-	api.HandleFunc("DELETE /api/v1/api-keys/{id}", s.handleRevokeAPIKey)
+		"GET /api/v1/me":               s.handleMe,
+		"GET /api/v1/api-keys":         s.handleListAPIKeys,
+		"POST /api/v1/api-keys":        s.handleCreateAPIKey,
+		"DELETE /api/v1/api-keys/{id}": s.handleRevokeAPIKey,
 
-	api.HandleFunc("GET /api/v1/providers", s.handleListProviders)
-	api.HandleFunc("GET /api/v1/accounts", s.handleListAccounts)
-	api.HandleFunc("GET /api/v1/accounts/{id}", s.handleGetAccount)
-	api.HandleFunc("DELETE /api/v1/accounts/{id}", s.handleDeleteAccount)
-	api.HandleFunc("POST /api/v1/accounts/{id}/resync", s.handleResync)
-	api.HandleFunc("GET /api/v1/accounts/{id}/webhooks", s.handleListAccountWebhooks)
-	api.HandleFunc("POST /api/v1/accounts/{id}/webhooks", s.handleCreateAccountWebhook)
-	api.HandleFunc("DELETE /api/v1/accounts/{id}/webhooks/{wid}", s.handleDeleteAccountWebhook)
+		"GET /api/v1/providers":                       s.handleListProviders,
+		"GET /api/v1/accounts":                        s.handleListAccounts,
+		"GET /api/v1/accounts/{id}":                   s.handleGetAccount,
+		"DELETE /api/v1/accounts/{id}":                s.handleDeleteAccount,
+		"POST /api/v1/accounts/{id}/resync":           s.handleResync,
+		"GET /api/v1/accounts/{id}/webhooks":          s.handleListAccountWebhooks,
+		"POST /api/v1/accounts/{id}/webhooks":         s.handleCreateAccountWebhook,
+		"DELETE /api/v1/accounts/{id}/webhooks/{wid}": s.handleDeleteAccountWebhook,
 
-	api.HandleFunc("GET /api/v1/folders", s.handleListFolders)
-	api.HandleFunc("GET /api/v1/threads", s.handleListThreads)
+		"GET /api/v1/folders": s.handleListFolders,
+		"GET /api/v1/threads": s.handleListThreads,
 
-	api.HandleFunc("GET /api/v1/emails", s.handleListEmails)
-	api.HandleFunc("POST /api/v1/emails", s.handleSendEmail)
-	api.HandleFunc("GET /api/v1/emails/{id}", s.handleGetEmail)
-	api.HandleFunc("PATCH /api/v1/emails/{id}", s.handlePatchEmail)
-	api.HandleFunc("POST /api/v1/emails/{id}/reply", s.handleReply)
-	api.HandleFunc("POST /api/v1/emails/{id}/forward", s.handleForward)
-	api.HandleFunc("GET /api/v1/emails/{id}/attachments", s.handleListAttachments)
-	api.HandleFunc("GET /api/v1/emails/{id}/attachments/{aid}", s.handleDownloadAttachment)
+		"GET /api/v1/emails":                        s.handleListEmails,
+		"POST /api/v1/emails":                       s.handleSendEmail,
+		"GET /api/v1/emails/{id}":                   s.handleGetEmail,
+		"PATCH /api/v1/emails/{id}":                 s.handlePatchEmail,
+		"POST /api/v1/emails/{id}/reply":            s.handleReply,
+		"POST /api/v1/emails/{id}/forward":          s.handleForward,
+		"GET /api/v1/emails/{id}/attachments":       s.handleListAttachments,
+		"GET /api/v1/emails/{id}/attachments/{aid}": s.handleDownloadAttachment,
 
-	api.HandleFunc("POST /api/v1/drafts", s.handleCreateDraft)
-	api.HandleFunc("POST /api/v1/drafts/{id}/send", s.handleSendDraft)
+		"POST /api/v1/drafts":           s.handleCreateDraft,
+		"POST /api/v1/drafts/{id}/send": s.handleSendDraft,
 
-	api.HandleFunc("GET /api/v1/webhooks", s.handleListWebhooks)
-	api.HandleFunc("POST /api/v1/webhooks", s.handleCreateWebhook)
-	api.HandleFunc("DELETE /api/v1/webhooks/{id}", s.handleDeleteWebhook)
-	api.HandleFunc("GET /api/v1/webhooks/{id}/deliveries", s.handleListWebhookDeliveries)
+		"GET /api/v1/webhooks":                 s.handleListWebhooks,
+		"POST /api/v1/webhooks":                s.handleCreateWebhook,
+		"DELETE /api/v1/webhooks/{id}":         s.handleDeleteWebhook,
+		"GET /api/v1/webhooks/{id}/deliveries": s.handleListWebhookDeliveries,
+	}
+	for _, pattern := range apiRoutes {
+		hf, ok := handlers[pattern]
+		if !ok {
+			panic("no handler for " + pattern)
+		}
+		api.HandleFunc(pattern, hf)
+	}
 
 	mux.Handle("/api/v1/", s.withDeveloper(api))
 

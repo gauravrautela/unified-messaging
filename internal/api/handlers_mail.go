@@ -19,6 +19,18 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (model.Account,
 	return s.resolveID(w, r, r.URL.Query().Get("account_id"))
 }
 
+// accountID prefers the query string's account_id — the convention every
+// other {id}-in-path mail route uses — and falls back to the request body's,
+// which the documented reply/forward/send payloads also carry. Checking the
+// query first means a caller cannot bypass ownership scoping by putting a
+// different account_id in the body than the one being probed via the URL.
+func accountID(r *http.Request, fromBody string) string {
+	if q := r.URL.Query().Get("account_id"); q != "" {
+		return q
+	}
+	return fromBody
+}
+
 func (s *Server) resolveID(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Mailbox, bool) {
 	log := logx.From(r.Context())
 	if id == "" {
@@ -283,7 +295,7 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
+	acct, mailbox, ok := s.resolveID(w, r, accountID(r, p.AccountID))
 	if !ok {
 		return
 	}
@@ -302,7 +314,7 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
+	acct, mailbox, ok := s.resolveID(w, r, accountID(r, p.AccountID))
 	if !ok {
 		return
 	}
