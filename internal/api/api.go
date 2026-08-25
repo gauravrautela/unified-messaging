@@ -62,6 +62,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /connect/{state}", s.handleConnectRedirect)
 	mux.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
 
+	// --- developer sign-in (form posts, cookie session) ---
+	mux.HandleFunc("GET /login", s.handleLoginPage)
+	mux.HandleFunc("POST /login", s.handleLogin)
+	mux.HandleFunc("GET /signup", s.handleSignupPage)
+	mux.HandleFunc("POST /signup", s.handleSignup)
+	mux.HandleFunc("POST /logout", s.handleLogout)
+
 	// --- account management + mail viewer UI (gated client-side by the API key) ---
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /mail", s.handleMailPage)
@@ -76,6 +83,11 @@ func (s *Server) Routes() http.Handler {
 	// --- the API proper ---
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/v1/hosted-auth", s.handleHostedAuth)
+
+	api.HandleFunc("GET /api/v1/me", s.handleMe)
+	api.HandleFunc("GET /api/v1/api-keys", s.handleListAPIKeys)
+	api.HandleFunc("POST /api/v1/api-keys", s.handleCreateAPIKey)
+	api.HandleFunc("DELETE /api/v1/api-keys/{id}", s.handleRevokeAPIKey)
 
 	api.HandleFunc("GET /api/v1/providers", s.handleListProviders)
 	api.HandleFunc("GET /api/v1/accounts", s.handleListAccounts)

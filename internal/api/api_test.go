@@ -624,3 +624,170 @@ func TestGetEmailIsComplete(t *testing.T) {
 		t.Fatalf("attachments not cached after first read: %+v", e.Attachments)
 	}
 }
+
+func postForm(h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
+	s, db := newTestServer(t)
+	rec := postForm(s.Routes(), "/signup", url.Values{
+		"email": {"new@x.com"}, "password": {"longenoughpassword"}, "name": {"New"},
+	})
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dashboard" {
+		t.Fatalf("status = %d location = %q", rec.Code, rec.Header().Get("Location"))
+	}
+	var cookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			cookie = c
+		}
+	}
+	if cookie == nil || cookie.Value == "" || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" {
+		t.Fatalf("session cookie = %+v", cookie)
+	}
+	if _, _, err := db.SessionDeveloper(cookie.Value, time.Now()); err != nil {
+		t.Fatalf("cookie does not resolve to a session: %v", err)
+	}
+	if _, _, err := db.DeveloperByEmail("new@x.com"); err != nil {
+		t.Fatalf("developer not created: %v", err)
+	}
+}
+
+func TestSignupAndLoginRejectBadInputInline(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+	rec := postForm(h, "/signup", url.Values{"email": {"bad"}, "password": {"short"}})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid email or password") {
+		t.Fatalf("signup bad input: %d %s", rec.Code, rec.Body.String())
+	}
+	seedDev(t, s, "a@x.com")
+	rec = postForm(h, "/login", url.Values{"email": {"a@x.com"}, "password": {"wrongpassword!"}})
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "invalid email or password") {
+		t.Fatalf("login wrong password: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = postForm(h, "/login", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("login ok: %d", rec.Code)
+	}
+}
+
+func TestLoginHonoursSameOriginNext(t *testing.T) {
+	s, _ := newTestServer(t)
+	seedDev(t, s, "a@x.com")
+	rec := postForm(s.Routes(), "/login?next=/mail?account_id=x", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+	if loc := rec.Header().Get("Location"); loc != "/mail?account_id=x" {
+		t.Fatalf("location = %q", loc)
+	}
+	rec = postForm(s.Routes(), "/login?next=https://evil.example.com/", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+	if loc := rec.Header().Get("Location"); loc != "/dashboard" {
+		t.Fatalf("open redirect: %q", loc)
+	}
+}
+
+func TestLogoutClearsSession(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	req := withSession(t, s, httptest.NewRequest(http.MethodPost, "/logout", nil), dev.ID)
+	tok, _ := req.Cookie(sessionCookie)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
+		t.Fatalf("status = %d location = %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if _, _, err := db.SessionDeveloper(tok.Value, time.Now()); err == nil {
+		t.Fatal("session survived logout")
+	}
+}
+
+func TestMeReportsAuthKind(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	for _, tc := range []struct {
+		req  *http.Request
+		kind string
+	}{
+		{withKey(httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), key), "api_key"},
+		{withSession(t, s, httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), dev.ID), "session"},
+	} {
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, tc.req)
+		var body struct {
+			ID    string `json:"id"`
+			Email string `json:"email"`
+			Auth  string `json:"auth"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.ID != dev.ID || body.Email != "a@x.com" || body.Auth != tc.kind {
+			t.Fatalf("me = %+v, want auth %q", body, tc.kind)
+		}
+	}
+}
+
+func TestAPIKeyEndpoints(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+	dev, key := seedDev(t, s, "a@x.com")
+
+	// Minting requires a session.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/api-keys", strings.NewReader(`{"name":"x"}`)), key))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("mint with api key: %d, want 403", rec.Code)
+	}
+
+	req := withSession(t, s, httptest.NewRequest(http.MethodPost, "/api/v1/api-keys", strings.NewReader(`{"name":"prod"}`)), dev.ID)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("mint: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Prefix string `json:"prefix"`
+		Key    string `json:"key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(created.Key, "um_") || created.Prefix != created.Key[:12] || created.Name != "prod" {
+		t.Fatalf("created = %+v", created)
+	}
+
+	// The new key works, and the list never shows it in full.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/api-keys", nil), created.Key))
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), created.Key) || !strings.Contains(rec.Body.String(), created.Prefix) {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Revoke: session only, and the key dies.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodDelete, "/api/v1/api-keys/"+created.ID, nil), key))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("revoke with api key: %d, want 403", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodDelete, "/api/v1/api-keys/"+created.ID, nil), dev.ID))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("revoke: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), created.Key))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked key still works: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodDelete, "/api/v1/api-keys/key_nope", nil), dev.ID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("revoke unknown: %d", rec.Code)
+	}
+}
