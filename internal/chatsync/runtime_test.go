@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -200,6 +201,96 @@ func TestLogoutIsTerminalAndForgetsDevice(t *testing.T) {
 	if c, ok := h.rt.HealthFor(acc); ok && c.State != "stopped" {
 		t.Fatalf("actor still alive: %+v", c)
 	}
+}
+
+// A provider goroutine must never be parked forever on an inbox that stopped
+// being drained. The actor's context is the sink's only escape from a full
+// queue, so every terminal exit has to cancel it, not just Detach.
+func TestSinkDoesNotBlockOnceTheActorHasStopped(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "1")
+	_ = h.rt.Attach(acc)
+	waitFor(t, func() bool { return h.fake.Sink(acc) != nil })
+	s := h.fake.Sink(acc)
+	h.fake.Disconnect(acc, "device removed", true)
+	waitFor(t, func() bool { a, _ := h.db.GetAnyAccount(acc); return a.Status == model.AccountCredentials })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// One more than the inbox holds: the last call has to fall through to
+		// the blocking send, and must come back out of it.
+		for i := 0; i <= 1024; i++ {
+			s.Message(acc, model.ChatMessage{ID: "F" + strconv.Itoa(i), ChatID: "c1", Kind: "text",
+				SentAt: time.Now(), Sender: model.Attendee{ID: "a1"}},
+				model.Chat{ID: "c1", Kind: "direct"}, model.Attendee{ID: "a1"})
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink still blocked on the inbox after the actor stopped")
+	}
+}
+
+// The window between "the actor has given the account up" and "the supervisor
+// has dropped its map entry" spans a store write and an emit. A relink landing
+// in it must still get a connection.
+func TestAttachReplacesATerminatingActor(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "1")
+	if err := h.rt.Attach(acc); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.fake.Sink(acc) != nil })
+
+	h.rt.mu.Lock()
+	old := h.rt.actors[acc]
+	h.rt.mu.Unlock()
+	old.terminate() // as markLoggedOut does, before its store work
+
+	if n := h.rt.Count(); n != 0 {
+		t.Fatalf("terminating actor counted as live: %d", n)
+	}
+	if err := h.rt.Attach(acc); err != nil {
+		t.Fatal(err)
+	}
+	h.rt.mu.Lock()
+	fresh := h.rt.actors[acc]
+	h.rt.mu.Unlock()
+	if fresh == old {
+		t.Fatal("Attach reused the terminating actor")
+	}
+	waitFor(t, func() bool { c, ok := h.rt.HealthFor(acc); return ok && c.State == "connected" })
+
+	// The old actor finishing must not evict its replacement.
+	old.stop()
+	time.Sleep(100 * time.Millisecond)
+	h.rt.mu.Lock()
+	still := h.rt.actors[acc]
+	h.rt.mu.Unlock()
+	if still != fresh {
+		t.Fatalf("replacement evicted by the old actor's removal: %v", still)
+	}
+}
+
+// The same window, end to end: logout, relink, attach, and a live socket again.
+func TestRelinkAfterLogoutReattaches(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "1")
+	_ = h.rt.Attach(acc)
+	waitFor(t, func() bool { return h.fake.Sink(acc) != nil })
+	h.fake.Disconnect(acc, "device removed", true)
+	waitFor(t, func() bool { a, _ := h.db.GetAnyAccount(acc); return a.Status == model.AccountCredentials })
+
+	if got := h.link(t, "1"); got != acc {
+		t.Fatalf("relink minted a new account: %s != %s", got, acc)
+	}
+	if err := h.rt.Attach(acc); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.fake.Sink(acc) != nil })
+	waitFor(t, func() bool { c, ok := h.rt.HealthFor(acc); return ok && c.State == "connected" })
 }
 
 func TestTransientDisconnectBacksOffAndReconnects(t *testing.T) {

@@ -44,12 +44,13 @@ type actor struct {
 	cancel context.CancelFunc
 	inbox  chan func()
 
-	mu         sync.Mutex
-	state      string
-	since      time.Time
-	reconnects int
-	failures   int
-	lastErr    string
+	mu          sync.Mutex
+	state       string
+	since       time.Time
+	reconnects  int
+	failures    int
+	lastErr     string
+	terminating bool
 }
 
 func newActor(rt *Runtime, acct model.Account, chat provider.Chatter, parent context.Context) *actor {
@@ -71,6 +72,11 @@ func (a *actor) stop() { a.cancel() }
 // whether that ending is worth another attempt. It returns only when the
 // account is finished with — stopped, logged out, or out of attempts.
 func (a *actor) run() {
+	// Deferred LIFO: the final state is recorded first, then the context is
+	// released. Cancelling matters on every exit, not just a Detach: the sink's
+	// only escape from a full inbox is this context, so a provider goroutine
+	// arriving after a logout would otherwise block on a queue nobody drains.
+	defer a.cancel()
 	defer a.setState(stateStopped)
 	for {
 		connID := "conn_" + strings.TrimPrefix(logx.NewRequestID(), "req_")
@@ -205,6 +211,11 @@ func (a *actor) roster(ctx context.Context, log *slog.Logger) {
 // status, and we publish the status change ourselves rather than owning the
 // manager's global hook, which belongs to whoever wires the process together.
 func (a *actor) markLoggedOut(reason string) {
+	// Flagged before the store write and the emit, not after: the supervisor
+	// must be able to tell "this entry is a ghost" for the whole of that
+	// window, or a relink landing in it would attach to an actor on its way out
+	// and end up with no connection at all.
+	a.terminate()
 	a.rt.accts.MarkLoggedOut(a.acct.ID, reason)
 	acct, err := a.rt.store.GetAnyAccount(a.acct.ID)
 	if err != nil {
@@ -246,6 +257,24 @@ func (a *actor) dropped(reason string) int {
 	a.failures++
 	a.lastErr = reason
 	return a.failures
+}
+
+// terminate marks the actor as past the point of no return: it will not serve
+// this account again, whatever else it still has to finish.
+func (a *actor) terminate() {
+	a.mu.Lock()
+	a.terminating = true
+	a.mu.Unlock()
+}
+
+// isTerminating reports whether the actor is winding down. A cancelled context
+// counts on its own, so the stop and shutdown paths need no explicit flag —
+// only the terminal branches that still have store work ahead of them do.
+func (a *actor) isTerminating() bool {
+	a.mu.Lock()
+	t := a.terminating
+	a.mu.Unlock()
+	return t || a.ctx.Err() != nil
 }
 
 func (a *actor) stabilised() {

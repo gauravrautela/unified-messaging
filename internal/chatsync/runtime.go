@@ -119,11 +119,19 @@ func (r *Runtime) Attach(accountID string) error {
 	}
 
 	r.mu.Lock()
-	if _, ok := r.actors[accountID]; ok {
-		r.mu.Unlock()
-		return nil
+	if ex, ok := r.actors[accountID]; ok {
+		if !ex.isTerminating() {
+			r.mu.Unlock()
+			return nil
+		}
+		// The entry belongs to an actor that has already given the account up
+		// and is only finishing its bookkeeping. Evict it here rather than wait
+		// for it: a relink arriving in that window must get a live connection,
+		// not a silent no-op. The old actor's own remove is identity-checked,
+		// so it cannot evict the replacement we are about to install.
+		delete(r.actors, accountID)
 	}
-	if len(r.actors) >= r.opts.MaxAccounts {
+	if r.liveCount() >= r.opts.MaxAccounts {
 		r.mu.Unlock()
 		return ErrCapacity
 	}
@@ -177,7 +185,21 @@ func (r *Runtime) HealthFor(accountID string) (model.Connection, bool) {
 	return a.health(), true
 }
 
-func (r *Runtime) Count() int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.actors) }
+// Count is how many accounts this process is actually serving. Actors that
+// have given their account up are excluded, so a run of logouts never eats the
+// capacity that the accounts replacing them need.
+func (r *Runtime) Count() int { r.mu.Lock(); defer r.mu.Unlock(); return r.liveCount() }
+
+// liveCount counts actors still serving their account. Callers hold r.mu.
+func (r *Runtime) liveCount() int {
+	n := 0
+	for _, a := range r.actors {
+		if !a.isTerminating() {
+			n++
+		}
+	}
+	return n
+}
 
 // Max is the configured connection ceiling, reported so an operator can see
 // how close to it the process is running.
