@@ -5,6 +5,7 @@ package logx
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
 	"strconv"
@@ -32,6 +33,17 @@ func NewRequestID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "req_" + hex.EncodeToString(b)
+}
+
+// Digest returns a short, stable, one-way handle for an identifier that is
+// itself sensitive — a chat id that happens to be a phone number, say.
+//
+// It is for correlation, not identification: the same input always yields the
+// same handle, so lines about one conversation can be tied together, but the
+// original value cannot be read back out of a log.
+func Digest(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return "h_" + hex.EncodeToString(sum[:])[:12]
 }
 
 // secretKeys are matched as substrings of lower-cased map keys.

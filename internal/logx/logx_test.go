@@ -76,3 +76,24 @@ func TestRequestIDShape(t *testing.T) {
 		t.Fatalf("id = %q", id)
 	}
 }
+
+// A digest is stable, short, and does not leak the value it stands for.
+func TestDigest(t *testing.T) {
+	const phone = "919888000000@s.whatsapp.net"
+	d := Digest(phone)
+	if d != Digest(phone) {
+		t.Fatal("digest must be stable for the same input")
+	}
+	if d == Digest("919888000001@s.whatsapp.net") {
+		t.Fatal("different inputs must digest differently")
+	}
+	if !strings.HasPrefix(d, "h_") || len(d) != len("h_")+12 {
+		t.Fatalf("digest = %q, want h_ + 12 hex chars", d)
+	}
+	if strings.Contains(d, "919888000000") {
+		t.Fatalf("digest leaks its input: %q", d)
+	}
+	if Digest("") == "" {
+		t.Fatal("digest of an empty string must still be a handle")
+	}
+}

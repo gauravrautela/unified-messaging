@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -80,6 +81,18 @@ func (p *Provider) Mailbox() provider.Mailbox    { return nil }
 func (p *Provider) Push() provider.Pusher        { return nil }
 func (p *Provider) Linker() provider.Linker      { return p }
 func (p *Provider) Chat() provider.Chatter       { return p }
+
+// newClient builds a whatsmeow client for one device.
+//
+// Reconnection is deliberately the caller's job: the chat runtime owns the
+// backoff policy and builds a fresh client for each attempt, so whatsmeow's own
+// auto-reconnect (on by default in NewClient) would run a second, invisible
+// connection alongside the one the runtime is managing.
+func (p *Provider) newClient(device *store.Device) *whatsmeow.Client {
+	c := whatsmeow.NewClient(device, waLog.Noop)
+	c.EnableAutoReconnect = false
+	return c
+}
 
 // connFor returns the live connection for an account, or nil when the account
 // is not currently connected.

@@ -11,7 +11,6 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
@@ -31,16 +30,14 @@ func (p *Provider) StartLink(ctx context.Context) (provider.LinkSession, error) 
 	log := logx.From(ctx).With("component", "whatsapp")
 
 	device := p.container.NewDevice()
-	client := whatsmeow.NewClient(device, waLog.Noop)
+	client := p.newClient(device)
 
-	s := &linkSession{
-		p:      p,
-		log:    log,
-		client: client,
-		device: device,
-		codes:  make(chan provider.LinkCode, 8),
-		result: make(chan provider.LinkResult, 1),
-	}
+	// The QR channel's lifetime is ours, not the caller's: cancelling linkCtx is
+	// how the session tells whatsmeow to stop emitting codes and close the
+	// channel, which is what lets the pump goroutine finish.
+	linkCtx, cancel := context.WithCancel(ctx)
+
+	s := newLinkSession(p, log, client, device, cancel)
 
 	// Pairing details only reach us as an event; the QR channel's own success
 	// item carries no JID. Registered before Connect so nothing is missed, and
@@ -68,12 +65,14 @@ func (p *Provider) StartLink(ctx context.Context) (provider.LinkSession, error) 
 
 	// GetQRChannel must be attached before Connect, otherwise the pairing
 	// events fire with nobody listening.
-	qr, err := client.GetQRChannel(ctx)
+	qr, err := client.GetQRChannel(linkCtx)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("whatsapp: qr channel: %w", err)
 	}
 
 	if err := client.Connect(); err != nil {
+		cancel()
 		return nil, fmt.Errorf("whatsapp: connect for pairing: %w", err)
 	}
 
@@ -89,13 +88,34 @@ type linkSession struct {
 	log    *slog.Logger
 	client *whatsmeow.Client
 	device *store.Device
+	cancel context.CancelFunc // stops whatsmeow's QR emitter
 
 	codes  chan provider.LinkCode
 	result chan provider.LinkResult
+	// stop closes as soon as the session resolves, so the pump goroutine leaves
+	// even if whatsmeow never closes the QR channel.
+	stop chan struct{}
+	// pumpDone closes when the pump goroutine has exited. Tests wait on it;
+	// production code does not need it.
+	pumpDone chan struct{}
 
 	mu     sync.Mutex
 	closed bool // guards sends on codes; set under mu together with closing it
 	once   sync.Once
+}
+
+func newLinkSession(p *Provider, log *slog.Logger, client *whatsmeow.Client, device *store.Device, cancel context.CancelFunc) *linkSession {
+	return &linkSession{
+		p:        p,
+		log:      log,
+		client:   client,
+		device:   device,
+		cancel:   cancel,
+		codes:    make(chan provider.LinkCode, 8),
+		result:   make(chan provider.LinkResult, 1),
+		stop:     make(chan struct{}),
+		pumpDone: make(chan struct{}),
+	}
 }
 
 func (s *linkSession) Codes() <-chan provider.LinkCode    { return s.codes }
@@ -107,33 +127,45 @@ func (s *linkSession) Close() {
 }
 
 // pump forwards QR codes to the caller and turns the channel's terminal item
-// into a result. whatsmeow closes the channel right after that item.
+// into a result. whatsmeow normally closes the channel right after that item —
+// but not on every path (a client-side Disconnect makes its emitter return
+// without closing), so the pump also watches the session's own stop signal and
+// never outlives the session either way.
 func (s *linkSession) pump(qr <-chan whatsmeow.QRChannelItem) {
-	for item := range qr {
-		switch item.Event {
-		case whatsmeow.QRChannelEventCode:
-			s.emit(provider.LinkCode{Code: item.Code, ExpiresAt: time.Now().Add(item.Timeout)})
-		case whatsmeow.QRChannelSuccess.Event:
-			// The PairSuccess handler already resolved with the identity; this
-			// item carries no JID, so there is nothing to add.
-		case whatsmeow.QRChannelTimeout.Event:
-			s.resolve(provider.LinkResult{Err: provider.ErrLinkTimeout})
-		case whatsmeow.QRChannelEventError:
-			err := item.Error
-			if err == nil {
-				err = errors.New("whatsapp: pairing failed")
+	defer close(s.pumpDone)
+	for {
+		select {
+		case <-s.stop:
+			return
+		case item, ok := <-qr:
+			if !ok {
+				// The channel closed without a terminal item we recognised: treat
+				// it as an expired window rather than leaving the caller waiting.
+				s.resolve(provider.LinkResult{Err: provider.ErrLinkTimeout})
+				return
 			}
-			s.resolve(provider.LinkResult{Err: err})
-		case whatsmeow.QRChannelEventPasskeyRequest, whatsmeow.QRChannelEventPasskeyResponse:
-			// Passkey pairing is not offered by this service; ignore.
-		default:
-			// err-client-outdated, err-scanned-without-multidevice, err-unexpected-state.
-			s.resolve(provider.LinkResult{Err: fmt.Errorf("whatsapp: pairing failed: %s", item.Event)})
+			switch item.Event {
+			case whatsmeow.QRChannelEventCode:
+				s.emit(provider.LinkCode{Code: item.Code, ExpiresAt: time.Now().Add(item.Timeout)})
+			case whatsmeow.QRChannelSuccess.Event:
+				// The PairSuccess handler already resolved with the identity; this
+				// item carries no JID, so there is nothing to add.
+			case whatsmeow.QRChannelTimeout.Event:
+				s.resolve(provider.LinkResult{Err: provider.ErrLinkTimeout})
+			case whatsmeow.QRChannelEventError:
+				err := item.Error
+				if err == nil {
+					err = errors.New("whatsapp: pairing failed")
+				}
+				s.resolve(provider.LinkResult{Err: err})
+			case whatsmeow.QRChannelEventPasskeyRequest, whatsmeow.QRChannelEventPasskeyResponse:
+				// Passkey pairing is not offered by this service; ignore.
+			default:
+				// err-client-outdated, err-scanned-without-multidevice, err-unexpected-state.
+				s.resolve(provider.LinkResult{Err: fmt.Errorf("whatsapp: pairing failed: %s", item.Event)})
+			}
 		}
 	}
-	// The channel closed without a terminal item we recognised: treat it as an
-	// expired window rather than leaving the caller waiting forever.
-	s.resolve(provider.LinkResult{Err: provider.ErrLinkTimeout})
 }
 
 // emit hands a code to the caller, dropping it if the caller is not keeping
@@ -164,9 +196,18 @@ func (s *linkSession) resolve(r provider.LinkResult) {
 		s.closed = true
 		close(s.codes)
 		s.mu.Unlock()
+		close(s.stop)
 
-		// Tear the pairing socket down before handing the result over, so the
-		// runtime's own connection is never racing this one for the device.
+		// Cancel the QR context first: whatsmeow's emitter reacts to it by
+		// closing its output channel and dropping its event handler. Disconnect
+		// alone would not — it makes the emitter return on the expected-disconnect
+		// path, which leaves the channel open and would strand the pump.
+		if s.cancel != nil {
+			s.cancel()
+		}
+
+		// Then tear the pairing socket down, before handing the result over, so
+		// the runtime's own connection is never racing this one for the device.
 		// Disconnect only closes the websocket; it joins no goroutines, so it is
 		// safe to call from inside an event handler.
 		s.client.Disconnect()

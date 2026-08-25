@@ -7,7 +7,6 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -31,7 +30,7 @@ var _ provider.ChatConn = (*conn)(nil)
 // gone — nothing but a fresh link can fix that, so it reports
 // ErrReauthRequired rather than an error the runtime would retry forever.
 func (p *Provider) Connect(ctx context.Context, accountID, deviceJID string, sink provider.EventSink) (provider.ChatConn, error) {
-	log := logx.From(ctx).With("component", "whatsapp", "account_id", accountID)
+	log := logx.From(ctx).With("component", "whatsapp")
 
 	jid, err := types.ParseJID(deviceJID)
 	if err != nil {
@@ -46,7 +45,7 @@ func (p *Provider) Connect(ctx context.Context, accountID, deviceJID string, sin
 		return nil, provider.ErrReauthRequired
 	}
 
-	c := &conn{p: p, accountID: accountID, client: whatsmeow.NewClient(device, waLog.Noop), sink: sink}
+	c := &conn{p: p, accountID: accountID, client: p.newClient(device), sink: sink}
 	// Registered before Connect so that events arriving during the initial
 	// handshake — history, receipts, an immediate logout — are not dropped.
 	c.client.AddEventHandler(c.handle)
@@ -87,7 +86,7 @@ func (c *conn) handle(evt any) {
 		m, kind := messageFrom(v)
 		m.AccountID = c.accountID
 		c.p.log.Debug("whatsapp inbound",
-			"account_id", c.accountID, "chat_id", m.ChatID, "message_id", m.ID,
+			"account_id", c.accountID, "chat_id", logChatID(v.Info.Chat), "message_id", m.ID,
 			"kind", kind, "text_bytes", len(m.Text))
 		switch kind {
 		case "message":
@@ -114,7 +113,7 @@ func (c *conn) handle(evt any) {
 			ids[i] = string(id)
 		}
 		c.p.log.Debug("whatsapp receipt", "account_id", c.accountID,
-			"chat_id", v.Chat.ToNonAD().String(), "kind", st, "count", len(ids))
+			"chat_id", logChatID(v.Chat), "kind", st, "count", len(ids))
 		c.sink.Receipt(c.accountID, v.Chat.ToNonAD().String(), ids, st)
 	case *events.LoggedOut:
 		// The device was removed from the phone: only a relink can recover.
@@ -126,6 +125,22 @@ func (c *conn) handle(evt any) {
 	case *events.StreamReplaced:
 		c.p.log.Warn("whatsapp stream replaced", "account_id", c.accountID)
 		c.sink.Disconnected(c.accountID, "stream replaced", false)
+	// A rejected connection never produces events.Disconnected: whatsmeow calls
+	// expectDisconnect() before dispatching these, which suppresses it. Without
+	// them the runtime would keep believing a dead socket is connected.
+	case *events.ConnectFailure:
+		c.p.log.Warn("whatsapp connect failure", "account_id", c.accountID, "kind", v.Reason.String())
+		c.sink.Disconnected(c.accountID, "connect failure: "+v.Reason.String(), false)
+	case *events.ClientOutdated:
+		c.p.log.Error("whatsapp client outdated", "account_id", c.accountID)
+		c.sink.Disconnected(c.accountID, "client outdated", false)
+	case *events.CATRefreshError:
+		reason := "cat refresh error"
+		if v.Error != nil {
+			reason += ": " + v.Error.Error()
+		}
+		c.p.log.Warn("whatsapp cat refresh error", "account_id", c.accountID, "error", reason)
+		c.sink.Disconnected(c.accountID, reason, false)
 	case *events.Disconnected:
 		c.p.log.Info("whatsapp socket closed", "account_id", c.accountID)
 		c.sink.Disconnected(c.accountID, "disconnected", false)
@@ -159,7 +174,7 @@ func (p *Provider) Forget(ctx context.Context, deviceJID string) error {
 // chats. Names come from the contact store; a phone number is only exposed
 // for phone JIDs, never for a privacy id.
 func (p *Provider) Chats(ctx context.Context, accountID string) ([]model.Chat, []model.Attendee, []model.ChatMember, error) {
-	log := logx.From(ctx).With("component", "whatsapp", "account_id", accountID)
+	log := logx.From(ctx).With("component", "whatsapp")
 
 	c := p.connFor(accountID)
 	if c == nil {

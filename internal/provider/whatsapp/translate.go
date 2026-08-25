@@ -7,6 +7,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 )
 
@@ -35,9 +36,20 @@ func attendeeFrom(jid, alt types.JID, pushName string) model.Attendee {
 	return a
 }
 
+// logChatID renders a chat id safe to log. A group JID is an opaque server id
+// and goes through verbatim; a direct chat's JID *is* the other party's phone
+// number, so it is reduced to a correlation handle.
+func logChatID(jid types.JID) string {
+	if jid.Server == types.GroupServer {
+		return jid.ToNonAD().String()
+	}
+	return logx.Digest(jid.ToNonAD().String())
+}
+
 // messageFrom classifies an inbound event: kind is one of
-// message | reaction | revoke | edit. For reaction/revoke/edit the target id
-// is returned in QuotedMessageID and the new text/emoji in Text.
+// message | reaction | revoke | edit, or "" for something the chat log has no
+// place for. For reaction/revoke/edit the target id is returned in
+// QuotedMessageID and the new text/emoji in Text.
 func messageFrom(e *events.Message) (model.ChatMessage, string) {
 	m := model.ChatMessage{
 		ID: e.Info.ID, ChatID: e.Info.Chat.ToNonAD().String(), IsFromMe: e.Info.IsFromMe,
@@ -60,10 +72,11 @@ func messageFrom(e *events.Message) (model.ChatMessage, string) {
 			m.Text = textOf(p.GetEditedMessage())
 			return m, "edit"
 		}
-		// App-state syncs, key requests and friends: nothing a chat log shows.
-		m.Kind = "unsupported"
-		m.Text = "[protocol]"
-		return m, "message"
+		// App-state key shares, history-sync notifications, peer-data responses:
+		// machinery, not conversation. An empty kind means "drop it" — storing
+		// these would put rows and webhooks in front of the developer for
+		// something no WhatsApp client ever shows.
+		return m, ""
 	case msg.GetConversation() != "":
 		m.Text = msg.GetConversation()
 	case msg.GetExtendedTextMessage() != nil:

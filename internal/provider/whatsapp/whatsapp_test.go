@@ -99,3 +99,15 @@ func TestCommandsWithoutConnection(t *testing.T) {
 		t.Fatalf("MarkRead = %v, want ErrNotFound", err)
 	}
 }
+
+// The library's own reconnect loop must stay off: the chat runtime owns
+// reconnection and builds a new client for each attempt.
+func TestNewClientDisablesAutoReconnect(t *testing.T) {
+	p, err := New(openDB(t), "unified-messaging-test", nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c := p.newClient(p.container.NewDevice()); c.EnableAutoReconnect {
+		t.Fatal("whatsmeow auto-reconnect must be disabled")
+	}
+}
