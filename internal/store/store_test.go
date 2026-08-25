@@ -365,37 +365,6 @@ func TestDeleteWebhookDropsQueuedDeliveries(t *testing.T) {
 // A database created before per-account webhooks existed must still open:
 // the additive migrations have to run before anything that references the
 // new columns.
-func TestOpenMigratesPreWebhookAccountDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-		CREATE TABLE webhooks (id TEXT PRIMARY KEY, url TEXT NOT NULL, secret TEXT NOT NULL DEFAULT '',
-		  events_json TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL);
-		CREATE TABLE oauth_states (state TEXT PRIMARY KEY, provider TEXT NOT NULL DEFAULT '', verifier TEXT NOT NULL,
-		  success_url TEXT NOT NULL DEFAULT '', failure_url TEXT NOT NULL DEFAULT '', notify_url TEXT NOT NULL DEFAULT '',
-		  created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-		INSERT INTO webhooks (id, url, created_at) VALUES ('wh_old', 'https://old.example.com', 0);`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open on old database: %v", err)
-	}
-	defer s.Close()
-	hooks, err := s.ListWebhooksFor("acc_any")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(hooks) != 1 || hooks[0].AccountID != "" {
-		t.Fatalf("old hook should survive as global: %+v", hooks)
-	}
-}
-
 func TestWebhookNameRoundTrips(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", Name: "crm-sync", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
@@ -425,5 +394,27 @@ func TestScanEmailDerivesBodyPlain(t *testing.T) {
 	}
 	if got.BodyPlain != "Hello & bye" {
 		t.Fatalf("body_plain = %q", got.BodyPlain)
+	}
+}
+
+func TestOpenRefusesPreTenancyDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT, email TEXT,
+		name TEXT, status TEXT, created_at INTEGER, updated_at INTEGER, last_synced_at INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("pre-tenancy database was opened")
+	}
+	want := "database " + path + " predates multi-tenancy; delete it (and its -wal/-shm files) and reconnect your mailboxes"
+	if err.Error() != want {
+		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
 	}
 }

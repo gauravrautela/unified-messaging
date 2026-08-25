@@ -16,6 +16,8 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+var ErrPreTenancy = errors.New("database predates multi-tenancy")
+
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
@@ -26,18 +28,44 @@ func Open(path string) (*Store, error) {
 	// modernc's driver serializes fine, but a single writer avoids SQLITE_BUSY
 	// churn between the sync loop and API handlers.
 	db.SetMaxOpenConns(1)
+
+	// Refuse a database from before tenancy rather than failing on the first
+	// query. We never delete on the operator's behalf.
+	if old, err := preTenancy(db); err != nil {
+		return nil, err
+	} else if old {
+		db.Close()
+		return nil, fmt.Errorf("database %s predates multi-tenancy; delete it (and its -wal/-shm files) and reconnect your mailboxes", path)
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	for _, m := range migrations {
-		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-			return nil, fmt.Errorf("migrate: %w", err)
+	return &Store{db: db}, nil
+}
+
+// preTenancy reports whether an accounts table exists without developer_id.
+func preTenancy(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(accounts)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	seen := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		seen = true
+		if name == "developer_id" {
+			return false, nil
 		}
 	}
-	if _, err := db.Exec(postMigration); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	return &Store{db: db}, nil
+	return seen, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }

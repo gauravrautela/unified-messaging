@@ -18,13 +18,16 @@ const (
 )
 
 type Account struct {
-	ID        string    `json:"id"`
-	Provider  string    `json:"provider"` // always "OUTLOOK" in this POC
-	Email     string    `json:"email"`
-	Name      string    `json:"name"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID string `json:"id"`
+	// DeveloperID is the owner. Never serialised: a caller only ever sees
+	// their own accounts, so it carries no information for them.
+	DeveloperID string    `json:"-"`
+	Provider    string    `json:"provider"` // always "OUTLOOK" in this POC
+	Email       string    `json:"email"`
+	Name        string    `json:"name"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 	// LastSyncedAt is nil until the first backfill completes.
 	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"`
 }
@@ -125,7 +128,8 @@ type SendAttachment struct {
 
 // Webhook is a caller-registered endpoint we deliver normalized events to.
 type Webhook struct {
-	ID string `json:"id"`
+	ID          string `json:"id"`
+	DeveloperID string `json:"-"`
 	// Name is a caller-chosen label echoed in every delivery, so one endpoint
 	// fed by several hooks can tell them apart.
 	Name string `json:"name,omitempty"`
@@ -171,4 +175,24 @@ type Event struct {
 	Email   *Email      `json:"email,omitempty"`
 	EmailID string      `json:"email_id,omitempty"`
 	Account *Account    `json:"account,omitempty"`
+}
+
+// Developer is a tenant: the integrator who signs in, holds API keys, and
+// owns connected accounts.
+type Developer struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Name      string    `json:"name,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// APIKey is the listable view of a key. The full key is returned exactly
+// once, at creation, and never stored.
+type APIKey struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Prefix     string     `json:"prefix"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
