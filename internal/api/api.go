@@ -105,6 +105,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /logout", s.handleLogout)
 
 	// --- account management + mail viewer UI (server-side session-gated; see handlers_auth.go) ---
+	// --- public integration guide ---
+	mux.HandleFunc("GET /docs", s.handleDocs)
+
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /mail", s.handleMailPage)
 

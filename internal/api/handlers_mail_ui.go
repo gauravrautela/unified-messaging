@@ -95,6 +95,7 @@ nav{width:220px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--borde
     <input id="search" type="search" placeholder="Search mail&hellip;">
     <label class="toggle"><input id="unread-only" type="checkbox">Unread only</label>
     <a href="/dashboard">Accounts</a>
+    <a href="/docs">API docs</a>
     <form method="post" action="/logout" style="display:inline"><button type="submit">Log out</button></form>
   </header>
   <p id="err" class="err hidden" style="margin:.6rem 1rem"></p>

@@ -134,6 +134,7 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
       <div style="display:flex;gap:.75rem;align-items:center">
         <span class="sub">{{.Email}}</span>
         <button id="connect-btn" class="primary">+ Connect account</button>
+        <a class="btn" href="/docs">API docs</a>
         <form id="logout-form" method="post" action="/logout" style="margin:0"><button class="signout" type="submit">Log out</button></form>
       </div>
     </header>

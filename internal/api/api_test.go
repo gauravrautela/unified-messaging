@@ -969,3 +969,41 @@ func TestHostedAuthAllowsLocalRedirectURLsButNotLocalNotifyURL(t *testing.T) {
 		t.Fatalf("local notify_url: status = %d, want 400", c)
 	}
 }
+
+// The integration guide is public: integrators read it before they have an
+// account, and it carries nothing secret. It must name every registered API
+// route so it cannot drift from what the server actually serves.
+func TestDocsPageIsPublicAndCoversEveryRoute(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/docs", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 without a session", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("content-type = %q", ct)
+	}
+	body := rec.Body.String()
+	for _, route := range apiRoutes {
+		if !strings.Contains(body, html.EscapeString(route)) {
+			t.Errorf("docs page does not mention route %q", route)
+		}
+	}
+	for _, want := range []string{"X-Outlook-Signature", "mail_received", "hosted-auth", "session_required", "30s"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("docs page missing %q", want)
+		}
+	}
+}
+
+func TestDashboardAndMailLinkToDocs(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	for _, path := range []string{"/dashboard", "/mail"} {
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, path, nil), dev.ID))
+		if !strings.Contains(rec.Body.String(), `href="/docs"`) {
+			t.Errorf("%s has no link to /docs", path)
+		}
+	}
+}
