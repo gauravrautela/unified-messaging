@@ -375,8 +375,18 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   create a developer account; a forgotten password has no recovery path, and
   repeated bad logins aren't throttled.
 - **Pre-tenancy databases are refused; there is no migration.** A database
-  created before multi-tenancy shipped fails to open (see "Logging" for the
-  message) — set up a fresh `DB_PATH` and reconnect mailboxes under it.
+  created before multi-tenancy shipped fails to open with `database <path>
+  predates multi-tenancy; delete it (and its -wal/-shm files) and reconnect
+  your mailboxes` — set up a fresh `DB_PATH` and reconnect mailboxes under it.
+- **DNS-rebinding/hostname SSRF is not prevented.** Webhook, `notify_url`, and
+  redirect URLs are checked as written: literal private, loopback, link-local,
+  and multicast addresses and `localhost` are rejected, but a hostname that
+  resolves to an internal address is not, and nothing re-checks the address the
+  request actually dials.
+- **Login-CSRF on `POST /login`.** The login form carries no CSRF token, so a
+  third-party page can sign a visitor into an attacker-controlled developer
+  account. Session-authenticated writes are defended separately (SameSite=Lax
+  plus a JSON content-type requirement); this is the sign-in step itself.
 
 ---
 

@@ -12,7 +12,7 @@ import (
 // developer-specific content, so unlike the dashboard it stays a plain string
 // rather than a template.
 func (s *Server) handleMailPage(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.sessionDeveloper(r); !ok {
+	if _, ok := s.sessionDeveloper(w, r); !ok {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}

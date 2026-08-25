@@ -40,7 +40,12 @@ func (s *Store) trace(op string, start time.Time, kv ...any) {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	// foreign_keys is per-connection state, so it belongs in the DSN rather
+	// than in a one-off PRAGMA: a PRAGMA in the migration only covers whichever
+	// connection ran it, which today is every connection solely because the
+	// pool is capped at one. In the DSN it holds for any connection the pool
+	// ever opens, whatever that cap becomes.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +56,7 @@ func Open(path string) (*Store, error) {
 	// Refuse a database from before tenancy rather than failing on the first
 	// query. We never delete on the operator's behalf.
 	if old, err := preTenancy(db); err != nil {
+		db.Close()
 		return nil, err
 	} else if old {
 		db.Close()

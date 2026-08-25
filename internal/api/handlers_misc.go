@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -105,9 +104,8 @@ func (r webhookRequest) validate() error {
 	if r.URL == "" {
 		return errors.New("url is required")
 	}
-	u, err := url.Parse(r.URL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("url %q must be an absolute http(s) URL", r.URL)
+	if err := publicHTTPURL(r.URL); err != nil {
+		return err
 	}
 	for _, e := range r.Events {
 		if !model.KnownEvent(e) {
@@ -179,7 +177,12 @@ func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Requ
 	dev, _ := developerFrom(r.Context())
 	id := r.PathValue("id")
 	if _, err := s.store.GetWebhook(dev.ID, id); err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+			return
+		}
+		logx.From(r.Context()).Error("loading webhook", "webhook_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	items, err := s.store.ListDeliveries(id)
@@ -196,7 +199,12 @@ func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Reque
 	dev, _ := developerFrom(r.Context())
 	accountID := r.PathValue("id")
 	if _, err := s.store.GetAccount(dev.ID, accountID); err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "account not found")
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "account not found")
+			return
+		}
+		logx.From(r.Context()).Error("loading account", "account_id", accountID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	var req webhookRequest
@@ -220,7 +228,12 @@ func (s *Server) handleListAccountWebhooks(w http.ResponseWriter, r *http.Reques
 	dev, _ := developerFrom(r.Context())
 	accountID := r.PathValue("id")
 	if _, err := s.store.GetAccount(dev.ID, accountID); err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "account not found")
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "account not found")
+			return
+		}
+		logx.From(r.Context()).Error("loading account", "account_id", accountID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	hooks, err := s.store.ListAccountWebhooks(dev.ID, accountID)
@@ -237,6 +250,13 @@ func (s *Server) handleListAccountWebhooks(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleDeleteAccountWebhook(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	hook, err := s.store.GetWebhook(dev.ID, r.PathValue("wid"))
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		logx.From(r.Context()).Error("loading webhook", "webhook_id", r.PathValue("wid"), "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	// A hook that does not exist and one bound to a different account are the
+	// same 404: ids must not be probeable across accounts.
 	if err != nil || hook.AccountID != r.PathValue("id") {
 		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
 		return

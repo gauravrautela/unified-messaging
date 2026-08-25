@@ -208,7 +208,7 @@ func TestExpiredOAuthStateRejected(t *testing.T) {
 }
 
 // A webhook bound to an account fires only for that account; one with no
-// account is global and fires for everyone.
+// account is global and fires for every account of the same developer.
 func TestListWebhooksForScopesByAccount(t *testing.T) {
 	s := newTestStore(t)
 	acct := seedAccount(t, s)
@@ -611,5 +611,23 @@ func TestOAuthStateCarriesDeveloper(t *testing.T) {
 	got, err := s.TakeOAuthState("st")
 	if err != nil || got.DeveloperID != "dev_1" {
 		t.Fatalf("TakeOAuthState = %+v %v", got, err)
+	}
+}
+
+// PRAGMA foreign_keys is per-connection, so setting it once in the migration
+// only holds while the pool hands out that one connection. Dropping idle
+// connections forces a fresh one, which must still have it on — that is only
+// true if the DSN carries the pragma.
+func TestForeignKeysAreOnForEveryConnection(t *testing.T) {
+	s := newTestStore(t)
+	s.db.SetMaxIdleConns(0) // every query now opens a new connection
+	for i := 0; i < 3; i++ {
+		var on int
+		if err := s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&on); err != nil {
+			t.Fatal(err)
+		}
+		if on != 1 {
+			t.Fatalf("foreign_keys = %d on a fresh connection, want 1", on)
+		}
 	}
 }

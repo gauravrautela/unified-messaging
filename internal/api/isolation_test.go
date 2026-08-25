@@ -1,4 +1,3 @@
-// internal/api/isolation_test.go
 package api
 
 import (

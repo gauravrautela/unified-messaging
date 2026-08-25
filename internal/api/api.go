@@ -104,7 +104,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /signup", s.handleSignup)
 	mux.HandleFunc("POST /logout", s.handleLogout)
 
-	// --- account management + mail viewer UI (gated client-side by the API key) ---
+	// --- account management + mail viewer UI (server-side session-gated; see handlers_auth.go) ---
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /mail", s.handleMailPage)
 
@@ -236,7 +236,7 @@ func (s *Server) withDeveloper(next http.Handler) http.Handler {
 
 		if c, err := r.Cookie(sessionCookie); err == nil {
 			log.Debug("auth: no bearer, session cookie present, resolving")
-			dev, err := s.auth.SessionDeveloper(ctx, c.Value)
+			dev, exp, err := s.auth.SessionDeveloper(ctx, c.Value)
 			if err != nil {
 				log.Debug("auth: session rejected", "err", err)
 				writeError(w, http.StatusUnauthorized, "unauthorized", "session expired; sign in again")
@@ -254,6 +254,13 @@ func (s *Server) withDeveloper(next http.Handler) http.Handler {
 					"session requests must send Content-Type: application/json")
 				return
 			}
+			// Re-issue the cookie on every successful resolution. Expiry slides
+			// in the sessions table, but the cookie's own Expires was fixed at
+			// login, so without this the browser drops a session the server
+			// still considers live. Unconditional is one header and always
+			// correct; comparing against the old cookie's expiry is not even
+			// possible here, since the browser does not send it back.
+			s.setSessionCookie(w, r, c.Value, exp)
 			log.Debug("auth: resolved", "developer_id", dev.ID, "via", "session")
 			s.serveAs(w, r, next, dev, authKindSession)
 			return

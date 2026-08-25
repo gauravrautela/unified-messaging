@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -38,16 +39,30 @@ func NewRequestID() string {
 // under-redaction is the worse failure mode for security.
 var secretKeys = []string{"password", "secret", "token", "key", "code", "verifier", "cookie", "authorization", "client_state", "clientstate", "session"}
 
-// Redact returns a copy of v with secret-looking map values replaced. It
-// walks maps and slices produced by encoding/json; other values pass through.
+// contentKeys hold message content rather than secrets: mail bodies and
+// base64 attachment payloads. Per the logging rules they are logged as a size
+// only, never as text — but unlike a secret their length is worth keeping,
+// because "did the body arrive at all" is the usual debugging question.
+// "body" and "content" match as substrings (body_plain, body_html,
+// content_bytes); "html" and "text" match exactly, since substring matching
+// would swallow innocuous keys like "context" or "text_direction".
+var contentKeys = []string{"body", "content"}
+var contentKeysExact = []string{"html", "text"}
+
+// Redact returns a copy of v with secret-looking map values replaced and
+// message content reduced to a length marker. It walks maps and slices
+// produced by encoding/json; other values pass through.
 func Redact(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for k, val := range t {
-			if isSecret(k) {
+			switch {
+			case isSecret(k):
 				out[k] = "[redacted]"
-			} else {
+			case isContent(k):
+				out[k] = contentMarker(val)
+			default:
 				out[k] = Redact(val)
 			}
 		}
@@ -71,6 +86,31 @@ func isSecret(k string) bool {
 		}
 	}
 	return false
+}
+
+func isContent(k string) bool {
+	lk := strings.ToLower(k)
+	for _, s := range contentKeys {
+		if strings.Contains(lk, s) {
+			return true
+		}
+	}
+	for _, s := range contentKeysExact {
+		if lk == s {
+			return true
+		}
+	}
+	return false
+}
+
+// contentMarker replaces a content string with its length. Non-strings keep
+// walking: a structured body ({"html": ..., "text": ...}) still has its own
+// leaf strings marked.
+func contentMarker(v any) any {
+	if s, ok := v.(string); ok {
+		return "[" + strconv.Itoa(len(s)) + " chars]"
+	}
+	return Redact(v)
 }
 
 // Records collects text log lines for assertions in tests.

@@ -65,7 +65,7 @@ func renderLanding(w http.ResponseWriter, d landingData) {
 // handleDashboard requires a browser session. The page's own fetches then
 // ride the same cookie, so account data stays gated by the API middleware.
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	dev, ok := s.sessionDeveloper(r)
+	dev, ok := s.sessionDeveloper(w, r)
 	if !ok {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return

@@ -109,9 +109,14 @@ func (s *Store) ListWebhooks(developerID string) ([]model.Webhook, error) {
 // hooks an account's event should reach — those bound to the account plus
 // the developer-wide ones of the account's owner.
 func (s *Store) ListWebhooksFor(accountID string) ([]model.Webhook, error) {
+	// Both clauses are gated on the hook belonging to the account's owner, the
+	// account-bound one included. That is defence in depth rather than a fix:
+	// a hook's account_id can only be set to an account the same developer
+	// owns. If that ever stopped holding, this query would still not deliver
+	// one tenant's mail events to another tenant's endpoint.
 	return s.queryWebhooks(webhookSelect+`
-		WHERE account_id = ?
-		   OR (account_id = '' AND developer_id = (SELECT developer_id FROM accounts WHERE id = ?))`,
+		WHERE developer_id = (SELECT developer_id FROM accounts WHERE id = ?)
+		  AND (account_id = ? OR account_id = '')`,
 		accountID, accountID)
 }
 

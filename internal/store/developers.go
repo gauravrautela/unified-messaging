@@ -1,4 +1,3 @@
-// internal/store/developers.go
 package store
 
 import (

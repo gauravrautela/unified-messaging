@@ -13,6 +13,11 @@ func TestRedactMasksSecretFields(t *testing.T) {
 		"session_id": "sess-abc",
 		"nested":     map[string]any{"secret": "s3", "token": "t0k", "key": "k", "code": "c0de", "ok": "fine"},
 		"list":       []any{map[string]any{"refresh_token": "rt"}},
+		"subject":    "hello there",
+		"body":       "<p>hi</p>",
+		"attachments": []any{map[string]any{
+			"name": "a.txt", "content": "AAAA",
+		}},
 	}
 	out := Redact(in).(map[string]any)
 	if out["email"] != "a@b.com" {
@@ -35,6 +40,21 @@ func TestRedactMasksSecretFields(t *testing.T) {
 	}
 	if out["list"].([]any)[0].(map[string]any)["refresh_token"] != "[redacted]" {
 		t.Fatal("refresh_token in list not redacted")
+	}
+	// Message content is replaced by a length marker: the text never reaches
+	// the log, but its size stays visible for debugging.
+	if out["body"] != "[9 chars]" {
+		t.Fatalf("body not length-marked: %v", out["body"])
+	}
+	if got := out["attachments"].([]any)[0].(map[string]any)["content"]; got != "[4 chars]" {
+		t.Fatalf("attachment content not length-marked: %v", got)
+	}
+	if out["attachments"].([]any)[0].(map[string]any)["name"] != "a.txt" {
+		t.Fatal("attachment name changed")
+	}
+	// Envelope fields are not bodies and stay readable.
+	if out["subject"] != "hello there" {
+		t.Fatalf("subject changed: %v", out["subject"])
 	}
 }
 

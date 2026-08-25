@@ -1,4 +1,3 @@
-// internal/api/handlers_auth.go
 package api
 
 import (
@@ -37,18 +36,32 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 
 // sessionDeveloper resolves the browser session for page handlers, which
 // sit outside the /api/v1 middleware.
-func (s *Server) sessionDeveloper(r *http.Request) (model.Developer, bool) {
+//
+// It takes w because resolving a session may slide its expiry, and the new
+// expiry only reaches the browser if the cookie is re-issued. Re-setting it on
+// every successful resolution is a single header and always correct, which
+// beats comparing against whatever the old cookie happened to carry.
+func (s *Server) sessionDeveloper(w http.ResponseWriter, r *http.Request) (model.Developer, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
 		return model.Developer{}, false
 	}
-	d, err := s.auth.SessionDeveloper(r.Context(), c.Value)
-	return d, err == nil
+	d, exp, err := s.auth.SessionDeveloper(r.Context(), c.Value)
+	if err != nil {
+		return model.Developer{}, false
+	}
+	s.setSessionCookie(w, r, c.Value, exp)
+	return d, true
 }
 
 // safeNext keeps ?next= on this origin: a path starting with a single "/".
+//
+// Both "//" and "/\" are rejected as second characters. Browsers normalise a
+// backslash in the authority position to a forward slash, so "/\evil.com"
+// navigates to evil.com exactly as "//evil.com" would — it only looks like a
+// relative path.
 func safeNext(raw string) string {
-	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
+	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") && !strings.HasPrefix(raw, `/\`) {
 		return raw
 	}
 	return "/dashboard"
@@ -114,7 +127,7 @@ func renderAuth(w http.ResponseWriter, status int, p authPage) {
 }
 
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.sessionDeveloper(r); ok {
+	if _, ok := s.sessionDeveloper(w, r); ok {
 		http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusFound)
 		return
 	}
@@ -144,7 +157,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSignupPage(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.sessionDeveloper(r); ok {
+	if _, ok := s.sessionDeveloper(w, r); ok {
 		http.Redirect(w, r, "/dashboard", http.StatusFound)
 		return
 	}

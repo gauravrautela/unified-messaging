@@ -84,29 +84,42 @@ func TestSessionsResolveExpireAndSlide(t *testing.T) {
 	if err != nil || tok == "" || exp.Before(time.Now().Add(29*24*time.Hour)) {
 		t.Fatalf("NewSession = %q %v %v", tok, exp, err)
 	}
-	if got, err := svc.SessionDeveloper(ctx, tok); err != nil || got.ID != d.ID {
+	got, gotExp, err := svc.SessionDeveloper(ctx, tok)
+	if err != nil || got.ID != d.ID {
 		t.Fatalf("SessionDeveloper = %+v %v", got, err)
+	}
+	// Expiry is stored as a Unix second, so compare at that resolution.
+	if !gotExp.Equal(exp.Truncate(time.Second)) {
+		t.Fatalf("fresh session expiry = %v, want the stored %v", gotExp, exp)
 	}
 	if recs.Contains(tok) {
 		t.Fatal("session token appeared in logs")
 	}
-	// Age the session by two days; the next use must push expiry forward.
-	if err := db.ExtendSession(tok, exp.Add(-2*24*time.Hour)); err != nil {
+	// Age the session by two days; the next use must push expiry forward, and
+	// must report the new expiry so the caller can re-issue the cookie.
+	aged := exp.Add(-2 * 24 * time.Hour)
+	if err := db.ExtendSession(tok, aged); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SessionDeveloper(ctx, tok); err != nil {
+	_, slidExp, err := svc.SessionDeveloper(ctx, tok)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !slidExp.After(aged) {
+		t.Fatalf("returned expiry %v did not move forward from %v", slidExp, aged)
 	}
 	if _, newExp, _ := db.SessionDeveloper(tok, time.Now()); !newExp.After(exp.Add(-24 * time.Hour)) {
 		t.Fatalf("expiry not slid: %v", newExp)
+	} else if !slidExp.Truncate(time.Second).Equal(newExp) {
+		t.Fatalf("returned expiry %v does not match the stored %v", slidExp, newExp)
 	}
 	if err := svc.DeleteSession(ctx, tok); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SessionDeveloper(ctx, tok); !errors.Is(err, ErrInvalidCredentials) {
+	if _, _, err := svc.SessionDeveloper(ctx, tok); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("deleted session err = %v", err)
 	}
-	if _, err := svc.SessionDeveloper(ctx, "garbage"); !errors.Is(err, ErrInvalidCredentials) {
+	if _, _, err := svc.SessionDeveloper(ctx, "garbage"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("garbage session err = %v", err)
 	}
 }

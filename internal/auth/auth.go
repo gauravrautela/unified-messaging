@@ -1,4 +1,3 @@
-// internal/auth/auth.go
 // Package auth owns developer identity: password hashing, browser sessions,
 // and API keys. It is the only package that imports bcrypt or knows the key
 // format, so the rest of the service handles opaque tokens at most.
@@ -18,6 +17,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -43,19 +43,6 @@ const (
 // dummyHash is compared when the email is unknown so both login failure
 // paths cost one bcrypt verification and cannot be told apart by timing.
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy-password-for-timing"), bcryptCost)
-
-// newID mirrors internal/accounts.newID (12 random bytes, hex-encoded,
-// "<prefix>_<hex>"). It is duplicated here rather than imported: accounts
-// currently fails to build while Tasks 5-6 are in flight, and importing it
-// would make this package fail to build too. Once accounts is stable again
-// this can be revisited, but the shape must stay identical either way.
-func newID(prefix string) (string, error) {
-	b := make([]byte, 12)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return prefix + "_" + hex.EncodeToString(b), nil
-}
 
 type Service struct {
 	store      *store.Store
@@ -101,7 +88,7 @@ func (a *Service) Signup(ctx context.Context, email, password, name string) (mod
 	if err != nil {
 		return model.Developer{}, err
 	}
-	id, err := newID("dev")
+	id, err := accounts.NewID("dev")
 	if err != nil {
 		return model.Developer{}, err
 	}
@@ -158,30 +145,36 @@ func (a *Service) NewSession(ctx context.Context, developerID string) (string, t
 // SessionDeveloper resolves a cookie value. Expiry slides forward once more
 // than slideAfter of the TTL has been consumed, so an active developer is
 // never logged out mid-work.
-func (a *Service) SessionDeveloper(ctx context.Context, token string) (model.Developer, error) {
+//
+// It returns the expiry the session now carries — the extended one when it
+// just slid — because sliding the database row alone is invisible to the
+// browser: the cookie's own Expires is fixed at login, so a caller has to
+// re-issue the cookie with this value for the slide to mean anything.
+func (a *Service) SessionDeveloper(ctx context.Context, token string) (model.Developer, time.Time, error) {
 	log := a.logger(ctx)
 	if token == "" {
-		return model.Developer{}, ErrInvalidCredentials
+		return model.Developer{}, time.Time{}, ErrInvalidCredentials
 	}
 	now := time.Now().UTC()
 	d, exp, err := a.store.SessionDeveloper(token, now)
 	if errors.Is(err, store.ErrNotFound) {
 		log.Debug("session lookup", "result", "miss or expired")
-		return model.Developer{}, ErrInvalidCredentials
+		return model.Developer{}, time.Time{}, ErrInvalidCredentials
 	}
 	if err != nil {
-		return model.Developer{}, err
+		return model.Developer{}, time.Time{}, err
 	}
 	if exp.Sub(now) < a.sessionTTL-slideAfter {
 		newExp := now.Add(a.sessionTTL)
 		if err := a.store.ExtendSession(token, newExp); err != nil {
 			log.Warn("extending session", "developer_id", d.ID, "err", err)
 		} else {
+			exp = newExp
 			log.Debug("session extended", "developer_id", d.ID, "expires_at", newExp)
 		}
 	}
 	log.Debug("session lookup", "result", "hit", "developer_id", d.ID)
-	return d, nil
+	return d, exp, nil
 }
 
 func (a *Service) DeleteSession(ctx context.Context, token string) error {
@@ -207,7 +200,7 @@ func (a *Service) NewAPIKey(ctx context.Context, developerID, name string) (stri
 	if err != nil {
 		return "", model.APIKey{}, err
 	}
-	id, err := newID("key")
+	id, err := accounts.NewID("key")
 	if err != nil {
 		return "", model.APIKey{}, err
 	}

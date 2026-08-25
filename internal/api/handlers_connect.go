@@ -63,6 +63,17 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	if req.ExpiresIn <= 0 {
 		req.ExpiresIn = 30
 	}
+	// notify_url is fetched server-to-server, and the redirect URLs are handed
+	// to a browser we sent there; none of them may name an internal target.
+	for _, u := range []string{req.NotifyURL, req.SuccessRedirectURL, req.FailureRedirectURL} {
+		if u == "" {
+			continue
+		}
+		if err := publicHTTPURL(u); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_url", err.Error())
+			return
+		}
+	}
 	var pendingHook *store.PendingWebhook
 	if req.Webhook != nil {
 		if err := req.Webhook.validate(); err != nil {

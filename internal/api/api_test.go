@@ -724,9 +724,18 @@ func TestLoginHonoursSameOriginNext(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != "/mail?account_id=x" {
 		t.Fatalf("location = %q", loc)
 	}
-	rec = postForm(s.Routes(), "/login?next=https://evil.example.com/", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
-	if loc := rec.Header().Get("Location"); loc != "/dashboard" {
-		t.Fatalf("open redirect: %q", loc)
+	// Browsers normalise a backslash to a forward slash, so "/\evil.com" and
+	// "/\/evil.com" are off-origin redirects wearing a same-origin shape.
+	for _, next := range []string{
+		"https://evil.example.com/",
+		`/\evil.com`,
+		`/\/evil.com`,
+		"//evil.example.com/",
+	} {
+		rec = postForm(s.Routes(), "/login?next="+url.QueryEscape(next), url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+		if loc := rec.Header().Get("Location"); loc != "/dashboard" {
+			t.Fatalf("open redirect via next=%q: %q", next, loc)
+		}
 	}
 }
 
@@ -830,5 +839,110 @@ func TestAPIKeyEndpoints(t *testing.T) {
 	h.ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodDelete, "/api/v1/api-keys/key_nope", nil), dev.ID))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("revoke unknown: %d", rec.Code)
+	}
+}
+
+// The debug body log must never carry message content: a send is logged by
+// size, not text. The handler's own outcome is irrelevant here — the body is
+// logged by the middleware before the handler ever runs.
+func TestRequestBodyLogNeverCarriesMailContent(t *testing.T) {
+	s, db, recs := newTestServerWithLog(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	if err := db.UpsertAccount(model.Account{ID: "acc_1", DeveloperID: dev.ID, Provider: "OUTLOOK", Email: "u@x.com", Status: model.AccountOK}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"account_id":"acc_1","to":[{"email":"x@y.com"}],"subject":"s","body":"SECRETBODY",` +
+		`"attachments":[{"name":"a.txt","content":"QUFBQQ=="}]}`
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/emails", strings.NewReader(body)), key)
+	req.Header.Set("Content-Type", "application/json")
+	s.Routes().ServeHTTP(httptest.NewRecorder(), req)
+
+	if !recs.Contains("request body") {
+		t.Fatalf("the body was never logged, so this test proves nothing: %v", recs.All())
+	}
+	if recs.Contains("SECRETBODY") {
+		t.Fatalf("mail body leaked into the log: %v", recs.All())
+	}
+	if recs.Contains("QUFBQQ==") {
+		t.Fatalf("attachment content leaked into the log: %v", recs.All())
+	}
+	if !recs.Contains("10 chars") {
+		t.Fatalf("body size not recorded: %v", recs.All())
+	}
+}
+
+// A session that resolves must have its cookie re-issued, otherwise the
+// sliding expiry in the database never reaches the browser and the developer
+// is logged out mid-work.
+func TestSessionRequestRefreshesCookieExpiry(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	req := withSession(t, s, httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), dev.ID)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var got *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			got = c
+		}
+	}
+	if got == nil {
+		t.Fatalf("no %s cookie re-issued: %v", sessionCookie, rec.Header().Values("Set-Cookie"))
+	}
+	if got.Expires.IsZero() || !got.Expires.After(time.Now()) {
+		t.Fatalf("cookie expiry = %v, want a future instant", got.Expires)
+	}
+}
+
+// A page handler must refresh the cookie too, since the dashboard is where a
+// long-lived session actually spends its time.
+func TestPageSessionRefreshesCookieExpiry(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	req := withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie && !c.Expires.IsZero() {
+			return
+		}
+	}
+	t.Fatalf("dashboard did not re-issue the session cookie: %v", rec.Header().Values("Set-Cookie"))
+}
+
+// Webhook targets are attacker-chosen URLs the server will fetch, and the
+// delivery status code comes back through the API — so a loopback or
+// link-local target is an SSRF oracle and must be refused up front.
+func TestWebhookURLMustBePublic(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	post := func(t *testing.T, path, body string) int {
+		t.Helper()
+		req := withKey(httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := post(t, "/api/v1/webhooks", `{"url":"http://127.0.0.1:9/x"}`); code != http.StatusBadRequest {
+		t.Fatalf("loopback webhook: status = %d, want 400", code)
+	}
+	if code := post(t, "/api/v1/webhooks", `{"url":"http://169.254.169.254/latest/meta-data/"}`); code != http.StatusBadRequest {
+		t.Fatalf("link-local webhook: status = %d, want 400", code)
+	}
+	if code := post(t, "/api/v1/webhooks", `{"url":"https://hooks.example.com/x"}`); code != http.StatusCreated {
+		t.Fatalf("public webhook: status = %d, want 201", code)
+	}
+	if code := post(t, "/api/v1/hosted-auth", `{"notify_url":"http://10.0.0.5/notify"}`); code != http.StatusBadRequest {
+		t.Fatalf("private notify_url: status = %d, want 400", code)
+	}
+	if code := post(t, "/api/v1/hosted-auth", `{"success_redirect_url":"http://localhost:8080/done"}`); code != http.StatusBadRequest {
+		t.Fatalf("localhost success_redirect_url: status = %d, want 400", code)
 	}
 }

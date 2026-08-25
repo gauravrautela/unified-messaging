@@ -27,6 +27,10 @@ import (
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
+	// Anything that logs from a context with no request logger attached falls
+	// back to slog.Default(); without this it would fall back to a handler this
+	// process never configured, silently at the wrong level and format.
+	slog.SetDefault(log)
 
 	if err := run(log); err != nil {
 		log.Error("fatal", "err", err)
