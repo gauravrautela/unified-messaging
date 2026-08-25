@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -51,6 +52,7 @@ type hostedAuthResponse struct {
 // outcome on notify_url. The API key never leaves the caller's server and the
 // end user never sees our client credentials.
 func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	var req hostedAuthRequest
 	if r.ContentLength > 0 {
 		if err := decodeJSON(r, &req); err != nil {
@@ -92,14 +94,15 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 
 	expiresAt := time.Now().Add(time.Duration(req.ExpiresIn) * time.Minute)
 	if err := s.store.SaveOAuthState(store.OAuthState{
-		State:      state,
-		Provider:   p.Name(),
-		Verifier:   pkce.Verifier,
-		SuccessURL: req.SuccessRedirectURL,
-		FailureURL: req.FailureRedirectURL,
-		NotifyURL:  req.NotifyURL,
-		Webhook:    pendingHook,
-		ExpiresAt:  expiresAt,
+		State:       state,
+		DeveloperID: dev.ID,
+		Provider:    p.Name(),
+		Verifier:    pkce.Verifier,
+		SuccessURL:  req.SuccessRedirectURL,
+		FailureURL:  req.FailureRedirectURL,
+		NotifyURL:   req.NotifyURL,
+		Webhook:     pendingHook,
+		ExpiresAt:   expiresAt,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -109,6 +112,8 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	if req.ForceConsent {
 		q = "?force_consent=1"
 	}
+	logx.From(r.Context()).Info("connect link minted",
+		"state_prefix", statePrefix(state), "provider", p.Name(), "expires_at", expiresAt, "has_webhook", pendingHook != nil)
 	writeJSON(w, http.StatusOK, hostedAuthResponse{
 		URL:       s.baseURL(r) + "/connect/" + state + q,
 		State:     state,
@@ -167,6 +172,16 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// statePrefix logs a short, non-sensitive fragment of an OAuth state, without
+// panicking on the attacker-controlled (and possibly short or empty) value
+// Microsoft's redirect carries.
+func statePrefix(state string) string {
+	if len(state) > 6 {
+		return state[:6]
+	}
+	return state
+}
+
 func displayName(providerName string) string {
 	switch providerName {
 	case "OUTLOOK":
@@ -180,8 +195,12 @@ func displayName(providerName string) string {
 func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	state := q.Get("state")
+	code := q.Get("code")
+	errCode := q.Get("error")
+	logx.From(r.Context()).Info("oauth callback",
+		"state_prefix", statePrefix(state), "has_code", code != "", "error", errCode)
 
-	if errCode := q.Get("error"); errCode != "" {
+	if errCode != "" {
 		desc := q.Get("error_description")
 		s.log.Warn("oauth callback returned an error", "error", errCode, "description", desc)
 		// Consume the state so a denied attempt cannot be replayed.
@@ -203,13 +222,12 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := q.Get("code")
 	if code == "" {
 		s.failConnect(w, r, pending, "missing_code", "Microsoft did not return an authorization code.")
 		return
 	}
 
-	acct, err := s.accts.Connect(r.Context(), pending.Provider, code, pending.Verifier)
+	acct, err := s.accts.Connect(r.Context(), pending.DeveloperID, pending.Provider, code, pending.Verifier)
 	if err != nil {
 		s.log.Error("connecting account", "err", err)
 		s.failConnect(w, r, pending, "connect_failed", err.Error())
@@ -221,7 +239,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// Bind the connect-time webhook before the first sync runs, so nothing
 	// that backfill emits is missed.
 	if pending.Webhook != nil {
-		if _, err := s.createAccountWebhook(acct.ID, webhookRequest{
+		if _, err := s.createAccountWebhook(pending.DeveloperID, acct.ID, webhookRequest{
 			Name: pending.Webhook.Name, URL: pending.Webhook.URL,
 			Secret: pending.Webhook.Secret, Events: pending.Webhook.Events,
 		}); err != nil {

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -15,16 +16,19 @@ import (
 // resolve validates the ?account_id= every mail route requires and returns the
 // mailbox implementation that owns it.
 func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (model.Account, provider.Mailbox, bool) {
-	return s.resolveID(w, r.URL.Query().Get("account_id"))
+	return s.resolveID(w, r, r.URL.Query().Get("account_id"))
 }
 
-func (s *Server) resolveID(w http.ResponseWriter, id string) (model.Account, provider.Mailbox, bool) {
+func (s *Server) resolveID(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Mailbox, bool) {
+	log := logx.From(r.Context())
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing_account_id", "account_id is required")
 		return model.Account{}, nil, false
 	}
-	acct, err := s.store.GetAccount(id)
+	dev, _ := developerFrom(r.Context())
+	acct, err := s.store.GetAccount(dev.ID, id)
 	if errors.Is(err, store.ErrNotFound) {
+		log.Debug("ownership check", "account_id", id, "result", "not owned or unknown")
 		writeError(w, http.StatusNotFound, "account_not_found", "no such account: "+id)
 		return model.Account{}, nil, false
 	}
@@ -32,6 +36,7 @@ func (s *Server) resolveID(w http.ResponseWriter, id string) (model.Account, pro
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return model.Account{}, nil, false
 	}
+	log.Debug("ownership check", "account_id", id, "result", "ok", "provider", acct.Provider, "status", acct.Status)
 	mailbox, err := s.mailboxFor(acct)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unknown_provider", err.Error())
@@ -241,7 +246,7 @@ func (s *Server) handleSendEmail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
 	if !ok {
 		return
 	}
@@ -278,7 +283,7 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
 	if !ok {
 		return
 	}
@@ -297,7 +302,7 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
 	if !ok {
 		return
 	}
@@ -320,7 +325,7 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
 	if !ok {
 		return
 	}

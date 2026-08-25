@@ -4,7 +4,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -25,10 +27,8 @@ type Config struct {
 	RedirectURI string
 	Scopes      []string
 
-	// APIKey guards our own REST surface. The Graph notification endpoint is
-	// exempt because Graph cannot send custom headers; it is authenticated by
-	// the per-subscription clientState secret instead.
-	APIKey string
+	// SessionTTL is how long a dashboard login lasts without use.
+	SessionTTL time.Duration
 
 	// TokenKey is the 32-byte AES key protecting refresh tokens at rest.
 	TokenKey []byte
@@ -43,7 +43,7 @@ func Load() (*Config, error) {
 		ClientSecret:  os.Getenv("MS_CLIENT_SECRET"),
 		Tenant:        env("MS_TENANT", "consumers"),
 		RedirectURI:   env("MS_REDIRECT_URI", "http://localhost:8080/oauth/callback"),
-		APIKey:        os.Getenv("API_KEY"),
+		SessionTTL:    time.Duration(envInt("SESSION_TTL_DAYS", 30)) * 24 * time.Hour,
 	}
 
 	// offline_access is what earns us a refresh token; without it the
@@ -53,9 +53,6 @@ func Load() (*Config, error) {
 
 	if c.ClientID == "" {
 		return nil, fmt.Errorf("MS_CLIENT_ID is required (see README for app registration steps)")
-	}
-	if c.APIKey == "" {
-		return nil, fmt.Errorf("API_KEY is required")
 	}
 
 	key, err := decodeKey(os.Getenv("TOKEN_ENCRYPTION_KEY"))
@@ -77,4 +74,16 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }

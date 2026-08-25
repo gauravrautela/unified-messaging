@@ -15,6 +15,7 @@ import (
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/api"
+	"github.com/gauravrautela/unified-messaging/internal/auth"
 	"github.com/gauravrautela/unified-messaging/internal/config"
 	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -72,6 +73,8 @@ func run(log *slog.Logger) error {
 	)
 	acctMgr.SetRegistry(registry)
 
+	authSvc := auth.New(db, log, cfg.SessionTTL)
+
 	opts := syncer.Options{
 		BackfillWindow: envDuration("BACKFILL_DAYS", 30*24*time.Hour, 24*time.Hour),
 		PollInterval:   envDuration("POLL_INTERVAL_SECONDS", 2*time.Minute, time.Second),
@@ -84,17 +87,25 @@ func run(log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, log).Routes(),
+		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, authSvc, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
 		log.Info("listening",
 			"addr", cfg.ListenAddr,
+			"db", cfg.DBPath,
 			"providers", registry.Names(),
 			"push_notifications", cfg.PushEnabled(),
+			"public_base_url", cfg.PublicBaseURL,
+			"tenant", cfg.Tenant,
+			"redirect_uri", cfg.RedirectURI,
+			"scopes", cfg.Scopes,
+			"client_secret_set", cfg.ClientSecret != "",
+			"session_ttl", cfg.SessionTTL,
 			"backfill", opts.BackfillWindow,
-			"poll_every", opts.PollInterval)
+			"poll_every", opts.PollInterval,
+			"debug", os.Getenv("DEBUG") != "")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server stopped", "err", err)
 			stop()

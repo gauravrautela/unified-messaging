@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"html"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/auth"
 	"github.com/gauravrautela/unified-messaging/internal/config"
 	"github.com/gauravrautela/unified-messaging/internal/events"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
@@ -23,29 +24,31 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
 )
 
-func newTestServer(t *testing.T) (*Server, *store.Store) {
+func newTestServerWithLog(t *testing.T) (*Server, *store.Store, *logx.Records) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-
 	cfg := &config.Config{
-		APIKey:      "test-key",
-		ClientID:    "client-123",
-		Tenant:      "consumers",
+		ClientID: "client-123", Tenant: "consumers",
 		RedirectURI: "http://localhost:8080/oauth/callback",
 		Scopes:      []string{"offline_access", "Mail.Read"},
+		SessionTTL:  30 * 24 * time.Hour,
 	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	auth := outlook.NewAuth(cfg.ClientID, "", cfg.Tenant, cfg.RedirectURI, cfg.Scopes)
-	registry := provider.NewRegistry(outlook.New(auth, stubTokens{}))
-
+	log, recs := logx.Capture()
+	a := outlook.NewAuth(cfg.ClientID, "", cfg.Tenant, cfg.RedirectURI, cfg.Scopes)
+	registry := provider.NewRegistry(outlook.New(a, stubTokens{}))
 	disp := events.NewDispatcher(db, log)
 	sync := syncer.New(db, registry, nil, disp, log, syncer.Options{PollInterval: time.Hour})
-	return NewServer(cfg, db, registry, nil, sync, log), db
+	authSvc := auth.New(db, log, cfg.SessionTTL)
+	return NewServer(cfg, db, registry, nil, sync, authSvc, log), db, recs
+}
+
+func newTestServer(t *testing.T) (*Server, *store.Store) {
+	s, db, _ := newTestServerWithLog(t)
+	return s, db
 }
 
 type stubTokens struct{}
@@ -54,23 +57,100 @@ func (stubTokens) AccessToken(context.Context, string, bool) (string, error) {
 	return "test-token", nil
 }
 
-func TestAPIKeyRequired(t *testing.T) {
-	s, _ := newTestServer(t)
-	h := s.Routes()
+// seedDev creates a developer and one API key, returning the full key.
+func seedDev(t *testing.T, s *Server, email string) (model.Developer, string) {
+	t.Helper()
+	ctx := context.Background()
+	d, err := s.auth.Signup(ctx, email, "longenoughpassword", "Dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _, err := s.auth.NewAPIKey(ctx, d.ID, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d, key
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated request got %d, want 401", rec.Code)
+func withKey(req *http.Request, key string) *http.Request {
+	req.Header.Set("Authorization", "Bearer "+key)
+	return req
+}
+
+func withSession(t *testing.T, s *Server, req *http.Request, devID string) *http.Request {
+	t.Helper()
+	tok, _, err := s.auth.NewSession(context.Background(), devID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	return req
+}
+
+func TestAPIRequiresDeveloperCredential(t *testing.T) {
+	s, _, recs := newTestServerWithLog(t)
+	h := s.Routes()
+	dev, key := seedDev(t, s, "a@x.com")
+
+	do := func(req *http.Request) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := do(httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no credential: %d, want 401", rec.Code)
+	}
+	if rec := do(withKey(httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil), key)); rec.Code != http.StatusOK {
+		t.Fatalf("api key: %d, want 200", rec.Code)
+	}
+	if rec := do(withKey(httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil), "um_"+strings.Repeat("x", 40))); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bogus key: %d, want 401", rec.Code)
+	}
+	if rec := do(withSession(t, s, httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil), dev.ID)); rec.Code != http.StatusOK {
+		t.Fatalf("session cookie: %d, want 200", rec.Code)
+	}
+	if rec := do(httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)); rec.Header().Get("X-Request-Id") == "" {
+		t.Fatal("responses must carry X-Request-Id")
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)
-	req.Header.Set("Authorization", "Bearer test-key")
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("authenticated request got %d, want 200", rec.Code)
+	// Request bodies are logged at DEBUG with secrets redacted, never in the clear.
+	bodyReq := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`{"url":"https://x","secret":"hush"}`)), key)
+	bodyReq.Header.Set("Content-Type", "application/json")
+	if rec := do(bodyReq); rec.Code != http.StatusCreated {
+		t.Fatalf("create webhook: %d, want 201", rec.Code)
+	}
+	var bodyLine string
+	for _, line := range recs.All() {
+		if strings.Contains(line, "request body") {
+			bodyLine = line
+		}
+	}
+	if bodyLine == "" {
+		t.Fatal("no request body log line found")
+	}
+	if !strings.Contains(bodyLine, "url:https://x") {
+		t.Fatalf("body log missing url: %s", bodyLine)
+	}
+	if !strings.Contains(bodyLine, "secret:[redacted]") {
+		t.Fatalf("body log did not redact secret: %s", bodyLine)
+	}
+	if strings.Contains(bodyLine, "hush") {
+		t.Fatalf("body log leaked the secret value: %s", bodyLine)
+	}
+}
+
+func TestRevokedKeyIsRejected(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	keys, _ := s.store.ListAPIKeys(dev.ID)
+	if err := s.auth.RevokeKey(context.Background(), dev.ID, keys[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil), key))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked key: %d, want 401", rec.Code)
 	}
 }
 
@@ -117,10 +197,10 @@ func TestGraphNotificationDoesNotRequireAPIKey(t *testing.T) {
 func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	s, db := newTestServer(t)
 	h := s.Routes()
+	dev, key := seedDev(t, s, "a@x.com")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
-		strings.NewReader(`{"success_redirect_url":"https://app.example.com/done"}`))
-	req.Header.Set("Authorization", "Bearer test-key")
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"success_redirect_url":"https://app.example.com/done"}`)), key)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -134,8 +214,12 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	if resp.State == "" || !strings.Contains(resp.URL, "/connect/"+resp.State) {
 		t.Fatalf("unexpected connect url: %+v", resp)
 	}
-	if _, err := db.PeekOAuthState(resp.State); err != nil {
+	pending, err := db.PeekOAuthState(resp.State)
+	if err != nil {
 		t.Fatalf("state was not persisted: %v", err)
+	}
+	if pending.DeveloperID != dev.ID {
+		t.Fatalf("pending state owner = %q", pending.DeveloperID)
 	}
 
 	// Following the link should render the landing page, whose button embeds a
@@ -184,13 +268,13 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	}
 }
 
-// The dashboard shell must render without an API key: the gate lives in its
-// client-side JS, not in this route, since the HTML itself carries nothing
-// sensitive to protect.
-func TestDashboardServesWithoutAPIKey(t *testing.T) {
+// The dashboard shell requires a signed-in session now that hosted auth is
+// tenant-scoped: an anonymous visitor has no developer to show it for.
+func TestDashboardServesWithSession(t *testing.T) {
 	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -200,12 +284,13 @@ func TestDashboardServesWithoutAPIKey(t *testing.T) {
 	}
 }
 
-// The mail viewer is the same kind of static shell as the dashboard: no
-// server-side session, gated client-side by the pasted API key.
-func TestMailPageServesWithoutAPIKey(t *testing.T) {
+// The mail viewer is the same kind of shell as the dashboard: rendered for a
+// signed-in developer, not gated client-side by a pasted API key.
+func TestMailPageServesWithSession(t *testing.T) {
 	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mail", nil))
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/mail", nil), dev.ID))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -214,9 +299,6 @@ func TestMailPageServesWithoutAPIKey(t *testing.T) {
 		t.Fatalf("content-type = %q, want text/html", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `id="gate-form"`) {
-		t.Fatal("mail page did not render the API key gate")
-	}
 	if !strings.Contains(body, `id="folders"`) || !strings.Contains(body, `id="messages"`) {
 		t.Fatal("mail page did not render the folder/message panes")
 	}
@@ -224,8 +306,9 @@ func TestMailPageServesWithoutAPIKey(t *testing.T) {
 
 func TestDashboardLinksToMailPage(t *testing.T) {
 	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
 
 	if !strings.Contains(rec.Body.String(), `"/mail`) {
 		t.Fatal("dashboard has no link to the mail viewer")
@@ -241,18 +324,14 @@ func TestConnectRejectsUnknownState(t *testing.T) {
 	}
 }
 
-func authed(req *http.Request) *http.Request {
-	req.Header.Set("Authorization", "Bearer test-key")
-	return req
-}
-
 // The connect-time webhook rides on the pending state so the callback can
 // bind it to the account once one exists.
 func TestHostedAuthStoresPendingWebhook(t *testing.T) {
 	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, authed(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
-		strings.NewReader(`{"webhook":{"url":"https://hook.example.com/in","secret":"s3"}}`))))
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"webhook":{"url":"https://hook.example.com/in","secret":"s3"}}`)), key))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -263,6 +342,9 @@ func TestHostedAuthStoresPendingWebhook(t *testing.T) {
 	pending, err := db.PeekOAuthState(resp.State)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if pending.DeveloperID != dev.ID {
+		t.Fatalf("pending state owner = %q", pending.DeveloperID)
 	}
 	if pending.Webhook == nil || pending.Webhook.URL != "https://hook.example.com/in" || pending.Webhook.Secret != "s3" {
 		t.Fatalf("pending webhook not stored: %+v", pending.Webhook)
@@ -276,9 +358,10 @@ func TestHostedAuthStoresPendingWebhook(t *testing.T) {
 
 func TestHostedAuthRejectsBadWebhookURL(t *testing.T) {
 	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, authed(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
-		strings.NewReader(`{"webhook":{"url":"not a url"}}`))))
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"webhook":{"url":"not a url"}}`)), key))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
@@ -287,22 +370,23 @@ func TestHostedAuthRejectsBadWebhookURL(t *testing.T) {
 func TestAccountWebhookCRUD(t *testing.T) {
 	s, db := newTestServer(t)
 	h := s.Routes()
-	if err := db.UpsertAccount(model.Account{ID: "acc_1", Provider: "OUTLOOK", Email: "u@x.com", Status: model.AccountOK}); err != nil {
+	dev, key := seedDev(t, s, "a@x.com")
+	if err := db.UpsertAccount(model.Account{ID: "acc_1", DeveloperID: dev.ID, Provider: "OUTLOOK", Email: "u@x.com", Status: model.AccountOK}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Unknown account -> 404.
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodPost, "/api/v1/accounts/acc_nope/webhooks",
-		strings.NewReader(`{"url":"https://hook.example.com"}`))))
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/accounts/acc_nope/webhooks",
+		strings.NewReader(`{"url":"https://hook.example.com"}`)), key))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown account: status = %d, want 404", rec.Code)
 	}
 
 	// Create.
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodPost, "/api/v1/accounts/acc_1/webhooks",
-		strings.NewReader(`{"url":"https://hook.example.com","secret":"s3"}`))))
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/accounts/acc_1/webhooks",
+		strings.NewReader(`{"url":"https://hook.example.com","secret":"s3"}`)), key))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: status = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -319,7 +403,7 @@ func TestAccountWebhookCRUD(t *testing.T) {
 
 	// List: scoped to the account, secret hidden.
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/accounts/acc_1/webhooks", nil)))
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/accounts/acc_1/webhooks", nil), key))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list: status = %d", rec.Code)
 	}
@@ -333,18 +417,18 @@ func TestAccountWebhookCRUD(t *testing.T) {
 
 	// Delete through the wrong account must not work.
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodDelete, "/api/v1/accounts/acc_other/webhooks/"+created.ID, nil)))
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodDelete, "/api/v1/accounts/acc_other/webhooks/"+created.ID, nil), key))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-account delete: status = %d, want 404", rec.Code)
 	}
 
 	// Delete.
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodDelete, "/api/v1/accounts/acc_1/webhooks/"+created.ID, nil)))
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodDelete, "/api/v1/accounts/acc_1/webhooks/"+created.ID, nil), key))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: status = %d", rec.Code)
 	}
-	if got, _ := db.ListAccountWebhooks("acc_1"); len(got) != 0 {
+	if got, _ := db.ListAccountWebhooks(dev.ID, "acc_1"); len(got) != 0 {
 		t.Fatalf("webhook survived delete: %+v", got)
 	}
 }
@@ -352,8 +436,9 @@ func TestAccountWebhookCRUD(t *testing.T) {
 // Dead and pending deliveries are visible per webhook, without their payloads.
 func TestListWebhookDeliveries(t *testing.T) {
 	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
 	now := time.Now().UTC()
-	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", URL: "https://x.example.com", CreatedAt: now}); err != nil {
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: dev.ID, URL: "https://x.example.com", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SaveDelivery(store.Delivery{
@@ -365,7 +450,7 @@ func TestListWebhookDeliveries(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/wh_1/deliveries", nil)))
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/wh_1/deliveries", nil), key))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -381,7 +466,7 @@ func TestListWebhookDeliveries(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/wh_nope/deliveries", nil)))
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/wh_nope/deliveries", nil), key))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown webhook: status = %d, want 404", rec.Code)
 	}
@@ -390,8 +475,9 @@ func TestListWebhookDeliveries(t *testing.T) {
 // Each account card carries a small form to set that account's webhook.
 func TestDashboardRendersWebhookForm(t *testing.T) {
 	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
 	body := rec.Body.String()
 	if !strings.Contains(body, `data-action="set-webhook"`) || !strings.Contains(body, `/webhooks`) {
 		t.Fatal("dashboard has no set-webhook form wired to the account webhooks API")
@@ -416,7 +502,8 @@ func TestGetEmailIsComplete(t *testing.T) {
 	defer func() { outlook.BaseURL = prev }()
 
 	s, db := newTestServer(t)
-	if err := db.UpsertAccount(model.Account{ID: "acc_1", Provider: outlook.Name, Email: "u@x.com", Status: model.AccountOK}); err != nil {
+	dev, key := seedDev(t, s, "a@x.com")
+	if err := db.UpsertAccount(model.Account{ID: "acc_1", DeveloperID: dev.ID, Provider: outlook.Name, Email: "u@x.com", Status: model.AccountOK}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.UpsertFolder(model.Folder{AccountID: "acc_1", ID: "F1", Name: "Inbox", Role: "inbox"}); err != nil {
@@ -431,7 +518,7 @@ func TestGetEmailIsComplete(t *testing.T) {
 
 	get := func() model.Email {
 		rec := httptest.NewRecorder()
-		s.Routes().ServeHTTP(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/emails/M1?account_id=acc_1", nil)))
+		s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/emails/M1?account_id=acc_1", nil), key))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 		}

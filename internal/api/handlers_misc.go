@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
@@ -18,7 +19,8 @@ import (
 // ---- accounts ----
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
-	accts, err := s.store.ListAccounts()
+	dev, _ := developerFrom(r.Context())
+	accts, err := s.store.ListAccounts(dev.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -27,7 +29,8 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
-	acct, err := s.store.GetAccount(r.PathValue("id"))
+	dev, _ := developerFrom(r.Context())
+	acct, err := s.store.GetAccount(dev.ID, r.PathValue("id"))
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "account_not_found", "no such account")
 		return
@@ -43,8 +46,9 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 // subscription. Leaving that behind would have Microsoft pushing notifications
 // at us for an account we can no longer authenticate.
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	id := r.PathValue("id")
-	if _, err := s.store.GetAccount(id); errors.Is(err, store.ErrNotFound) {
+	if _, err := s.store.GetAccount(dev.ID, id); errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "account_not_found", "no such account")
 		return
 	}
@@ -52,6 +56,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	s.syncer.RemoveSubscriptions(ctx, id)
 
+	logx.From(r.Context()).Info("deleting account", "account_id", id)
 	if err := s.store.DeleteAccount(id); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -60,8 +65,9 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	id := r.PathValue("id")
-	acct, err := s.store.GetAccount(id)
+	acct, err := s.store.GetAccount(dev.ID, id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "account_not_found", "no such account")
 		return
@@ -75,6 +81,7 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 			"account status is "+acct.Status+"; it must be reconnected first")
 		return
 	}
+	logx.From(r.Context()).Info("resync requested", "account_id", id)
 	s.syncer.Wake(id)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
 }
@@ -115,21 +122,21 @@ func (r webhookRequest) eventsOrDefault() []string {
 	return r.Events
 }
 
-func newWebhook(accountID string, req webhookRequest) (model.Webhook, error) {
+func newWebhook(developerID, accountID string, req webhookRequest) (model.Webhook, error) {
 	id, err := accounts.NewID("wh")
 	if err != nil {
 		return model.Webhook{}, err
 	}
 	return model.Webhook{
-		ID: id, AccountID: accountID, Name: req.Name, URL: req.URL, Secret: req.Secret,
+		ID: id, DeveloperID: developerID, AccountID: accountID, Name: req.Name, URL: req.URL, Secret: req.Secret,
 		Events: req.Events, CreatedAt: time.Now().UTC(),
 	}, nil
 }
 
 // createAccountWebhook is shared by the REST handler and the OAuth callback.
-func (s *Server) createAccountWebhook(accountID string, req webhookRequest) (model.Webhook, error) {
+func (s *Server) createAccountWebhook(developerID, accountID string, req webhookRequest) (model.Webhook, error) {
 	req.Events = req.eventsOrDefault()
-	hook, err := newWebhook(accountID, req)
+	hook, err := newWebhook(developerID, accountID, req)
 	if err != nil {
 		return hook, err
 	}
@@ -137,6 +144,7 @@ func (s *Server) createAccountWebhook(accountID string, req webhookRequest) (mod
 }
 
 func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	var req webhookRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
@@ -146,7 +154,7 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
 		return
 	}
-	hook, err := newWebhook("", req)
+	hook, err := newWebhook(dev.ID, "", req)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -163,8 +171,9 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 // handleListWebhookDeliveries shows what is still waiting for a retry and what
 // was abandoned, so a caller can tell an outage's cost.
 func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	id := r.PathValue("id")
-	if _, err := s.store.GetWebhook(id); err != nil {
+	if _, err := s.store.GetWebhook(dev.ID, id); err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
 		return
 	}
@@ -179,8 +188,9 @@ func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Requ
 // ---- per-account webhooks ----
 
 func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	accountID := r.PathValue("id")
-	if _, err := s.store.GetAccount(accountID); err != nil {
+	if _, err := s.store.GetAccount(dev.ID, accountID); err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "account not found")
 		return
 	}
@@ -193,7 +203,7 @@ func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
 		return
 	}
-	hook, err := s.createAccountWebhook(accountID, req)
+	hook, err := s.createAccountWebhook(dev.ID, accountID, req)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -202,12 +212,13 @@ func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleListAccountWebhooks(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
 	accountID := r.PathValue("id")
-	if _, err := s.store.GetAccount(accountID); err != nil {
+	if _, err := s.store.GetAccount(dev.ID, accountID); err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "account not found")
 		return
 	}
-	hooks, err := s.store.ListAccountWebhooks(accountID)
+	hooks, err := s.store.ListAccountWebhooks(dev.ID, accountID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -219,12 +230,13 @@ func (s *Server) handleListAccountWebhooks(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleDeleteAccountWebhook(w http.ResponseWriter, r *http.Request) {
-	hook, err := s.store.GetWebhook(r.PathValue("wid"))
+	dev, _ := developerFrom(r.Context())
+	hook, err := s.store.GetWebhook(dev.ID, r.PathValue("wid"))
 	if err != nil || hook.AccountID != r.PathValue("id") {
 		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
 		return
 	}
-	if err := s.store.DeleteWebhook(hook.ID); err != nil {
+	if err := s.store.DeleteWebhook(dev.ID, hook.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
@@ -232,7 +244,8 @@ func (s *Server) handleDeleteAccountWebhook(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
-	hooks, err := s.store.ListWebhooks()
+	dev, _ := developerFrom(r.Context())
+	hooks, err := s.store.ListWebhooks(dev.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -244,7 +257,13 @@ func (s *Server) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteWebhook(r.PathValue("id")); err != nil {
+	dev, _ := developerFrom(r.Context())
+	err := s.store.DeleteWebhook(dev.ID, r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		return
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}

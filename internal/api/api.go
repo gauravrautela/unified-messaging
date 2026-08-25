@@ -3,16 +3,20 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
+	"github.com/gauravrautela/unified-messaging/internal/auth"
 	"github.com/gauravrautela/unified-messaging/internal/config"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -25,13 +29,16 @@ type Server struct {
 	registry *provider.Registry
 	accts    *accounts.Manager
 	syncer   *syncer.Syncer
+	auth     *auth.Service
 	log      *slog.Logger
 }
 
 func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry,
-	a *accounts.Manager, sy *syncer.Syncer, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, store: s, registry: reg, accts: a, syncer: sy, log: log}
+	a *accounts.Manager, sy *syncer.Syncer, au *auth.Service, log *slog.Logger) *Server {
+	return &Server{cfg: cfg, store: s, registry: reg, accts: a, syncer: sy, auth: au, log: log}
 }
+
+const sessionCookie = "um_session"
 
 // mailboxFor resolves the provider that owns an account. Every mail handler
 // goes through here rather than holding a concrete client, which is what keeps
@@ -99,44 +106,143 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("DELETE /api/v1/webhooks/{id}", s.handleDeleteWebhook)
 	api.HandleFunc("GET /api/v1/webhooks/{id}/deliveries", s.handleListWebhookDeliveries)
 
-	mux.Handle("/api/v1/", s.requireAPIKey(api))
+	mux.Handle("/api/v1/", s.withDeveloper(api))
 
-	return s.withLogging(mux)
+	return s.withRequestID(mux)
 }
 
-func (s *Server) requireAPIKey(next http.Handler) http.Handler {
+// withRequestID gives every request an id, a request-scoped logger, and the
+// X-Request-Id response header, then logs one summary line at the end.
+func (s *Server) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if got == "" {
-			got = r.Header.Get("X-API-Key")
+		id := r.Header.Get("X-Request-Id")
+		if id == "" || len(id) > 64 {
+			id = logx.NewRequestID()
 		}
-		if got != s.cfg.APIKey {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid API key")
+		log := s.log.With("component", "api", "request_id", id)
+		w.Header().Set("X-Request-Id", id)
+		ctx := logx.With(r.Context(), log)
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK, ctx: ctx}
+		log.Debug("request received",
+			"method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery,
+			"content_type", r.Header.Get("Content-Type"), "content_length", r.ContentLength,
+			"has_authorization", r.Header.Get("Authorization") != "" || r.Header.Get("X-API-Key") != "",
+			"has_session_cookie", hasCookie(r, sessionCookie),
+			"remote", r.RemoteAddr, "user_agent", r.UserAgent())
+
+		next.ServeHTTP(rec, r.WithContext(ctx))
+
+		dev, _ := developerFrom(rec.ctx)
+		log.Info("http",
+			"method", r.Method, "path", r.URL.Path, "status", rec.status,
+			"bytes", rec.bytes, "dur", time.Since(start).Round(time.Millisecond),
+			"developer_id", dev.ID, "auth", authKindFrom(rec.ctx))
+	})
+}
+
+func hasCookie(r *http.Request, name string) bool {
+	_, err := r.Cookie(name)
+	return err == nil
+}
+
+// withDeveloper resolves the caller from an API key or a session cookie, in
+// that order, and rejects the request when neither is valid.
+func (s *Server) withDeveloper(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		log := logx.From(ctx)
+
+		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if bearer == "" {
+			bearer = r.Header.Get("X-API-Key")
+		}
+		if bearer != "" {
+			log.Debug("auth: bearer present, resolving api key")
+			dev, key, err := s.auth.KeyDeveloper(ctx, bearer)
+			if err != nil {
+				log.Debug("auth: api key rejected", "err", err)
+				writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid API key")
+				return
+			}
+			log.Debug("auth: resolved", "developer_id", dev.ID, "key_id", key.ID, "prefix", key.Prefix)
+			s.serveAs(w, r, next, dev, authKindAPIKey)
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		if c, err := r.Cookie(sessionCookie); err == nil {
+			log.Debug("auth: no bearer, session cookie present, resolving")
+			dev, err := s.auth.SessionDeveloper(ctx, c.Value)
+			if err != nil {
+				log.Debug("auth: session rejected", "err", err)
+				writeError(w, http.StatusUnauthorized, "unauthorized", "session expired; sign in again")
+				return
+			}
+			log.Debug("auth: resolved", "developer_id", dev.ID, "via", "session")
+			s.serveAs(w, r, next, dev, authKindSession)
+			return
+		}
+
+		log.Debug("auth: no credential presented")
+		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid API key")
 	})
 }
 
-func (s *Server) withLogging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
-		s.log.Info("http",
-			"method", r.Method, "path", r.URL.Path,
-			"status", rec.status, "dur", time.Since(start).Round(time.Millisecond))
-	})
+// logBody logs a JSON request body at DEBUG with secrets masked, then hands
+// the bytes back to the handler. Bodies over 64 KB are logged by size only.
+func logBody(r *http.Request) {
+	log := logx.From(r.Context())
+	if r.Body == nil || r.ContentLength == 0 || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		return
+	}
+	if r.ContentLength > 64<<10 {
+		log.Debug("request body", "bytes", r.ContentLength, "logged", false)
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err != nil {
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		log.Debug("request body", "bytes", len(raw), "json", false)
+		return
+	}
+	log.Debug("request body", "bytes", len(raw), "body", logx.Redact(v))
+}
+
+// serveAs runs next with the developer in context and the logger enriched,
+// and records the context on the status recorder so the summary line can
+// name the developer.
+func (s *Server) serveAs(w http.ResponseWriter, r *http.Request, next http.Handler, dev model.Developer, kind string) {
+	ctx := withDeveloperCtx(r.Context(), dev, kind)
+	ctx = logx.With(ctx, logx.From(ctx).With("developer_id", dev.ID, "auth", kind))
+	if rec, ok := w.(*statusRecorder); ok {
+		rec.ctx = ctx
+	}
+	r = r.WithContext(ctx)
+	logBody(r)
+	next.ServeHTTP(w, r)
 }
 
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	bytes  int
+	ctx    context.Context
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += n
+	return n, err
 }
 
 // ---- helpers ----
