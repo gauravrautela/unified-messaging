@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -416,5 +417,8 @@ func TestOpenRefusesPreTenancyDatabase(t *testing.T) {
 	want := "database " + path + " predates multi-tenancy; delete it (and its -wal/-shm files) and reconnect your mailboxes"
 	if err.Error() != want {
 		t.Fatalf("error = %q\nwant  %q", err.Error(), want)
+	}
+	if !errors.Is(err, ErrPreTenancy) {
+		t.Fatal("refusal must match ErrPreTenancy")
 	}
 }

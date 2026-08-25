@@ -35,7 +35,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	} else if old {
 		db.Close()
-		return nil, fmt.Errorf("database %s predates multi-tenancy; delete it (and its -wal/-shm files) and reconnect your mailboxes", path)
+		return nil, &preTenancyError{path: path}
 	}
 
 	if _, err := db.Exec(schema); err != nil {
@@ -43,6 +43,16 @@ func Open(path string) (*Store, error) {
 	}
 	return &Store{db: db}, nil
 }
+
+// preTenancyError carries the operator-facing message while still matching
+// ErrPreTenancy under errors.Is.
+type preTenancyError struct{ path string }
+
+func (e *preTenancyError) Error() string {
+	return fmt.Sprintf("database %s predates multi-tenancy; delete it (and its -wal/-shm files) and reconnect your mailboxes", e.path)
+}
+
+func (e *preTenancyError) Is(target error) bool { return target == ErrPreTenancy }
 
 // preTenancy reports whether an accounts table exists without developer_id.
 func preTenancy(db *sql.DB) (bool, error) {
