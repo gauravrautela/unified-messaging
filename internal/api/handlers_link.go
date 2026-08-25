@@ -51,6 +51,15 @@ type link struct {
 	started time.Time
 }
 
+// startError reports whether getOrStart's call to StartLink failed for this
+// link. Safe to call before l.ready closes (it just observes the zero value,
+// nil, until the creator sets it).
+func (l *link) startError() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.startErr
+}
+
 // statusResponse renders the current state for /qr, without ever touching
 // the store: by the time a session has resolved, TakeOAuthState has already
 // consumed the pending row, so this must be self-contained.
@@ -204,68 +213,74 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 
 // handleLinkQR is polled by the connect page every couple of seconds. The
 // first call after consent starts the actual pairing session; every call
-// after that just reports what pumpLink has observed so far, from the
-// in-memory link rather than the store — the store's copy of this state is
-// gone the moment pairing succeeds or fails.
+// after that — including a second poll that arrives while that first call's
+// StartLink is still in flight — waits on the same outcome rather than
+// reporting "waiting" for a session that may already have failed.
 func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 	// The pairing state changes underneath a fixed URL every couple of
 	// seconds; nothing about this response is ever safe to cache.
 	w.Header().Set("Cache-Control", "no-store")
 	state := r.PathValue("state")
 
-	if l := s.links.get(state); l != nil {
-		writeJSON(w, http.StatusOK, l.statusResponse())
-		return
-	}
+	l := s.links.get(state)
+	created := false
+	if l == nil {
+		// No link exists yet for this state: this is the validation path
+		// that only ever runs for whichever poll actually reaches
+		// getOrStart's create branch (or loses that race to a concurrent
+		// twin) — the store's copy of this state is gone the moment pairing
+		// later succeeds or fails, so this is the last point anything here
+		// can check consent or expiry against it.
+		pending, err := s.store.PeekOAuthState(state)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "not_found", "unknown link")
+			return
+		}
+		if time.Now().After(pending.ExpiresAt) {
+			writeError(w, http.StatusGone, "expired", "this connection link has expired")
+			return
+		}
+		if pending.ConsentedAt == nil {
+			writeError(w, http.StatusConflict, "consent_required", "accept the disclosure first")
+			return
+		}
+		p, err := s.registry.Get(pending.Provider)
+		if err != nil || p.Linker() == nil {
+			writeError(w, http.StatusBadRequest, "unsupported_for_kind", "not a linkable provider")
+			return
+		}
 
-	pending, err := s.store.PeekOAuthState(state)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "unknown link")
-		return
-	}
-	if time.Now().After(pending.ExpiresAt) {
-		writeError(w, http.StatusGone, "expired", "this connection link has expired")
-		return
-	}
-	if pending.ConsentedAt == nil {
-		writeError(w, http.StatusConflict, "consent_required", "accept the disclosure first")
-		return
-	}
-	p, err := s.registry.Get(pending.Provider)
-	if err != nil || p.Linker() == nil {
-		writeError(w, http.StatusBadRequest, "unsupported_for_kind", "not a linkable provider")
-		return
-	}
+		// The session must outlive this request: the end user has not
+		// scanned anything yet, and the request/response round trip is over
+		// long before that happens. getOrStart guarantees only one caller
+		// ever calls StartLink for this state; everyone else gets the same
+		// placeholder back and falls through to the wait below.
+		l, created = s.links.getOrStart(state, func() (provider.LinkSession, error) {
+			return p.Linker().StartLink(context.Background())
+		}, pending.SuccessURL)
 
-	// The session must outlive this request: the end user has not scanned
-	// anything yet, and the request/response round trip is over long before
-	// that happens. getOrStart guarantees only one caller ever calls
-	// StartLink for this state; everyone else gets the same placeholder back
-	// and waits below.
-	l, created := s.links.getOrStart(state, func() (provider.LinkSession, error) {
-		return p.Linker().StartLink(context.Background())
-	}, pending.SuccessURL)
+		if created && l.startError() == nil {
+			go s.pumpLink(state, pending, l)
+		}
+	}
 
 	if !created {
-		// Someone else's StartLink is in flight for this state. Wait for it
-		// to resolve, but only up to a bound: a hung dial must delay this one
-		// poll, never every poll for this state forever.
+		// Either this poll found an already-installed link (every poll after
+		// the first, the common case), or it just lost the create race for a
+		// brand new one. Either way getOrStart's StartLink for it may still
+		// be in flight; wait for it to resolve, but only up to a bound — a
+		// hung dial must delay this one poll, never every poll for this
+		// state forever, and never report "waiting" for a session that has
+		// already failed.
 		select {
 		case <-l.ready:
 		case <-time.After(5 * time.Second):
 		}
 	}
 
-	l.mu.Lock()
-	startErr := l.startErr
-	l.mu.Unlock()
-	if startErr != nil {
-		writeError(w, http.StatusBadGateway, "provider_error", startErr.Error())
+	if err := l.startError(); err != nil {
+		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
 		return
-	}
-
-	if created {
-		go s.pumpLink(state, pending, l)
 	}
 
 	writeJSON(w, http.StatusOK, l.statusResponse())
@@ -483,8 +498,19 @@ label{display:flex;align-items:flex-start;gap:.6rem;text-align:left;font-size:.8
   function poll() {
     if (polling) return;
     polling = true;
-    fetch("/connect/" + state + "/qr").then(function(r) { return r.json(); }).then(function(data) {
+    fetch("/connect/" + state + "/qr").then(function(r) {
+      return r.json().then(function(data) { return { ok: r.ok, data: data }; });
+    }).then(function(result) {
       polling = false;
+      var data = result.data;
+      if (!result.ok) {
+        // A non-2xx /qr response ({error:{code,message}}) means the pairing
+        // attempt itself failed server-side (e.g. the provider dial errored)
+        // — terminal, like "failed"/"expired" below, not something another
+        // poll will resolve.
+        status.textContent = (data.error && data.error.message) || "Could not connect. Reload the page to try again.";
+        return;
+      }
       if (data.png_base64) {
         qr.src = "data:image/png;base64," + data.png_base64;
         qr.style.display = "block";

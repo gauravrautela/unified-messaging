@@ -24,11 +24,12 @@ type FakeChat struct {
 	startLinkDelay time.Duration
 
 	// Script knobs.
-	Roster     func(accountID string) ([]model.Chat, []model.Attendee, []model.ChatMember, error)
-	SendResult provider.SendResult
-	ConnectErr error
-	CommandErr error
-	DirectChat string // returned by StartDirect
+	Roster       func(accountID string) ([]model.Chat, []model.Attendee, []model.ChatMember, error)
+	SendResult   provider.SendResult
+	ConnectErr   error
+	CommandErr   error
+	DirectChat   string // returned by StartDirect
+	StartLinkErr error  // returned by StartLink when set; set it before any concurrent poll begins
 }
 
 func NewFakeChat(name string) *FakeChat {
@@ -108,6 +109,9 @@ func (f *FakeChat) StartLink(ctx context.Context) (provider.LinkSession, error) 
 	f.mu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
+	}
+	if f.StartLinkErr != nil {
+		return nil, f.StartLinkErr
 	}
 	s := &fakeSession{codes: make(chan provider.LinkCode, 16), result: make(chan provider.LinkResult, 1)}
 	f.mu.Lock()

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
 	"net/http"
@@ -1579,4 +1580,72 @@ func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
 	}
 
 	<-done // avoid leaking the slow poll's goroutine past the test
+}
+
+// Every /qr poll for a state must see the outcome of that state's StartLink
+// call, not just the poll that happened to trigger it. Before the fix, any
+// poll that arrived after the placeholder existed but before StartLink
+// resolved took a fast path straight to statusResponse() and reported
+// "waiting" even once StartLink had already failed.
+func TestLinkQRSecondPollerSeesStartLinkFailure(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+
+	// Set both knobs up front, before any concurrent poll begins, so the two
+	// pollers below only ever read them (no concurrent mutation to race on).
+	s.fake().SetStartLinkDelay(200 * time.Millisecond)
+	s.fake().StartLinkErr = errors.New("dial failed")
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	bodies := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+			codes[i] = rec.Code
+			bodies[i] = rec.Body.String()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, c := range codes {
+		if c != http.StatusBadGateway {
+			t.Fatalf("poller %d: status = %d, want 502 (body %s)", i, c, bodies[i])
+		}
+	}
+	// StartLink only ever ran once (the loser waited on the winner's outcome
+	// rather than dialing itself), and it never produced a session.
+	if n := s.fake().SessionCount(); n != 0 {
+		t.Fatalf("SessionCount = %d, want 0 (StartLink only ever failed)", n)
+	}
+
+	// The failed attempt must not leave the registry stuck: a fresh poll
+	// (knobs cleared) starts a brand-new session rather than replaying the
+	// old failure.
+	s.fake().SetStartLinkDelay(0)
+	s.fake().StartLinkErr = nil
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	var q struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &q)
+	if rec.Code != http.StatusOK || q.Status != "waiting" {
+		t.Fatalf("retry after failed start: %d %+v", rec.Code, q)
+	}
+	if n := s.fake().SessionCount(); n != 1 {
+		t.Fatalf("SessionCount = %d, want 1 after the retry succeeds", n)
+	}
 }
