@@ -155,7 +155,7 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			accts, err := s.store.ListAccounts()
+			accts, err := s.store.ListAllAccounts()
 			if err != nil {
 				s.log.Error("listing accounts for poll", "err", err)
 				continue
@@ -180,7 +180,7 @@ func (s *Syncer) mailboxFor(acct model.Account) (provider.Mailbox, error) {
 
 // SyncAccount brings one account up to date: discover scopes, then walk each.
 func (s *Syncer) SyncAccount(ctx context.Context, accountID string) error {
-	acct, err := s.store.GetAccount(accountID)
+	acct, err := s.store.GetAnyAccount(accountID)
 	if err != nil {
 		return err
 	}

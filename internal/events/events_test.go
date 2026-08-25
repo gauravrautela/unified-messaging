@@ -26,6 +26,18 @@ func newTestStore(t *testing.T) *store.Store {
 	return s
 }
 
+func seedTenant(t *testing.T, db *store.Store) {
+	t.Helper()
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"acc_1", "acc_2"} {
+		if err := db.UpsertAccount(model.Account{ID: id, DeveloperID: "dev_1", Provider: "OUTLOOK", Email: id + "@x.com", Status: model.AccountOK}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // receiver is an HTTP endpoint that records what it was sent.
 type receiver struct {
 	*httptest.Server
@@ -70,15 +82,16 @@ func waitFor(t *testing.T, cond func() bool) {
 
 func TestDeliveryIsScopedToAccount(t *testing.T) {
 	db := newTestStore(t)
+	seedTenant(t, db)
 	mine := newReceiver(t, http.StatusOK)
 	theirs := newReceiver(t, http.StatusOK)
 	global := newReceiver(t, http.StatusOK)
 
 	now := time.Now()
 	for _, w := range []model.Webhook{
-		{ID: "wh_mine", AccountID: "acc_1", URL: mine.URL, CreatedAt: now},
-		{ID: "wh_theirs", AccountID: "acc_2", URL: theirs.URL, CreatedAt: now},
-		{ID: "wh_global", URL: global.URL, CreatedAt: now},
+		{ID: "wh_mine", DeveloperID: "dev_1", AccountID: "acc_1", URL: mine.URL, CreatedAt: now},
+		{ID: "wh_theirs", DeveloperID: "dev_1", AccountID: "acc_2", URL: theirs.URL, CreatedAt: now},
+		{ID: "wh_global", DeveloperID: "dev_1", URL: global.URL, CreatedAt: now},
 	} {
 		if err := db.SaveWebhook(w); err != nil {
 			t.Fatal(err)
@@ -121,8 +134,9 @@ func newFastDispatcher(t *testing.T, db *store.Store, schedule ...time.Duration)
 // the schedule once the subscriber recovers, surviving anything in between.
 func TestFailedDeliveryIsQueuedAndRetried(t *testing.T) {
 	db := newTestStore(t)
+	seedTenant(t, db)
 	rcv := newReceiver(t, http.StatusInternalServerError)
-	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	d := newFastDispatcher(t, db, 10*time.Millisecond, time.Hour)
@@ -146,8 +160,9 @@ func TestFailedDeliveryIsQueuedAndRetried(t *testing.T) {
 
 func TestDeliveryIsDeadAfterScheduleExhausted(t *testing.T) {
 	db := newTestStore(t)
+	seedTenant(t, db)
 	rcv := newReceiver(t, http.StatusBadGateway)
-	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	d := newFastDispatcher(t, db, 10*time.Millisecond, 10*time.Millisecond)
@@ -169,8 +184,9 @@ func TestDeliveryIsDeadAfterScheduleExhausted(t *testing.T) {
 // several accounts can tell the deliveries apart.
 func TestPayloadIdentifiesWebhook(t *testing.T) {
 	db := newTestStore(t)
+	seedTenant(t, db)
 	rcv := newReceiver(t, http.StatusOK)
-	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", Name: "crm-sync", AccountID: "acc_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Name: "crm-sync", AccountID: "acc_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	newFastDispatcher(t, db).Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})

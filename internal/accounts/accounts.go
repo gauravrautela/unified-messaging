@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/secretbox"
@@ -59,24 +60,31 @@ func (m *Manager) lockFor(accountID string) *sync.Mutex {
 	return l
 }
 
-// Connect completes an OAuth handshake and records the account.
+// Connect completes an OAuth handshake and records the account under the
+// developer who minted the connect link.
 //
-// Reconnecting an already-known address updates the existing record in place
-// rather than creating a duplicate, so callers keep the same account_id.
-func (m *Manager) Connect(ctx context.Context, providerName, code, verifier string) (model.Account, error) {
+// Reconnecting an address that developer already has updates the existing
+// record in place rather than creating a duplicate, so callers keep the same
+// account_id. The same address under a different developer is a different
+// account.
+func (m *Manager) Connect(ctx context.Context, developerID, providerName, code, verifier string) (model.Account, error) {
+	log := logx.From(ctx).With("component", "accounts", "developer_id", developerID, "provider", providerName)
 	p, err := m.registry.Get(providerName)
 	if err != nil {
 		return model.Account{}, err
 	}
 	auth := p.Auth()
 
+	log.Debug("exchanging authorization code")
 	tok, err := auth.Exchange(ctx, code, verifier)
 	if err != nil {
+		log.Warn("code exchange failed", "err", err)
 		return model.Account{}, err
 	}
 	if tok.RefreshToken == "" {
 		return model.Account{}, errors.New("accounts: no refresh token returned; is offline_access in the requested scopes?")
 	}
+	log.Debug("code exchanged", "access_expires_at", tok.ExpiresAt, "scope", tok.Scope)
 
 	identity, err := auth.Identify(ctx, tok.AccessToken)
 	if err != nil {
@@ -86,7 +94,8 @@ func (m *Manager) Connect(ctx context.Context, providerName, code, verifier stri
 		return model.Account{}, errors.New("accounts: provider did not report an address")
 	}
 
-	id, err := m.store.AccountIDByEmail(identity.Email)
+	id, err := m.store.AccountIDByEmail(developerID, identity.Email)
+	reconnect := err == nil
 	if errors.Is(err, store.ErrNotFound) {
 		id, err = newID("acc")
 		if err != nil {
@@ -97,23 +106,24 @@ func (m *Manager) Connect(ctx context.Context, providerName, code, verifier stri
 	}
 
 	if err := m.store.UpsertAccount(model.Account{
-		ID:       id,
-		Provider: p.Name(),
-		Email:    identity.Email,
-		Name:     identity.Name,
-		Status:   model.AccountOK,
+		ID:          id,
+		DeveloperID: developerID,
+		Provider:    p.Name(),
+		Email:       identity.Email,
+		Name:        identity.Name,
+		Status:      model.AccountOK,
 	}); err != nil {
 		return model.Account{}, err
 	}
-	// The upsert conflicts on email, so re-read to get the ID that actually won.
-	realID, err := m.store.AccountIDByEmail(identity.Email)
+	realID, err := m.store.AccountIDByEmail(developerID, identity.Email)
 	if err != nil {
 		return model.Account{}, err
 	}
 	if err := m.persist(realID, tok); err != nil {
 		return model.Account{}, err
 	}
-	return m.store.GetAccount(realID)
+	log.Info("account connected", "account_id", realID, "email", identity.Email, "reconnect", reconnect)
+	return m.store.GetAnyAccount(realID)
 }
 
 func (m *Manager) persist(accountID string, tok provider.Token) error {
@@ -143,7 +153,7 @@ func (m *Manager) AccessToken(ctx context.Context, accountID string, force bool)
 		return rec.AccessToken, nil
 	}
 
-	acct, err := m.store.GetAccount(accountID)
+	acct, err := m.store.GetAnyAccount(accountID)
 	if err != nil {
 		return "", err
 	}

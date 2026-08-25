@@ -40,7 +40,7 @@ func (s *Syncer) subscriptionLoop(ctx context.Context) {
 }
 
 func (s *Syncer) reconcileSubscriptions(ctx context.Context) {
-	accts, err := s.store.ListAccounts()
+	accts, err := s.store.ListAllAccounts()
 	if err != nil {
 		s.log.Error("listing accounts for subscription reconcile", "err", err)
 		return
@@ -64,7 +64,7 @@ func (s *Syncer) EnsureSubscription(ctx context.Context, accountID string) error
 	if s.opts.PublicBaseURL == "" {
 		return nil
 	}
-	acct, err := s.store.GetAccount(accountID)
+	acct, err := s.store.GetAnyAccount(accountID)
 	if err != nil {
 		return err
 	}
@@ -217,7 +217,7 @@ func (s *Syncer) pusherByName(providerName string) (provider.Pusher, error) {
 // Without this a subscription can quietly stop delivering, and only the poll
 // would ever notice.
 func (s *Syncer) handleLifecycle(ctx context.Context, sub store.Subscription, action provider.LifecycleAction) error {
-	acct, err := s.store.GetAccount(sub.AccountID)
+	acct, err := s.store.GetAnyAccount(sub.AccountID)
 	if err != nil {
 		return err
 	}
@@ -252,7 +252,7 @@ func (s *Syncer) handleLifecycle(ctx context.Context, sub store.Subscription, ac
 // RemoveSubscriptions best-effort deletes an account's subscriptions upstream,
 // so disconnecting does not leave a provider pushing at us forever.
 func (s *Syncer) RemoveSubscriptions(ctx context.Context, accountID string) {
-	acct, err := s.store.GetAccount(accountID)
+	acct, err := s.store.GetAnyAccount(accountID)
 	if err != nil {
 		return
 	}

@@ -186,8 +186,11 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	}
 	defer db.Close()
 
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.UpsertAccount(model.Account{
-		ID: "acc_1", Provider: outlook.Name, Email: "me@outlook.com", Status: model.AccountOK,
+		ID: "acc_1", DeveloperID: "dev_1", Provider: outlook.Name, Email: "me@outlook.com", Status: model.AccountOK,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +199,7 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	sinkSrv := httptest.NewServer(sink.handler())
 	defer sinkSrv.Close()
 	if err := db.SaveWebhook(model.Webhook{
-		ID: "wh_1", URL: sinkSrv.URL, CreatedAt: time.Now(),
+		ID: "wh_1", DeveloperID: "dev_1", URL: sinkSrv.URL, CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}

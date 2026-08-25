@@ -178,7 +178,7 @@ func (d *Dispatcher) retryDue(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		h, err := d.store.GetWebhook(dl.WebhookID)
+		h, err := d.store.GetAnyWebhook(dl.WebhookID)
 		if err != nil {
 			// Hook was removed; the cascade normally handles this, but be safe.
 			_ = d.store.DeleteDelivery(dl.ID)

@@ -92,8 +92,11 @@ func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
 	}
 	defer db.Close()
 
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.UpsertAccount(model.Account{
-		ID: "acc_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -171,8 +174,11 @@ func TestEnsureSubscriptionIsNoOpWithoutPush(t *testing.T) {
 	}
 	defer db.Close()
 
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.UpsertAccount(model.Account{
-		ID: "acc_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
 	}); err != nil {
 		t.Fatal(err)
 	}
