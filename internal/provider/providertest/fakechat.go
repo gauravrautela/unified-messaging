@@ -45,15 +45,50 @@ func (f *FakeChat) Chat() provider.Chatter       { return f }
 
 // ---- Linker ----
 
+// fakeSession is one scripted pairing attempt. result is 1-buffered and
+// resolves exactly once: whichever of Pair or FailLink runs first delivers
+// the value and marks the session closed; the other call, and any EmitCode
+// after that point, become safe no-ops rather than a panic or a block. mu
+// guards closed so "is it safe to send" and "mark it closed" happen as one
+// atomic step — a plain done-channel-plus-select is not enough, since a send
+// racing a close of the same channel can still panic even inside a select.
 type fakeSession struct {
 	codes  chan provider.LinkCode
 	result chan provider.LinkResult
+
+	mu     sync.Mutex
+	closed bool
 	once   sync.Once
 }
 
 func (s *fakeSession) Codes() <-chan provider.LinkCode    { return s.codes }
 func (s *fakeSession) Result() <-chan provider.LinkResult { return s.result }
-func (s *fakeSession) Close()                             { s.once.Do(func() { close(s.codes) }) }
+
+// Close marks the session done, stopping further code emission, and closes
+// the codes channel. Idempotent and safe to call more than once.
+func (s *fakeSession) Close() {
+	s.once.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		close(s.codes)
+	})
+}
+
+// resolve delivers r on the result channel exactly once. It reports false,
+// without sending or panicking, if the session was already resolved/closed.
+func (s *fakeSession) resolve(r provider.LinkResult) bool {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	s.closed = true
+	s.mu.Unlock()
+	s.result <- r
+	s.Close() // idempotent; also closes the codes channel.
+	return true
+}
 
 func (f *FakeChat) StartLink(ctx context.Context) (provider.LinkSession, error) {
 	s := &fakeSession{codes: make(chan provider.LinkCode, 16), result: make(chan provider.LinkResult, 1)}
@@ -72,25 +107,39 @@ func (f *FakeChat) latest() *fakeSession {
 	return f.sessions[len(f.sessions)-1]
 }
 
-// EmitCode pushes a QR code to the most recent link session.
+// EmitCode pushes a QR code to the most recent link session. A no-op, not a
+// panic, once that session has been paired, failed or closed — later tasks'
+// tests rely on QR rotation racing pairing being safe.
 func (f *FakeChat) EmitCode(code string) {
-	if s := f.latest(); s != nil {
-		s.codes <- provider.LinkCode{Code: code, ExpiresAt: time.Now().Add(20 * time.Second)}
+	s := f.latest()
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.codes <- provider.LinkCode{Code: code, ExpiresAt: time.Now().Add(20 * time.Second)}:
+	default:
+		// Buffer full: drop rather than block while holding the session lock.
 	}
 }
 
-// Pair completes the most recent link session successfully.
+// Pair completes the most recent link session successfully. A no-op if that
+// session was already resolved.
 func (f *FakeChat) Pair(id provider.Identity, deviceJID string) {
 	if s := f.latest(); s != nil {
-		s.result <- provider.LinkResult{Identity: id, DeviceJID: deviceJID}
-		s.Close()
+		s.resolve(provider.LinkResult{Identity: id, DeviceJID: deviceJID})
 	}
 }
 
+// FailLink fails the most recent link session. A no-op if that session was
+// already resolved.
 func (f *FakeChat) FailLink(err error) {
 	if s := f.latest(); s != nil {
-		s.result <- provider.LinkResult{Err: err}
-		s.Close()
+		s.resolve(provider.LinkResult{Err: err})
 	}
 }
 

@@ -47,6 +47,37 @@ func TestFakeChatLinkScript(t *testing.T) {
 	}
 }
 
+// TestFakeChatEmitAfterPairIsSafe covers QR rotation racing pairing: a code
+// emitted after the session already resolved must be a silent no-op, not a
+// panic, and a second Pair on an already-resolved session must not block or
+// deliver a second result.
+func TestFakeChatEmitAfterPairIsSafe(t *testing.T) {
+	f := NewFakeChat("FAKECHAT")
+	sess, err := f.Linker().StartLink(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Pair(provider.Identity{Identifier: "+919888000000"}, "919888000000:5@s.whatsapp.net")
+	f.EmitCode("qr-late")                                                          // must not panic on the now-closed codes channel
+	f.Pair(provider.Identity{Identifier: "+919888000001"}, "other@s.whatsapp.net") // must not block
+
+	select {
+	case res := <-sess.Result():
+		if res.DeviceJID != "919888000000:5@s.whatsapp.net" {
+			t.Fatalf("result = %+v, want the first Pair's result", res)
+		}
+	default:
+		t.Fatal("expected a result to be ready")
+	}
+
+	select {
+	case res := <-sess.Result():
+		t.Fatalf("expected exactly one result, got a second: %+v", res)
+	default:
+		// Good: the second Pair did not queue a second value.
+	}
+}
+
 func TestFakeChatConnectRecordsSinkAndCommands(t *testing.T) {
 	f := NewFakeChat("FAKECHAT")
 	sink := &recSink{}
