@@ -942,7 +942,30 @@ func TestWebhookURLMustBePublic(t *testing.T) {
 	if code := post(t, "/api/v1/hosted-auth", `{"notify_url":"http://10.0.0.5/notify"}`); code != http.StatusBadRequest {
 		t.Fatalf("private notify_url: status = %d, want 400", code)
 	}
-	if code := post(t, "/api/v1/hosted-auth", `{"success_redirect_url":"http://localhost:8080/done"}`); code != http.StatusBadRequest {
-		t.Fatalf("localhost success_redirect_url: status = %d, want 400", code)
+	// Redirect URLs are followed by the browser, not fetched by us: local is fine.
+	if code := post(t, "/api/v1/hosted-auth", `{"success_redirect_url":"http://localhost:8080/done"}`); code != http.StatusOK {
+		t.Fatalf("localhost success_redirect_url: status = %d, want 200", code)
+	}
+}
+
+// The dashboard's own Connect button sends success_redirect_url pointing at
+// this server's origin (localhost in dev). Redirect URLs are followed by the
+// end user's browser, never fetched by us, so the SSRF check must not apply
+// to them — only notify_url is a server-to-server target.
+func TestHostedAuthAllowsLocalRedirectURLsButNotLocalNotifyURL(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	post := func(body string) int {
+		req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := post(`{"success_redirect_url":"http://localhost:8080/dashboard?connected=1","failure_redirect_url":"http://127.0.0.1:8080/dashboard"}`); c != http.StatusOK {
+		t.Fatalf("local redirect urls: status = %d, want 200", c)
+	}
+	if c := post(`{"notify_url":"http://127.0.0.1:9/hook"}`); c != http.StatusBadRequest {
+		t.Fatalf("local notify_url: status = %d, want 400", c)
 	}
 }

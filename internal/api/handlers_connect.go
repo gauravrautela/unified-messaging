@@ -63,14 +63,22 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	if req.ExpiresIn <= 0 {
 		req.ExpiresIn = 30
 	}
-	// notify_url is fetched server-to-server, and the redirect URLs are handed
-	// to a browser we sent there; none of them may name an internal target.
-	for _, u := range []string{req.NotifyURL, req.SuccessRedirectURL, req.FailureRedirectURL} {
+	// notify_url is fetched server-to-server, so it must not name an internal
+	// target. The redirect URLs are only ever followed by the end user's own
+	// browser (and the dashboard legitimately points them at this origin), so
+	// they need to be http(s) but may be local.
+	if req.NotifyURL != "" {
+		if err := publicHTTPURL(req.NotifyURL); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_url", "notify_url: "+err.Error())
+			return
+		}
+	}
+	for _, u := range []string{req.SuccessRedirectURL, req.FailureRedirectURL} {
 		if u == "" {
 			continue
 		}
-		if err := publicHTTPURL(u); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_url", err.Error())
+		if parsed, err := url.Parse(u); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			writeError(w, http.StatusBadRequest, "invalid_url", "redirect urls must be absolute http(s) URLs")
 			return
 		}
 	}
