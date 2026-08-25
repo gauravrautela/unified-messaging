@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -20,9 +21,12 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+// seedDeveloper is idempotent: several seed helpers (seedAccount,
+// seedChatAccount) call it for the same "dev_1" fixture, and a test that
+// exercises both a mail and a chat account for one developer seeds it twice.
 func seedDeveloper(t *testing.T, s *Store, id, email string) string {
 	t.Helper()
-	if err := s.CreateDeveloper(model.Developer{ID: id, Email: email, Name: "Dev"}, "$2a$12$hash"); err != nil {
+	if err := s.CreateDeveloper(model.Developer{ID: id, Email: email, Name: "Dev"}, "$2a$12$hash"); err != nil && !errors.Is(err, ErrConflict) {
 		t.Fatal(err)
 	}
 	return id
@@ -629,5 +633,248 @@ func TestForeignKeysAreOnForEveryConnection(t *testing.T) {
 		if on != 1 {
 			t.Fatalf("foreign_keys = %d on a fresh connection, want 1", on)
 		}
+	}
+}
+
+func seedChatAccount(t *testing.T, s *Store) string {
+	t.Helper()
+	seedDeveloper(t, s, "dev_1", "dev1@example.com")
+	a := model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "WHATSAPP", Kind: model.AccountKindChat,
+		Email: "+919888000000", Status: model.AccountOK}
+	if err := s.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	return a.ID
+}
+
+func TestAccountKindRoundTripsAndDefaultsToMail(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	got, _ := s.GetAnyAccount(acct)
+	if got.Kind != model.AccountKindMail || got.Identifier != got.Email {
+		t.Fatalf("mail account = %+v", got)
+	}
+	wa := seedChatAccount(t, s)
+	got, _ = s.GetAnyAccount(wa)
+	if got.Kind != model.AccountKindChat || got.Identifier != "+919888000000" {
+		t.Fatalf("chat account = %+v", got)
+	}
+	all, _ := s.ListChatAccounts()
+	if len(all) != 1 || all[0].ID != wa {
+		t.Fatalf("ListChatAccounts = %+v", all)
+	}
+}
+
+func TestChatMessagesAreIdempotentAndPaged(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "direct", Name: "Ada"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		ins, err := s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: fmt.Sprintf("m%d", i), ChatID: "c1",
+			Sender: model.Attendee{ID: "a1"}, Kind: "text", Text: fmt.Sprintf("t%d", i), SentAt: base.Add(time.Duration(i) * time.Minute)})
+		if err != nil || !ins {
+			t.Fatalf("insert %d: %v %v", i, ins, err)
+		}
+	}
+	// Replay of an existing id changes nothing and reports not-inserted.
+	ins, err := s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: "m2", ChatID: "c1", Sender: model.Attendee{ID: "a1"}, Kind: "text", Text: "changed", SentAt: base})
+	if err != nil || ins {
+		t.Fatalf("replay inserted=%v err=%v", ins, err)
+	}
+	if m, _ := s.GetChatMessage(acct, "m2"); m.Text != "t2" {
+		t.Fatalf("replay mutated text: %q", m.Text)
+	}
+	page1, next, err := s.ListChatMessages(acct, "c1", "", 2)
+	if err != nil || len(page1) != 2 || page1[0].ID != "m4" || page1[1].ID != "m3" || next != "m3" {
+		t.Fatalf("page1 = %v next=%q err=%v", ids(page1), next, err)
+	}
+	// A new message arriving does not disturb the next page.
+	_, _ = s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: "m9", ChatID: "c1", Sender: model.Attendee{ID: "a1"}, Kind: "text", Text: "new", SentAt: base.Add(time.Hour)})
+	page2, next2, _ := s.ListChatMessages(acct, "c1", next, 2)
+	if len(page2) != 2 || page2[0].ID != "m2" || page2[1].ID != "m1" || next2 != "m1" {
+		t.Fatalf("page2 = %v next=%q", ids(page2), next2)
+	}
+	last, next3, _ := s.ListChatMessages(acct, "c1", next2, 2)
+	if len(last) != 1 || last[0].ID != "m0" || next3 != "" {
+		t.Fatalf("last = %v next=%q", ids(last), next3)
+	}
+}
+
+func ids(ms []model.ChatMessage) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.ID
+	}
+	return out
+}
+
+func TestReactionsMergeAndRemove(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	_ = s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "direct"})
+	_, _ = s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: "m1", ChatID: "c1", Sender: model.Attendee{ID: "a1"}, Kind: "text", Text: "x", SentAt: time.Now()})
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.ApplyReaction(acct, "m1", model.Reaction{AttendeeID: "a1", Emoji: "👍", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.ApplyReaction(acct, "m1", model.Reaction{AttendeeID: "a2", Emoji: "❤️", At: now})
+	_ = s.ApplyReaction(acct, "m1", model.Reaction{AttendeeID: "a1", Emoji: "😂", At: now}) // replaces a1's
+	m, _ := s.GetChatMessage(acct, "m1")
+	if len(m.Reactions) != 2 {
+		t.Fatalf("reactions = %+v", m.Reactions)
+	}
+	_ = s.ApplyReaction(acct, "m1", model.Reaction{AttendeeID: "a1", Emoji: "", At: now}) // removes a1's
+	m, _ = s.GetChatMessage(acct, "m1")
+	if len(m.Reactions) != 1 || m.Reactions[0].AttendeeID != "a2" {
+		t.Fatalf("after remove = %+v", m.Reactions)
+	}
+}
+
+func TestChatUnreadFlagsEditRevokeStatusRename(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	_ = s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "group", Name: "Team"})
+	at := time.Now().UTC().Truncate(time.Second)
+	if err := s.BumpChat(acct, "c1", at, 1); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.BumpChat(acct, "c1", at.Add(time.Second), 1)
+	c, _ := s.GetChat(acct, "c1")
+	if c.UnreadCount != 2 || c.LastMessageAt == nil || !c.LastMessageAt.Equal(at.Add(time.Second)) {
+		t.Fatalf("bump = %+v", c)
+	}
+	_ = s.ClearUnread(acct, "c1")
+	tru := true
+	_ = s.SetChatFlags(acct, "c1", &tru, nil)
+	c, _ = s.GetChat(acct, "c1")
+	if c.UnreadCount != 0 || !c.Archived || c.Muted {
+		t.Fatalf("flags = %+v", c)
+	}
+	_ = s.ReplaceChatMembers(acct, "c1", []model.ChatMember{{ChatID: "c1", AttendeeID: "a1", Role: "admin"}, {ChatID: "c1", AttendeeID: "a2"}})
+	_ = s.UpsertAttendee(model.Attendee{ID: "a1", Phone: "+911", Name: "One"}, acct)
+	c, _ = s.GetChat(acct, "c1")
+	if len(c.Members) != 2 || c.Members[0].ID != "a1" || c.Members[0].Phone != "+911" {
+		t.Fatalf("members = %+v", c.Members)
+	}
+	_, _ = s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: "tmp1", ChatID: "c1", Sender: model.Attendee{ID: "self"}, IsFromMe: true, Kind: "text", Text: "hello", SentAt: at, Status: "sending"})
+	if err := s.RenameChatMessage(acct, "tmp1", "REAL1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMessageStatus(acct, []string{"REAL1"}, "read"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EditChatMessage(acct, "REAL1", "hello!", at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := s.GetChatMessage(acct, "REAL1")
+	if m.Status != "read" || m.Text != "hello!" || m.EditedAt == nil {
+		t.Fatalf("after edit = %+v", m)
+	}
+	_ = s.RevokeChatMessage(acct, "REAL1")
+	m, _ = s.GetChatMessage(acct, "REAL1")
+	if !m.Deleted || m.Text != "" {
+		t.Fatalf("after revoke = %+v", m)
+	}
+	lst, _ := s.ListChats(ChatQuery{AccountID: acct, Kind: "group"})
+	if len(lst) != 1 {
+		t.Fatalf("ListChats kind=group = %d", len(lst))
+	}
+}
+
+func TestChatSessionAndIdempotency(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if _, err := s.ChatSession(acct); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing session err = %v", err)
+	}
+	if err := s.SaveChatSession(acct, "WHATSAPP", "919888000000:5@s.whatsapp.net"); err != nil {
+		t.Fatal(err)
+	}
+	if jid, _ := s.ChatSession(acct); jid != "919888000000:5@s.whatsapp.net" {
+		t.Fatalf("jid = %q", jid)
+	}
+	_ = s.DeleteChatSession(acct)
+	if _, err := s.ChatSession(acct); !errors.Is(err, ErrNotFound) {
+		t.Fatal("session survived delete")
+	}
+	if err := s.PutIdempotency("dev_1", "k1", []byte(`{"id":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.GetIdempotency("dev_1", "k1"); err != nil || string(b) != `{"id":"x"}` {
+		t.Fatalf("get = %s %v", b, err)
+	}
+	if _, err := s.GetIdempotency("dev_other", "k1"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("idempotency key leaked across developers")
+	}
+	s.PurgeIdempotency(time.Now().Add(time.Hour))
+	if _, err := s.GetIdempotency("dev_1", "k1"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("purge did not remove")
+	}
+}
+
+func TestDeletingChatAccountCascadesChatTables(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	_ = s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "direct"})
+	_ = s.ReplaceChatMembers(acct, "c1", []model.ChatMember{{ChatID: "c1", AttendeeID: "a1"}})
+	_ = s.UpsertAttendee(model.Attendee{ID: "a1"}, acct)
+	_, _ = s.UpsertChatMessage(model.ChatMessage{AccountID: acct, ID: "m1", ChatID: "c1", Sender: model.Attendee{ID: "a1"}, Kind: "text", SentAt: time.Now()})
+	_ = s.SaveChatSession(acct, "WHATSAPP", "j")
+	if err := s.DeleteAccount(acct); err != nil {
+		t.Fatal(err)
+	}
+	for table, want := range map[string]int{"chats": 0, "chat_members": 0, "attendees": 0, "chat_messages": 0, "chat_sessions": 0} {
+		var n int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n)
+		if n != want {
+			t.Errorf("%s has %d rows after delete", table, n)
+		}
+	}
+}
+
+func TestAccountsKindMigrationOnTenancyDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tenancy.db")
+	db, _ := sql.Open("sqlite", path)
+	// Minimal multi-tenancy-era accounts table (has developer_id, no kind).
+	if _, err := db.Exec(`CREATE TABLE developers (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+		CREATE TABLE accounts (id TEXT PRIMARY KEY, developer_id TEXT NOT NULL REFERENCES developers(id), provider TEXT NOT NULL, email TEXT NOT NULL,
+		 name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_synced_at INTEGER);
+		INSERT INTO developers VALUES ('dev_1','d@x.com','h','',0);
+		INSERT INTO accounts (id, developer_id, provider, email, status, created_at, updated_at) VALUES ('acc_old','dev_1','OUTLOOK','o@x.com','OK',0,0);`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	a, err := s.GetAnyAccount("acc_old")
+	if err != nil || a.Kind != model.AccountKindMail {
+		t.Fatalf("migrated account = %+v %v", a, err)
+	}
+}
+
+// SelfAttendee resolves the account's own attendee row (is_self = 1); an
+// account with none is ErrNotFound rather than a zero-value Attendee, since
+// callers use it to tag outgoing messages.
+func TestSelfAttendee(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if _, err := s.SelfAttendee(acct); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("no self attendee err = %v", err)
+	}
+	if err := s.UpsertAttendee(model.Attendee{ID: "self", Phone: "+919888000000", Name: "Me", IsSelf: true}, acct); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertAttendee(model.Attendee{ID: "a1", Name: "Other"}, acct); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SelfAttendee(acct)
+	if err != nil || got.ID != "self" || !got.IsSelf {
+		t.Fatalf("SelfAttendee = %+v %v", got, err)
 	}
 }

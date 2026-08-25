@@ -66,6 +66,11 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -109,12 +114,16 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) UpsertAccount(a model.Account) error {
 	now := time.Now().Unix()
+	kind := a.Kind
+	if kind == "" {
+		kind = model.AccountKindMail
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO accounts (id, developer_id, provider, email, name, status, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?)
+		INSERT INTO accounts (id, developer_id, kind, provider, email, name, status, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(developer_id, email) DO UPDATE SET
 		  name = excluded.name, status = excluded.status, updated_at = excluded.updated_at`,
-		a.ID, a.DeveloperID, a.Provider, a.Email, a.Name, a.Status, now, now)
+		a.ID, a.DeveloperID, kind, a.Provider, a.Email, a.Name, a.Status, now, now)
 	return err
 }
 
@@ -131,7 +140,7 @@ func (s *Store) AccountIDByEmail(developerID, email string) (string, error) {
 }
 
 const accountSelect = `
-	SELECT id, developer_id, provider, email, name, status, created_at, updated_at, last_synced_at
+	SELECT id, developer_id, kind, provider, email, name, status, created_at, updated_at, last_synced_at
 	FROM accounts`
 
 // GetAccount is the tenant-scoped read every API handler uses. A row owned
@@ -199,7 +208,7 @@ func scanAccount(r scanner) (model.Account, error) {
 	var a model.Account
 	var created, updated int64
 	var synced sql.NullInt64
-	err := r.Scan(&a.ID, &a.DeveloperID, &a.Provider, &a.Email, &a.Name, &a.Status, &created, &updated, &synced)
+	err := r.Scan(&a.ID, &a.DeveloperID, &a.Kind, &a.Provider, &a.Email, &a.Name, &a.Status, &created, &updated, &synced)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -212,7 +221,14 @@ func scanAccount(r scanner) (model.Account, error) {
 		t := time.Unix(synced.Int64, 0).UTC()
 		a.LastSyncedAt = &t
 	}
+	a.Identifier = a.Email
 	return a, nil
+}
+
+// ListChatAccounts is UNSCOPED: the chat runtime attaches every live chat
+// account at boot.
+func (s *Store) ListChatAccounts() ([]model.Account, error) {
+	return s.queryAccounts(accountSelect+` WHERE kind = ? AND status = ? ORDER BY created_at`, model.AccountKindChat, model.AccountOK)
 }
 
 // ---------- tokens ----------
@@ -503,4 +519,13 @@ func b2i(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// nullUnix converts an optional time into a value fit for a nullable INTEGER
+// column: nil stays nil, a set time becomes its unix seconds.
+func nullUnix(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.Unix()
 }

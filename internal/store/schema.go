@@ -36,6 +36,7 @@ CREATE INDEX IF NOT EXISTS sessions_by_developer ON sessions(developer_id);
 CREATE TABLE IF NOT EXISTS accounts (
   id            TEXT PRIMARY KEY,
   developer_id  TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL DEFAULT 'mail',
   provider      TEXT NOT NULL,
   email         TEXT NOT NULL,
   name          TEXT NOT NULL DEFAULT '',
@@ -163,4 +164,76 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 );
 CREATE INDEX IF NOT EXISTS deliveries_due ON webhook_deliveries(dead, next_attempt_at);
 CREATE INDEX IF NOT EXISTS deliveries_by_webhook ON webhook_deliveries(webhook_id);
+
+-- ---- chat providers (WhatsApp) ----
+CREATE TABLE IF NOT EXISTS chats (
+  account_id      TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id              TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  name            TEXT NOT NULL DEFAULT '',
+  unread_count    INTEGER NOT NULL DEFAULT 0,
+  last_message_at INTEGER,
+  archived        INTEGER NOT NULL DEFAULT 0,
+  muted           INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, id)
+);
+CREATE INDEX IF NOT EXISTS chats_by_activity ON chats(account_id, last_message_at DESC);
+
+CREATE TABLE IF NOT EXISTS attendees (
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id         TEXT NOT NULL,
+  lid        TEXT NOT NULL DEFAULT '',
+  phone      TEXT NOT NULL DEFAULT '',
+  name       TEXT NOT NULL DEFAULT '',
+  is_self    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_members (
+  account_id  TEXT NOT NULL,
+  chat_id     TEXT NOT NULL,
+  attendee_id TEXT NOT NULL,
+  role        TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (account_id, chat_id, attendee_id),
+  FOREIGN KEY (account_id, chat_id) REFERENCES chats(account_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  account_id     TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id             TEXT NOT NULL,
+  chat_id        TEXT NOT NULL,
+  sender_id      TEXT NOT NULL,
+  is_from_me     INTEGER NOT NULL DEFAULT 0,
+  kind           TEXT NOT NULL,
+  text           TEXT NOT NULL DEFAULT '',
+  quoted_id      TEXT NOT NULL DEFAULT '',
+  sent_at        INTEGER NOT NULL,
+  edited_at      INTEGER,
+  deleted        INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT '',
+  reactions_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (account_id, id)
+);
+CREATE INDEX IF NOT EXISTS chat_messages_by_chat ON chat_messages(account_id, chat_id, sent_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  provider   TEXT NOT NULL,
+  device_jid TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  developer_id TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  key          TEXT NOT NULL,
+  response     BLOB NOT NULL,
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (developer_id, key)
+);
 `
+
+// migrations are additive column changes for databases created before the
+// column existed. Each is safe to re-run: "duplicate column" is ignored.
+var migrations = []string{
+	`ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'mail'`,
+}
