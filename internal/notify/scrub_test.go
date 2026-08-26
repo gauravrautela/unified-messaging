@@ -30,6 +30,37 @@ func TestMaskDiscordURL(t *testing.T) {
 	}
 }
 
+func TestScrubDoesNotOverMatchNonTelegramBotPaths(t *testing.T) {
+	unchanged := "https://example.com/bottle/of/wine"
+	if got := Scrub(unchanged); got != unchanged {
+		t.Fatalf("Scrub masked a non-token /bot path: %q", got)
+	}
+	got := Scrub("https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage")
+	if !strings.Contains(got, "/bot•••/sendMessage") {
+		t.Fatalf("real telegram token not scrubbed: %q", got)
+	}
+}
+
+func TestScrubAndMaskDiscordURLRequireDiscordHost(t *testing.T) {
+	nonDiscord := "https://myservice.example.com/api/webhooks/42/secret"
+	if got := MaskDiscordURL(nonDiscord); got != nonDiscord {
+		t.Fatalf("MaskDiscordURL masked a non-discord host: %q", got)
+	}
+	if got := Scrub(nonDiscord); got != nonDiscord {
+		t.Fatalf("Scrub masked a non-discord host: %q", got)
+	}
+	for _, host := range []string{"discord.com", "discordapp.com"} {
+		u := "https://" + host + "/api/webhooks/42/s3cr3t"
+		want := "https://" + host + "/api/webhooks/42/•••"
+		if got := MaskDiscordURL(u); got != want {
+			t.Errorf("MaskDiscordURL(%q) = %q, want %q", u, got, want)
+		}
+		if got := Scrub(u); got != want {
+			t.Errorf("Scrub(%q) = %q, want %q", u, got, want)
+		}
+	}
+}
+
 func TestScrubErrHidesTelegramTokenAndDiscordToken(t *testing.T) {
 	err := ScrubErr(errors.New(`Post "https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage": dial tcp: timeout`))
 	if strings.Contains(err.Error(), "123456:ABC") || !strings.Contains(err.Error(), "bot•••/sendMessage") {

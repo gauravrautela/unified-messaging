@@ -9,8 +9,16 @@ import (
 )
 
 var (
-	telegramToken = regexp.MustCompile(`/bot[^/\s"]+/`)
-	discordToken  = regexp.MustCompile(`(/api/webhooks/\d+)/[^/\s"?]+`)
+	// telegramToken matches only Telegram's actual bot-token shape
+	// (<digits>:<[A-Za-z0-9_-]+>), so a customer webhook path that merely
+	// starts with "/bot" — e.g. "/bottle/of/wine" or "/botdetection/" — is
+	// left untouched.
+	telegramToken = regexp.MustCompile(`/bot\d+:[A-Za-z0-9_-]+/`)
+	// discordToken requires an actual Discord webhook host (discord.com or
+	// discordapp.com, optionally subdomained) so a developer's own webhook
+	// URL that merely happens to look like "/api/webhooks/<id>/<token>" is
+	// never masked.
+	discordToken = regexp.MustCompile(`(?i)(https?://(?:[a-z0-9-]+\.)?discord(?:app)?\.com/api/webhooks/\d+)/[^/\s"?]+`)
 )
 
 // Scrub removes credentials that transports embed in URLs: the Telegram bot
