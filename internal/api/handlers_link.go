@@ -70,6 +70,10 @@ func (l *link) statusResponse() map[string]any {
 	switch {
 	case l.result != nil && l.result.Err == nil:
 		resp["status"] = "paired"
+		// The id is what a connect page needs next, and it already leaves
+		// through the redirect query string when one was supplied. A page built
+		// from /docs with no success_redirect_url had no way to learn it.
+		resp["account_id"] = l.accountID
 		if l.successURL != "" {
 			resp["redirect"] = appendQuery(l.successURL, url.Values{"account_id": {l.accountID}})
 		}
@@ -81,7 +85,7 @@ func (l *link) statusResponse() map[string]any {
 	case l.code.Code != "":
 		if png, err := qrcode.Encode(l.code.Code, qrcode.Medium, 512); err == nil {
 			resp["png_base64"] = base64.StdEncoding.EncodeToString(png)
-			resp["expires_in"] = int(time.Until(l.code.ExpiresAt).Seconds())
+			resp["expires_in"] = max(0, int(time.Until(l.code.ExpiresAt).Seconds()))
 		}
 	}
 	return resp
@@ -94,10 +98,15 @@ func (l *link) statusResponse() map[string]any {
 type linkRegistry struct {
 	mu    sync.Mutex
 	links map[string]*link
+
+	// ttl is the pairing window pumpLink enforces. It is linkTTL everywhere
+	// except in tests, which shorten it to drive the timeout branch without
+	// waiting three minutes. Set once, before any pump goroutine reads it.
+	ttl time.Duration
 }
 
 func newLinkRegistry() *linkRegistry {
-	return &linkRegistry{links: map[string]*link{}}
+	return &linkRegistry{links: map[string]*link{}, ttl: linkTTL}
 }
 
 func (lr *linkRegistry) get(state string) *link {
@@ -128,15 +137,18 @@ func (lr *linkRegistry) getOrStart(state string, start func() (provider.LinkSess
 
 	sess, err := start()
 	if err != nil {
+		// Publish the failure before the placeholder becomes unreachable: a
+		// concurrent poll holding this *link must never observe a link that is
+		// no longer in the registry and still reports startErr == nil.
+		l.mu.Lock()
+		l.startErr = err
+		l.mu.Unlock()
+		close(l.ready)
 		lr.mu.Lock()
 		if lr.links[state] == l {
 			delete(lr.links, state)
 		}
 		lr.mu.Unlock()
-		l.mu.Lock()
-		l.startErr = err
-		l.mu.Unlock()
-		close(l.ready)
 		return l, true
 	}
 
@@ -201,6 +213,15 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	}
 	if time.Now().After(pending.ExpiresAt) {
 		writeError(w, http.StatusGone, "expired", "this connection link has expired")
+		return
+	}
+	// Consent is a linker concept: an OAuth provider takes consent on its own
+	// screen, so consented_at on a mail state records a fact that means
+	// nothing. /qr already refuses such a state; refuse it here too, and with
+	// the same 404 an unknown state gets — this endpoint is browser-facing and
+	// tells an unauthenticated caller nothing about which states exist.
+	if p, err := s.registry.Get(pending.Provider); err != nil || p.Linker() == nil {
+		writeError(w, http.StatusNotFound, "not_found", "unknown link")
 		return
 	}
 	if err := s.store.SetOAuthConsent(state, time.Now().UTC()); err != nil {
@@ -291,7 +312,7 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 // It owns l.session and l.code exclusively; only the mutex-guarded fields are
 // shared with a concurrent /qr poll.
 func (s *Server) pumpLink(state string, pending store.OAuthState, l *link) {
-	timeout := time.NewTimer(linkTTL)
+	timeout := time.NewTimer(s.links.ttl)
 	defer timeout.Stop()
 
 	codes := l.session.Codes()
@@ -313,9 +334,38 @@ func (s *Server) pumpLink(state string, pending store.OAuthState, l *link) {
 			return
 		case <-timeout.C:
 			l.session.Close()
-			s.finishLink(state, pending, l, provider.LinkResult{Err: provider.ErrLinkTimeout})
+			// Close and the phone's scan can be simultaneous: the provider may
+			// have resolved this session successfully a moment ago, or be about
+			// to. Dropping such a result linked the device for real — it stays
+			// in the end user's "Linked devices" list, with its keys on disk —
+			// while we reported link_timeout and created no account, leaving
+			// them to unlink it by hand. Give a late result a bounded chance to
+			// arrive, and honour it only if it actually succeeded (our own
+			// Close resolves an unpaired session as ErrLinkCancelled).
+			res := provider.LinkResult{Err: provider.ErrLinkTimeout}
+			if late, ok := lateResult(l.session, lateResultWait); ok && late.Err == nil {
+				res = late
+			}
+			s.finishLink(state, pending, l, res)
 			return
 		}
+	}
+}
+
+// lateResultWait bounds how long the closing pairing window waits for a result
+// that may already be on its way. Short: nothing is waiting on this but the
+// pump goroutine, and a session that has not resolved by now never will.
+const lateResultWait = time.Second
+
+// lateResult reports a result already delivered, or delivered within wait.
+func lateResult(sess provider.LinkSession, wait time.Duration) (provider.LinkResult, bool) {
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case res := <-sess.Result():
+		return res, true
+	case <-t.C:
+		return provider.LinkResult{}, false
 	}
 }
 

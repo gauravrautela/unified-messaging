@@ -2325,3 +2325,155 @@ func TestSendWithoutSelfAttendeeLeavesSenderIDEmpty(t *testing.T) {
 		t.Fatalf("own send must still be is_from_me: %+v", msg)
 	}
 }
+
+// --- a pair that lands as the window closes (I7) ---
+
+// lateSession delivers its result only once Close has been called, which is
+// exactly the shape of the race pumpLink lost: whatsmeow's PairSuccess handler
+// resolves the session while the 3-minute timer is firing, so the timeout
+// branch runs with a successful result already on (or about to reach) the
+// result channel. Discarding it left the device linked and visible in the end
+// user's "Linked devices" list with no account behind it.
+type lateSession struct {
+	codes  chan provider.LinkCode
+	result chan provider.LinkResult
+	res    provider.LinkResult
+	once   sync.Once
+}
+
+func (s *lateSession) Codes() <-chan provider.LinkCode    { return s.codes }
+func (s *lateSession) Result() <-chan provider.LinkResult { return s.result }
+func (s *lateSession) Close() {
+	s.once.Do(func() {
+		go func() {
+			time.Sleep(30 * time.Millisecond)
+			s.result <- s.res
+		}()
+	})
+}
+
+func TestPumpLinkHonoursAPairThatLandsAsTheWindowCloses(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT","notify_url":"https://api.example.com/hook"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PeekOAuthState(r.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	notified := make(chan map[string]any, 1)
+	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
+
+	sess := &lateSession{
+		codes:  make(chan provider.LinkCode, 1),
+		result: make(chan provider.LinkResult, 1),
+		res: provider.LinkResult{
+			Identity:  provider.Identity{Identifier: "+919888000007", Name: "Ada"},
+			DeviceJID: "919888000007:1@s.whatsapp.net",
+		},
+	}
+	l := &link{ready: make(chan struct{}), session: sess, started: time.Now()}
+	close(l.ready)
+	s.links.ttl = 10 * time.Millisecond
+
+	go s.pumpLink(r.State, pending, l)
+
+	select {
+	case p := <-notified:
+		if p["status"] != "CREATED" {
+			t.Fatalf("a pair that landed as the window closed was reported as %v", p)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("nothing notified")
+	}
+	accts, _ := db.ListAccounts(dev.ID)
+	if len(accts) != 1 {
+		t.Fatalf("accounts = %+v, want the paired device to have become one", accts)
+	}
+	for _, jid := range s.fake().Forgotten() {
+		if jid == "919888000007:1@s.whatsapp.net" {
+			t.Fatal("a successful pairing must not have its device forgotten")
+		}
+	}
+}
+
+// --- paired status carries the account id (I8) ---
+
+// /docs and llms.txt both document {"status":"paired","account_id":"acc_…"}.
+// A connect page built from the docs with no success_redirect_url got "paired"
+// and no id at all.
+func TestQRPairedStatusCarriesAccountID(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	s.fake().Pair(provider.Identity{Identifier: "+919888000008", Name: "Ada"}, "919888000008:1@s.whatsapp.net")
+
+	var q map[string]any
+	waitFor(t, func() bool {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+		q = map[string]any{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &q)
+		return q["status"] == "paired"
+	})
+	accts, _ := db.ListAccounts(dev.ID)
+	if len(accts) != 1 {
+		t.Fatalf("accounts = %+v", accts)
+	}
+	if q["account_id"] != accts[0].ID {
+		t.Fatalf("paired status = %v, want account_id %q", q, accts[0].ID)
+	}
+}
+
+// --- link minors ---
+
+// A QR code whose expiry has already passed must not report a negative
+// countdown to the connect page.
+func TestStatusResponseClampsExpiresIn(t *testing.T) {
+	l := &link{code: provider.LinkCode{Code: "2@abc", ExpiresAt: time.Now().Add(-time.Minute)}}
+	got := l.statusResponse()
+	if got["expires_in"] != 0 {
+		t.Fatalf("expires_in = %v, want 0", got["expires_in"])
+	}
+}
+
+// Consent is a linker concept. Recording consented_at on an OUTLOOK state
+// stores a fact that means nothing there — /qr already refuses such a state,
+// and consent must refuse it the same way.
+func TestConsentRejectsANonLinkerState(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"OUTLOOK"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "not_found") {
+		t.Fatalf("consent on a mail state: %d %s", rec.Code, rec.Body.String())
+	}
+}
