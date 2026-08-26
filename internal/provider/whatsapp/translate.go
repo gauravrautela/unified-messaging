@@ -74,7 +74,7 @@ func messageFrom(e *events.Message) (model.ChatMessage, string) {
 		Sender: attendeeFrom(e.Info.Sender, e.Info.SenderAlt, e.Info.PushName),
 		SentAt: e.Info.Timestamp.UTC(), Kind: "text", Reactions: []model.Reaction{},
 	}
-	msg := e.Message
+	msg := unwrap(e.Message)
 	switch {
 	case msg.GetReactionMessage() != nil:
 		m.QuotedMessageID = msg.GetReactionMessage().GetKey().GetID()
@@ -105,6 +105,34 @@ func messageFrom(e *events.Message) (model.ChatMessage, string) {
 		m.Text = mediaLabel(msg)
 	}
 	return m, "message"
+}
+
+// unwrap peels the envelopes WhatsApp puts around an ordinary body —
+// disappearing-message chats (Ephemeral), view-once sends, bot replies and
+// the sender's own-device copy — so the callers see the same shape as a
+// plain send. Mirrors whatsmeow's UnwrapRaw without needing RawMessage.
+func unwrap(msg *waE2E.Message) *waE2E.Message {
+	for i := 0; i < 8 && msg != nil; i++ {
+		switch {
+		case msg.GetDeviceSentMessage().GetMessage() != nil:
+			msg = msg.GetDeviceSentMessage().GetMessage()
+		case msg.GetBotInvokeMessage().GetMessage() != nil:
+			msg = msg.GetBotInvokeMessage().GetMessage()
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2Extension().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
 }
 
 // textOf pulls the body out of a nested message (an edit's replacement).

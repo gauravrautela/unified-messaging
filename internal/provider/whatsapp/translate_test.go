@@ -137,3 +137,19 @@ func TestRememberAttendeeKeepsAResolvedName(t *testing.T) {
 		t.Fatalf("newer record did not win: %+v", got)
 	}
 }
+
+// Disappearing-message groups and view-once sends wrap the real body in an
+// envelope; the text must come out the same as an unwrapped send.
+func TestMessageFromUnwrapsEphemeralAndViewOnce(t *testing.T) {
+	chat := types.NewJID("120363000000000000", types.GroupServer)
+	m, kind := messageFrom(evt(chat, "H", &waE2E.Message{EphemeralMessage: &waE2E.FutureProofMessage{
+		Message: &waE2E.Message{Conversation: proto.String("vanishing")}}}))
+	if kind != "message" || m.Kind != "text" || m.Text != "vanishing" {
+		t.Fatalf("ephemeral: kind=%q m.Kind=%q text=%q", kind, m.Kind, m.Text)
+	}
+	m, _ = messageFrom(evt(chat, "I", &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{
+		Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{}}}}))
+	if m.Kind != "unsupported" || m.Text != "[image]" {
+		t.Fatalf("view-once image: kind=%q text=%q", m.Kind, m.Text)
+	}
+}
