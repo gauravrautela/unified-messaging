@@ -82,13 +82,18 @@ func (d *Dispatcher) Start(ctx context.Context) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		// Fresh deliveries run on a context detached from ctx: a POST cancelled
+		// mid-flight is rescheduled even when the subscriber had already
+		// accepted it, and the client's own 15 s timeout is the real bound on
+		// how long one can take. ctx decides when this loop stops, nothing else.
+		deliverCtx := context.WithoutCancel(ctx)
 		for {
 			select {
 			case <-ctx.Done():
-				d.drain(ctx)
+				d.drain(deliverCtx)
 				return
 			case ev := <-d.queue:
-				d.deliver(ctx, ev)
+				d.deliver(deliverCtx, ev)
 			}
 		}
 	}()
@@ -154,14 +159,14 @@ const drainDeadline = 5 * time.Second
 // "dispatcher drain": a first attempt is what makes a delivery durable, so an
 // event discarded here is lost for good rather than retried from the store.
 //
-// The POSTs deliberately run on a context detached from the cancelled one —
-// requests built from ctx would abort mid-flight and be rescheduled even where
-// the subscriber had already accepted them.
+// ctx here is the delivery worker's own detached context, not the cancelled
+// one: requests built from the cancelled context would abort mid-flight and be
+// rescheduled even where the subscriber had already accepted them.
 func (d *Dispatcher) drain(ctx context.Context) {
 	if len(d.queue) == 0 {
 		return
 	}
-	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainDeadline)
+	drainCtx, cancel := context.WithTimeout(ctx, drainDeadline)
 	defer cancel()
 	n := 0
 	for {
