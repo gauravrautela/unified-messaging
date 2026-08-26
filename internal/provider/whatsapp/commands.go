@@ -200,7 +200,7 @@ func (p *Provider) MarkRead(ctx context.Context, accountID, chatID string, messa
 func (p *Provider) Logout(ctx context.Context, accountID string) error {
 	c := p.connFor(accountID)
 	if c == nil {
-		return provider.ErrNotFound
+		return nil
 	}
 	if err := c.client.Logout(ctx); err != nil {
 		return err

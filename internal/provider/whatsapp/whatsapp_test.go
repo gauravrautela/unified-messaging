@@ -98,6 +98,11 @@ func TestCommandsWithoutConnection(t *testing.T) {
 	if err := p.MarkRead(ctx, "acc_1", "chat", []string{"m"}); !errors.Is(err, provider.ErrNotFound) {
 		t.Fatalf("MarkRead = %v, want ErrNotFound", err)
 	}
+	// Logout is the exception: no live connection already is the end state a
+	// logout wants, not a failure.
+	if err := p.Logout(ctx, "acc_1"); err != nil {
+		t.Fatalf("Logout without connection = %v, want nil", err)
+	}
 }
 
 // The library's own reconnect loop must stay off: the chat runtime owns

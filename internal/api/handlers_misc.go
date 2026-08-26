@@ -17,12 +17,40 @@ import (
 
 // ---- accounts ----
 
+// decorate adds runtime state to a chat account before it is serialised. Mail
+// accounts, and chat accounts when the runtime is not wired (some tests build
+// a Server without one), pass through unchanged.
+func (s *Server) decorate(a model.Account) model.Account {
+	if a.Kind == model.AccountKindChat && s.chat != nil {
+		if c, ok := s.chat.HealthFor(a.ID); ok {
+			c.LastError = scrubErr(c.LastError)
+			a.Connection = &c
+		} else {
+			a.Connection = &model.Connection{State: "stopped"}
+		}
+	}
+	return a
+}
+
+// scrubErr keeps a chat connection's last error from ever putting a JID —
+// which embeds a phone number — in front of an API caller or a log line. A
+// message with no "@" carries no JID and passes through as-is.
+func scrubErr(msg string) string {
+	if strings.Contains(msg, "@") {
+		return logx.Digest(msg)
+	}
+	return msg
+}
+
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	accts, err := s.store.ListAccounts(dev.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
+	}
+	for i := range accts {
+		accts[i] = s.decorate(accts[i])
 	}
 	writeJSON(w, http.StatusOK, listResponse[model.Account]{Items: accts})
 }
@@ -38,16 +66,18 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, acct)
+	writeJSON(w, http.StatusOK, s.decorate(acct))
 }
 
-// handleDeleteAccount tears the mailbox out, including the upstream Graph
-// subscription. Leaving that behind would have Microsoft pushing notifications
-// at us for an account we can no longer authenticate.
+// handleDeleteAccount tears an account down. A mail account loses its upstream
+// Graph subscription too — leaving that behind would have Microsoft pushing
+// notifications at us for an account we can no longer authenticate. A chat
+// account is detached from the runtime, logged out best-effort, and unlinked.
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	id := r.PathValue("id")
-	if _, err := s.store.GetAccount(dev.ID, id); err != nil {
+	acct, err := s.store.GetAccount(dev.ID, id)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "account_not_found", "no such account")
 			return
@@ -58,6 +88,23 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+
+	if acct.Kind == model.AccountKindChat {
+		logx.From(r.Context()).Info("deleting chat account", "account_id", id)
+		s.chat.Detach(id)
+		if p, err := s.registry.Get(acct.Provider); err == nil && p.Chat() != nil {
+			if err := p.Chat().Logout(ctx, id); err != nil {
+				logx.From(r.Context()).Warn("logout on delete", "account_id", id, "err", err)
+			}
+		}
+		if err := s.accts.DeleteLinked(ctx, id); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	s.syncer.RemoveSubscriptions(ctx, id)
 
 	logx.From(r.Context()).Info("deleting account", "account_id", id)
@@ -80,6 +127,10 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	if acct.Kind != model.AccountKindMail {
+		writeError(w, http.StatusBadRequest, "unsupported_for_kind", "resync applies to mail accounts; use reconnect for chat")
+		return
+	}
 	if acct.Status != model.AccountOK {
 		writeError(w, http.StatusConflict, "account_not_ok",
 			"account status is "+acct.Status+"; it must be reconnected first")
@@ -88,6 +139,38 @@ func (s *Server) handleResync(w http.ResponseWriter, r *http.Request) {
 	logx.From(r.Context()).Info("resync requested", "account_id", id)
 	s.syncer.Wake(id)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+}
+
+// handleReconnect is resync's chat counterpart: rather than pull a delta, it
+// tears the live socket down and brings it back up, the same recovery a
+// process restart would give the account for free.
+func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
+	acct, err := s.store.GetAccount(dev.ID, r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "account_not_found", "no such account")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	if acct.Kind != model.AccountKindChat {
+		writeError(w, http.StatusBadRequest, "unsupported_for_kind", "reconnect applies to chat accounts; use resync for mail")
+		return
+	}
+	if acct.Status != model.AccountOK {
+		writeError(w, http.StatusConflict, "account_not_ok",
+			"account status is "+acct.Status+"; it must be relinked first")
+		return
+	}
+	logx.From(r.Context()).Info("reconnect requested", "account_id", acct.ID)
+	s.chat.Detach(acct.ID)
+	if err := s.chat.Attach(acct.ID); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "capacity", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "reconnecting"})
 }
 
 // ---- webhooks ----
@@ -299,11 +382,14 @@ func (s *Server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 
 type providerInfo struct {
 	Name string `json:"name"`
+	Kind string `json:"kind"`
 	Push bool   `json:"push_notifications"`
+	Auth string `json:"auth"` // "link" for a QR-linked chat provider, "oauth" otherwise
 }
 
-// handleListProviders reports which backends this deployment can connect, and
-// whether each can deliver push notifications or must be polled.
+// handleListProviders reports which backends this deployment can connect,
+// what kind of account each produces, how a caller authenticates it, and
+// whether it can deliver push notifications or must be polled.
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 	names := s.registry.Names()
 	out := make([]providerInfo, 0, len(names))
@@ -312,7 +398,11 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		out = append(out, providerInfo{Name: n, Push: p.Push() != nil})
+		auth := "oauth"
+		if p.Linker() != nil {
+			auth = "link"
+		}
+		out = append(out, providerInfo{Name: n, Kind: p.Kind(), Push: p.Push() != nil, Auth: auth})
 	}
 	writeJSON(w, http.StatusOK, listResponse[providerInfo]{Items: out})
 }

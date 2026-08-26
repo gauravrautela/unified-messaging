@@ -12,6 +12,7 @@ package syncer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -195,11 +196,17 @@ func (s *Syncer) pollOnce(ctx context.Context) {
 	s.log.Debug("poll tick", "accounts", len(accts), "ok", n)
 }
 
-// mailboxFor resolves the provider that owns an account.
+// mailboxFor resolves the provider that owns an account. A chat account's
+// provider has no Mailbox at all, which would otherwise leave callers to
+// dereference a nil interface — surfacing that as an error here means a
+// misrouted Wake logs and returns instead of panicking the worker goroutine.
 func (s *Syncer) mailboxFor(acct model.Account) (provider.Mailbox, error) {
 	p, err := s.registry.Get(acct.Provider)
 	if err != nil {
 		return nil, err
+	}
+	if p.Mailbox() == nil {
+		return nil, fmt.Errorf("provider %s has no mailbox", acct.Provider)
 	}
 	return p.Mailbox(), nil
 }

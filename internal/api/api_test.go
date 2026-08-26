@@ -1934,3 +1934,74 @@ func TestReactionRequiresEmojiField(t *testing.T) {
 		t.Fatalf("explicit empty emoji (remove) should still work: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestChatAccountLifecycleRoutes covers the chat account surface added in
+// task 9: connection state on the account payload, resync's kind rejection,
+// reconnect (detach + attach), and delete unlinking the device.
+func TestChatAccountLifecycleRoutes(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	h := s.Routes()
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, withKey(httptest.NewRequest("GET", path, nil), key))
+		return rec
+	}
+	post := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, withKey(httptest.NewRequest("POST", path, nil), key))
+		return rec
+	}
+	body := get("/api/v1/accounts/" + acc).Body.String()
+	if !strings.Contains(body, `"kind":"chat"`) || !strings.Contains(body, `"identifier":"+91`) || !strings.Contains(body, `"connection":{"state":"connected"`) {
+		t.Fatalf("account = %s", body)
+	}
+	if rec := post("/api/v1/accounts/" + acc + "/resync"); rec.Code != 400 || !strings.Contains(rec.Body.String(), "unsupported_for_kind") {
+		t.Fatalf("resync chat: %d", rec.Code)
+	}
+	if rec := post("/api/v1/accounts/" + acc + "/reconnect"); rec.Code != 202 {
+		t.Fatalf("reconnect: %d %s", rec.Code, rec.Body.String())
+	}
+	waitFor(t, func() bool { c, ok := s.chat.HealthFor(acc); return ok && c.State == "connected" })
+	prov := get("/api/v1/providers").Body.String()
+	if !strings.Contains(prov, `"name":"FAKECHAT"`) || !strings.Contains(prov, `"auth":"link"`) || !strings.Contains(prov, `"kind":"chat"`) {
+		t.Fatalf("providers = %s", prov)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest("DELETE", "/api/v1/accounts/"+acc, nil), key))
+	if rec.Code != 204 {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	cmds := s.fake().Commands()
+	if len(cmds) == 0 || !strings.HasPrefix(cmds[len(cmds)-1], "Logout "+acc) {
+		t.Fatalf("logout not sent: %v", cmds)
+	}
+	if len(s.fake().Forgotten()) != 1 {
+		t.Fatal("device not forgotten")
+	}
+	if _, ok := s.chat.HealthFor(acc); ok {
+		t.Fatal("runtime still has the account")
+	}
+}
+
+// TestScrubErrRedactsJIDs proves a connection error carrying a JID (a phone
+// number in disguise) never reaches an API caller or a log line verbatim,
+// while an ordinary error message — no "@" in it — passes through unchanged.
+func TestScrubErrRedactsJIDs(t *testing.T) {
+	plain := "context deadline exceeded"
+	if got := scrubErr(plain); got != plain {
+		t.Fatalf("scrubErr(%q) = %q, want unchanged", plain, got)
+	}
+	withJID := "stream error for 919900000000@s.whatsapp.net: conflict"
+	got := scrubErr(withJID)
+	if got == withJID {
+		t.Fatalf("scrubErr(%q) left the JID in place", withJID)
+	}
+	if strings.Contains(got, "919900000000") || strings.Contains(got, "@s.whatsapp.net") {
+		t.Fatalf("scrubErr(%q) = %q, still leaks the JID", withJID, got)
+	}
+	if got != logx.Digest(withJID) {
+		t.Fatalf("scrubErr(%q) = %q, want the digest %q", withJID, got, logx.Digest(withJID))
+	}
+}

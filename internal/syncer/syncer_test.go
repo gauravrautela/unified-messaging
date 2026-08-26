@@ -397,3 +397,23 @@ func TestWakeCollapsesWhileInflight(t *testing.T) {
 		t.Fatal("follow-up run was not recorded")
 	}
 }
+
+// A chat account's provider has no Mailbox at all. SyncAccount reaching one —
+// a stray Wake against a chat account, say — must fail cleanly rather than
+// dereference the nil Mailbox and panic the worker goroutine.
+func TestSyncAccountOnChatAccountReturnsError(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "chat.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_ = db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash")
+	_ = db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "+91", Status: model.AccountOK})
+	fake := providertest.NewFakeChat("FAKECHAT")
+	log, _ := logx.Capture()
+	s := New(db, provider.NewRegistry(fake), nil, events.NewDispatcher(db, log), log, Options{PollInterval: time.Hour})
+
+	if err := s.SyncAccount(context.Background(), "acc_wa"); err == nil {
+		t.Fatal("SyncAccount on a chat account = nil error, want one")
+	}
+}
