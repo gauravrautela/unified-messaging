@@ -272,7 +272,7 @@ const ok = crypto.timingSafeEqual(Buffer.from(want), Buffer.from(req.get("X-Outl
 </ul>
 
 <h2 id="chat">7. Chat (WhatsApp)</h2>
-<div class="note warn">WhatsApp is integrated through the <b>linked-device model</b> &mdash; the same mechanism as whatsapp.web.com &mdash; not the official WhatsApp Business API. The end user links this service as an additional device on their phone by scanning a QR code; nothing is registered as a business number. Meta can ban a number it judges to be automating WhatsApp, so treat this like any other unofficial client: message at a human pace, never send unsolicited bulk messages, and make sure the person you are connecting understands and accepts that risk. The consent screen below exists so they see this before a QR code ever appears.</div>
+<div class="note warn">WhatsApp is integrated through the <b>linked-device model</b> &mdash; the same mechanism as web.whatsapp.com &mdash; not the official WhatsApp Business API. The end user links this service as an additional device on their phone by scanning a QR code; nothing is registered as a business number. Meta can ban a number it judges to be automating WhatsApp, so treat this like any other unofficial client: message at a human pace, never send unsolicited bulk messages, and make sure the person you are connecting understands and accepts that risk. The consent screen below exists so they see this before a QR code ever appears.</div>
 <p>Device keys (the credentials that keep the phone's linked-device session alive) are written by whatsmeow into tables inside this service's own SQLite file, <b>unsealed</b> &mdash; unlike OAuth refresh tokens, which are AES-256-GCM sealed before they touch disk. Anyone who can read the database file can impersonate a linked WhatsApp device. Run this behind disk-level or filesystem encryption if you turn WhatsApp on for anything beyond local testing.</p>
 <h3>7.1 Link a number</h3>
 <p>Same <code>hosted-auth</code> call as mail, naming the provider:</p>
@@ -316,7 +316,7 @@ curl -s -X POST "{{.Base}}/api/v1/chats?account_id=$ACC" \
   -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
   -d '{"account_id": "acc_…", "phone": "+15559876543", "text": "Hi!"}'
 # 201 {"chat": Chat, "message": ChatMessage}   # starts a new direct chat and sends the first message in one call</code></pre>
-<p><code>PATCH /api/v1/chats/{id}</code> takes <code>{"read": true}</code> (marks every message in the chat read on the phone too), <code>{"archived": true}</code> and/or <code>{"muted": true}</code>.</p>
+<p><code>PATCH /api/v1/chats/{id}</code> takes <code>{"read": true}</code> (marks every message in the chat read on the phone too), <code>{"archived": true}</code> and/or <code>{"muted": true}</code>. The read receipt sent upstream covers the <b>50 most recent</b> messages in the chat; the local unread count is cleared in full either way.</p>
 <p>Edit, delete and react act on the message id: <code>PATCH /api/v1/chats/{id}/messages/{mid}</code> (<code>{"text": "…"}</code>), <code>DELETE</code> (204, revokes for everyone), <code>PUT .../reaction</code> (<code>{"emoji": "👍"}</code>, empty string removes it). All three return <code>403 not_own_message</code> on a message you did not send &mdash; WhatsApp itself has no concept of editing someone else's message.</p>
 <div class="note"><code>Idempotency-Key</code> is honored on every chat write (send, edit, delete, react, start-chat). It is scoped per developer and per operation (method + path + account + body): the same key with the same body replays the original response; the same key with a <b>different</b> body is a client bug and gets <code>409 idempotency_conflict</code>. Optional but recommended for sends, since a retried network timeout must never double-send a message.</div>
 <h3>7.4 Reconnect</h3>
@@ -333,7 +333,7 @@ curl -s -X POST "{{.Base}}/api/v1/chats?account_id=$ACC" \
 <tr><td><code>account_status</code></td><td>The account's connection state changed &mdash; see below. Can arrive at <b>any time</b>, independent of any request you made.</td></tr>
 </table>
 <h3>7.6 Connection loss and unlinking</h3>
-<p>Unlinking the device from the phone (WhatsApp &rarr; Settings &rarr; Linked devices &rarr; Log out) or 30 consecutive reconnect failures both flip the account to <code>status: "CREDENTIALS"</code> and emit <code>account_status</code>, exactly like a revoked mail token. There is no way to relink the same account id automatically &mdash; a WhatsApp logout is deliberate on the phone's part; mint a fresh <code>hosted-auth</code> connect link to pair a new device. A transient drop instead shows up as <code>connection.state: "backoff"</code> while the runtime retries (capped at 5&nbsp;minutes between attempts) without ever touching <code>status</code>.</p>
+<p>Unlinking the device from the phone (WhatsApp &rarr; Settings &rarr; Linked devices &rarr; Log out) or 30 consecutive reconnect failures both flip the account to <code>status: "CREDENTIALS"</code> and emit <code>account_status</code>, exactly like a revoked mail token. Relinking always needs a fresh <code>hosted-auth</code> connect link &mdash; a WhatsApp logout is deliberate on the phone's part, and there is no token left to refresh. Pairing the <b>same number</b> again reuses the existing account, so <code>account_id</code>, its webhooks and its stored chats survive; pairing a different number creates a new account. A transient drop instead shows up as <code>connection.state: "backoff"</code> while the runtime retries (capped at 5&nbsp;minutes between attempts) without ever touching <code>status</code>.</p>
 <h2 id="lifecycle">8. Account lifecycle</h2>
 <table>
 <tr><th>Status</th><th>Meaning</th><th>What to do</th></tr>
@@ -354,7 +354,7 @@ curl -s -X POST "{{.Base}}/api/v1/chats?account_id=$ACC" \
 <tr><td>401</td><td><code>unauthorized</code> &mdash; missing, invalid or revoked key</td></tr>
 <tr><td>403</td><td><code>session_required</code> &mdash; key management needs the dashboard session; <code>not_own_message</code> &mdash; editing, deleting or the like on a chat message you did not send</td></tr>
 <tr><td>404</td><td><code>account_not_found</code>, <code>not_found</code> &mdash; including anything owned by another developer</td></tr>
-<tr><td>409</td><td><code>account_not_ok</code>, <code>reconnect_required</code>, <code>consent_required</code> (WhatsApp <code>/qr</code> polled before consent), <code>idempotency_conflict</code> (an <code>Idempotency-Key</code> reused with a different request)</td></tr>
+<tr><td>409</td><td><code>account_not_ok</code>, <code>reconnect_required</code> (the grant is dead, or a chat account has no live socket right now &mdash; e.g. its connection is in <code>backoff</code>), <code>consent_required</code> (WhatsApp <code>/qr</code> polled before consent), <code>idempotency_conflict</code> (an <code>Idempotency-Key</code> reused with a different request)</td></tr>
 <tr><td>410</td><td><code>expired</code> &mdash; the connect link (or its ~3-minute WhatsApp pairing window) elapsed</td></tr>
 <tr><td>415</td><td><code>json_required</code> &mdash; dashboard-session writes must send <code>Content-Type: application/json</code></td></tr>
 <tr><td>502</td><td><code>provider_error</code> &mdash; the mail or chat provider failed; the message carries its error code</td></tr>
@@ -402,6 +402,7 @@ curl -s -X POST "$BASE/api/v1/emails/$MSG/reply?account_id=$ACC" -H "Authorizati
 <li>Backfill is bounded (30 days by default); older mail is fetched on demand by <code>GET /api/v1/emails/{id}</code>.</li>
 <li>Inline attachment uploads are capped by the provider (~3&nbsp;MB).</li>
 <li>Webhook delivery is at-least-once; the very first attempt is in-memory, so a crash between an event and its first POST can lose it &mdash; the next sync re-converges the mirror but does not replay the event.</li>
+<li>The event queue is bounded. A subscriber slow enough to fill it pushes back on the producer for 5&nbsp;s and only then is an event dropped; drops are counted and reported as <code>dropped_events</code> on <code>GET /healthz</code>. A dropped event is never persisted and cannot be replayed.</li>
 <li>Paging is offset-based; a mailbox that changes during pagination can shift items between pages.</li>
 <li>Webhook URLs are checked for literal private/loopback addresses only; hostnames are not resolved.</li>
 <li><b>WhatsApp: text only.</b> Media messages arrive as <code>kind: "unsupported"</code>; there is no way to send an attachment.</li>

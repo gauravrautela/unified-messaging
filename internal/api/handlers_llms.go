@@ -55,7 +55,7 @@ Spec version: v1
 
 Account:
 ` + "```" + `
-{id, provider: "OUTLOOK"|"WHATSAPP", kind: "mail"|"chat", email (mail only), identifier (email for mail, E.164 phone for chat), name,
+{id, provider: "OUTLOOK"|"WHATSAPP", kind: "mail"|"chat", email (the address for mail, the E.164 phone for chat), identifier (same value), name,
  status: "OK"|"CREDENTIALS", created_at, updated_at, last_synced_at?,
  connection?: {state: "connecting"|"connected"|"backoff"|"stopped"|"error", since, reconnects, last_error?}}  // connection is chat-only
 ` + "```" + `
@@ -144,7 +144,7 @@ Error:
 
 ### Account lifecycle
 - ` + "`GET /api/v1/accounts`" + ` -> ` + "`{items: [Account]}`" + `; ` + "`GET /api/v1/accounts/{id}`" + `.
-- ` + "`status: \"CREDENTIALS\"`" + ` means the provider rejected the refresh token (mail) or the linked device was logged out / 30 consecutive reconnects failed (WhatsApp): mint a new connect link for the same user (same account_id for mail; WhatsApp always pairs a new account_id since a phone that logged out has no token to refresh). An ` + "`account_status`" + ` event is emitted either way, and it can arrive with no request of yours in flight.
+- ` + "`status: \"CREDENTIALS\"`" + ` means the provider rejected the refresh token (mail) or the linked device was logged out / 30 consecutive reconnects failed (WhatsApp): mint a new connect link for the same user (mail keeps its account_id; WhatsApp always needs a fresh connect link, since a phone that logged out has no token to refresh, but relinking the **same number** reuses the same account_id — a different number makes a new account). An ` + "`account_status`" + ` event is emitted either way, and it can arrive with no request of yours in flight.
 - ` + "`POST /api/v1/accounts/{id}/resync`" + ` (mail only) -> ` + "`202 {status: \"queued\"}`" + `; 409 account_not_ok if status is not OK; 400 unsupported_for_kind on a chat account.
 - ` + "`POST /api/v1/accounts/{id}/reconnect`" + ` (chat only) -> forces the socket to reconnect now; 400 unsupported_for_kind on a mail account; 503 capacity at ` + "`WHATSAPP_MAX_ACCOUNTS`" + `.
 - ` + "`DELETE /api/v1/accounts/{id}`" + ` -> 204; removes tokens/device credentials, mirror, subscriptions and per-account webhooks (and, for WhatsApp, logs the device out).
@@ -158,7 +158,7 @@ Error:
 - On success, ` + "`notify_url`" + ` gets ` + "`{status: \"CREATED\", account_id, identifier (E.164 phone), provider: \"WHATSAPP\"}`" + ` or ` + "`{status: \"FAILED\", error, message}`" + `, exactly like mail.
 - ` + "`GET /api/v1/chats?account_id&kind=direct|group&unread=true&q=&limit&offset`" + ` -> ` + "`{items: [Chat], limit, offset}`" + `.
 - ` + "`POST /api/v1/chats`" + ` body ` + "`{account_id, phone? or attendee_id?, text}`" + ` -> 201 ` + "`{chat: Chat, message: ChatMessage}`" + ` (starts a direct chat and sends the first message in one call).
-- ` + "`PATCH /api/v1/chats/{id}?account_id`" + ` body ` + "`{read?: true, archived?: bool, muted?: bool}`" + ` -> Chat.
+- ` + "`PATCH /api/v1/chats/{id}?account_id`" + ` body ` + "`{read?: true, archived?: bool, muted?: bool}`" + ` -> Chat. The upstream read receipt covers the 50 most recent messages; the local unread count is cleared in full.
 - ` + "`GET /api/v1/chats/{id}/messages?account_id&before=&limit`" + ` -> ` + "`{items: [ChatMessage], next_before?}`" + `, newest first; page with ` + "`?before=<next_before>`" + `.
 - ` + "`POST /api/v1/chats/{id}/messages?account_id`" + ` body ` + "`{text, quoted_message_id?}`" + ` -> 201 ChatMessage. Send an ` + "`Idempotency-Key`" + ` header to make a retried send safe.
 - ` + "`PATCH /api/v1/chats/{id}/messages/{mid}?account_id`" + ` body ` + "`{text}`" + ` -> ChatMessage. ` + "`DELETE .../messages/{mid}?account_id`" + ` -> 204 (revokes for everyone). ` + "`PUT .../messages/{mid}/reaction?account_id`" + ` body ` + "`{emoji}`" + ` (` + "`\"\"`" + ` removes it) -> 204. All three: ` + "`403 not_own_message`" + ` on a message ` + "`is_from_me: false`" + `.
@@ -174,7 +174,7 @@ Error:
 | 401 | unauthorized |
 | 403 | session_required, not_own_message (editing/deleting/reacting to a chat message you did not send) |
 | 404 | account_not_found, not_found (also for resources owned by another developer) |
-| 409 | account_not_ok, reconnect_required, consent_required (WhatsApp ` + "`/qr`" + ` polled before consent), idempotency_conflict (` + "`Idempotency-Key`" + ` reused with a different request) |
+| 409 | account_not_ok, reconnect_required (dead grant, or a chat account with no live socket right now — e.g. connection state "backoff"), consent_required (WhatsApp ` + "`/qr`" + ` polled before consent), idempotency_conflict (` + "`Idempotency-Key`" + ` reused with a different request) |
 | 410 | expired (connect link, or the ~3-minute WhatsApp pairing window) |
 | 415 | json_required (dashboard-session writes only) |
 | 502 | provider_error (message carries the provider's code) |
@@ -189,6 +189,7 @@ Error:
 - Backfill window 30 days; older messages fetched on demand by id. (Mail only — WhatsApp has no history sync; a newly linked device only sees messages sent after pairing.)
 - Offset paging on mail; items may shift while a mailbox changes. Chat message paging is cursor-based (` + "`before`" + `/` + "`next_before`" + `) and stable.
 - First webhook attempt is in-memory; a crash before the first POST loses that event (the mirror re-converges on next sync).
+- The event queue is bounded: a subscriber slow enough to fill it pushes back on the producer for 5 s, and only then is an event dropped. Drops are counted and reported as ` + "`dropped_events`" + ` on ` + "`GET /healthz`" + `; a dropped event is never persisted and cannot be replayed.
 - Webhook URL check is literal-IP only; hostnames are not resolved.
 - WhatsApp: text only — media arrives as ` + "`kind: \"unsupported\"`" + ` and cannot be sent. QR linking only, no phone-number pairing codes. One socket per account, capped process-wide at ` + "`WHATSAPP_MAX_ACCOUNTS`" + ` (default 200). Reconnect backoff up to 5 minutes; 30 consecutive failures -> ` + "`CREDENTIALS`" + ` (unreachable).
 `

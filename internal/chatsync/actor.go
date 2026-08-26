@@ -142,13 +142,15 @@ func (a *actor) run() {
 		}
 
 		n := a.dropped(d.reason)
-		log.Info("disconnected, backing off", "reason", d.reason, "attempt", n)
 		a.setState(stateBackoff)
+		// The give-up check comes first: the last line before a terminal
+		// CREDENTIALS must not say we are about to retry.
 		if n >= maxFailures {
 			log.Error("giving up on chat account", "attempts", n)
 			a.markLoggedOut("unreachable")
 			return
 		}
+		log.Info("disconnected, backing off", "reason", d.reason, "attempt", n)
 		if !a.sleep(next(n - 1)) {
 			return
 		}

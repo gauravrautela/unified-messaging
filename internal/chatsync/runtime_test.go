@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -322,6 +323,50 @@ func TestConnectFailuresExhaustToCredentials(t *testing.T) {
 	}
 }
 
+// The last thing said about an account being given up must not be "backing
+// off": the drop that reaches the cap decides to stop, so that line belongs
+// below the decision, not above it. This is the disconnect path — the
+// connect-failure path above already had the order right.
+func TestExhaustionDoesNotLogBackingOffOnTheTerminalDrop(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "1")
+	_ = h.rt.Attach(acc)
+	for i := 0; i < maxFailures; i++ {
+		// Wait for this attempt's own connection before dropping it: dropping a
+		// sink the actor has already abandoned is a no-op and would silently
+		// shorten the run.
+		waitFor(t, func() bool {
+			c, ok := h.rt.HealthFor(acc)
+			return ok && c.State == "connected" && c.Reconnects == i
+		})
+		h.fake.Disconnect(acc, "network", false)
+	}
+	waitFor(t, func() bool { a, _ := h.db.GetAnyAccount(acc); return a.Status == model.AccountCredentials })
+
+	var backingOff, gaveUp, lastGiveUp, lastBackOff int
+	lastGiveUp, lastBackOff = -1, -1
+	for i, line := range h.recs.All() {
+		if strings.Contains(line, "disconnected, backing off") {
+			backingOff++
+			lastBackOff = i
+		}
+		if strings.Contains(line, "giving up on chat account") {
+			gaveUp++
+			lastGiveUp = i
+		}
+	}
+	if gaveUp != 1 {
+		t.Fatalf("give-up lines = %d, want 1", gaveUp)
+	}
+	if lastBackOff > lastGiveUp {
+		t.Fatal(`"backing off" was logged after the decision to give up`)
+	}
+	if backingOff >= maxFailures {
+		t.Fatalf("backing off logged %d times over %d drops: the terminal drop logged it too",
+			backingOff, maxFailures)
+	}
+}
+
 func TestCapacityAndStartAttachesOnlyOKChatAccounts(t *testing.T) {
 	h := newHarness(t)
 	a := h.link(t, "1")
@@ -342,5 +387,49 @@ func TestCapacityAndStartAttachesOnlyOKChatAccounts(t *testing.T) {
 	waitFor(t, func() bool { return h.fake.Sink(a) == nil })
 	if err := h.rt.Attach(d); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Spec §3, /docs §7.6, the README and llms.txt all promise a 5-minute
+// ceiling. Jittering after the cap made the real ceiling 6 minutes.
+func TestBackoffNeverExceedsTheDocumentedCap(t *testing.T) {
+	for attempt := 0; attempt < 40; attempt++ {
+		for i := 0; i < 200; i++ {
+			d := next(attempt)
+			if d > maxBackoff {
+				t.Fatalf("next(%d) = %v, above the documented %v cap", attempt, d, maxBackoff)
+			}
+			if d <= 0 {
+				t.Fatalf("next(%d) = %v, must be positive", attempt, d)
+			}
+		}
+	}
+	// Jitter still spreads a fleet out at the cap rather than collapsing to it.
+	spread := map[time.Duration]bool{}
+	for i := 0; i < 200; i++ {
+		spread[next(20)] = true
+	}
+	if len(spread) < 10 {
+		t.Fatalf("capping removed the jitter: %d distinct waits at the ceiling", len(spread))
+	}
+}
+
+// A finishLink that lands after the runtime has stopped must not start a
+// doomed connection — and must not wg.Add(1) after Wait() returned, which is
+// a sync.WaitGroup reuse hazard.
+func TestAttachAfterShutdownIsRefused(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	h.rt.ctx = ctx // the harness started the runtime on its own context
+	cancel()
+	h.rt.Wait()
+
+	err := h.rt.Attach(acc)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Attach after shutdown = %v, want context.Canceled", err)
+	}
+	if h.fake.Sink(acc) != nil {
+		t.Fatal("Attach after shutdown opened a connection anyway")
 	}
 }

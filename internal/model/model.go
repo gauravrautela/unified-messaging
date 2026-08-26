@@ -22,7 +22,7 @@ type Account struct {
 	// DeveloperID is the owner. Never serialised: a caller only ever sees
 	// their own accounts, so it carries no information for them.
 	DeveloperID string    `json:"-"`
-	Provider    string    `json:"provider"` // always "OUTLOOK" in this POC
+	Provider    string    `json:"provider"` // "OUTLOOK" or "WHATSAPP"
 	Email       string    `json:"email"`
 	Kind        string    `json:"kind"`
 	Identifier  string    `json:"identifier"`

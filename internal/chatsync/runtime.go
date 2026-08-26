@@ -105,6 +105,20 @@ func (r *Runtime) Start(ctx context.Context) {
 // Attach starts an actor for accountID. Attaching an already-attached account
 // is a no-op, which is what makes Start idempotent.
 func (r *Runtime) Attach(accountID string) error {
+	// A link that finishes during shutdown lands here after Wait() has already
+	// returned. Starting an actor then would wg.Add(1) on a WaitGroup a Wait
+	// has completed on — the reuse hazard the docs warn about — for a
+	// connection that is about to be torn down anyway.
+	r.mu.Lock()
+	runCtx := r.ctx
+	r.mu.Unlock()
+	// nil means Start has not run yet, which is not shutdown: Attach still
+	// works, exactly as it did before this guard.
+	if runCtx != nil {
+		if err := runCtx.Err(); err != nil {
+			return err
+		}
+	}
 	acct, err := r.store.GetAnyAccount(accountID)
 	if err != nil {
 		return err

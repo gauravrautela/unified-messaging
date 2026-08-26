@@ -33,5 +33,13 @@ func next(attempt int) time.Duration {
 		d = maxBackoff
 	}
 	j := 1 + (rand.Float64()*0.4 - 0.2)
-	return time.Duration(float64(d) * j)
+	d = time.Duration(float64(d) * j)
+	// The cap is applied again after the jitter, and it is the one that counts:
+	// capping only before it left the real ceiling 20% above the 5 minutes the
+	// spec, /docs, the README and llms.txt all promise. Waits at the ceiling
+	// still spread over [4m, 5m], so a fleet does not reconnect in lockstep.
+	if d > maxBackoff {
+		d = maxBackoff
+	}
+	return d
 }
