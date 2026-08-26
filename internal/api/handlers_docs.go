@@ -288,6 +288,7 @@ From: Bob &lt;bob@example.com&gt;
 **Q3 plan**
 Hi — attaching the deck we discussed…</code></pre>
 <p>Text is cut at 200 characters for mail and 300 for chat; phone numbers are masked (<code>+91 98••• •855</code>); media shows as <code>[image]</code> etc. Not supported: attachments, replies from the channel, custom templates.</p>
+<p>The rendered message is capped at what the transport accepts &mdash; <b>2,000</b> runes for Discord&rsquo;s <code>content</code>, <b>4,096</b> for Telegram&rsquo;s <code>text</code> &mdash; and cut with an ellipsis if a long subject or recipient list pushes it over. Rate limiting is ordinary back-pressure: a Discord <b>429</b> is a retryable failure like any other non-2xx and rides the same schedule, so a burst of events is delayed, never dropped.</p>
 
 <h2 id="chat">7. Chat (WhatsApp)</h2>
 <div class="note warn">WhatsApp is integrated through the <b>linked-device model</b> &mdash; the same mechanism as web.whatsapp.com &mdash; not the official WhatsApp Business API. The end user links this service as an additional device on their phone by scanning a QR code; nothing is registered as a business number. Meta can ban a number it judges to be automating WhatsApp, so treat this like any other unofficial client: message at a human pace, never send unsolicited bulk messages, and make sure the person you are connecting understands and accepts that risk. The consent screen below exists so they see this before a QR code ever appears.</div>

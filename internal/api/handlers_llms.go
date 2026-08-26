@@ -135,15 +135,15 @@ Error:
 - ` + "`PATCH /api/v1/emails/{id}?account_id`" + ` body ` + "`{read?: bool, flagged?: bool}`" + ` -> Email.
 
 ### Webhooks
-- Per account: ` + "`POST /api/v1/accounts/{id}/webhooks`" + ` body ` + "`{url, secret?, name?, events?}`" + ` (events default ` + "`[\"mail_received\"]`" + ` for a mailbox, ` + "`[\"chat_received\"]`" + ` for a chat account) -> 201 Webhook incl. secret once.
+- Per account: ` + "`POST /api/v1/accounts/{id}/webhooks`" + ` body ` + "`{kind?: \"webhook\"|\"discord\"|\"telegram\", url?, secret?, bot_token?, chat_id?, name?, events?}`" + ` (events default ` + "`[\"mail_received\"]`" + ` for a mailbox, ` + "`[\"chat_received\"]`" + ` for a chat account) -> 201 Webhook incl. secret once. ` + "`kind`" + ` defaults to ` + "`webhook`" + `; see the per-kind bodies below.
 - Developer-wide: ` + "`POST /api/v1/webhooks`" + ` same body; empty ` + "`events`" + ` means all. ` + "`\"*\"`" + ` also means all.
-- List/delete: ` + "`GET|DELETE /api/v1/webhooks[/{id}]`" + `, ` + "`GET|DELETE /api/v1/accounts/{id}/webhooks[/{wid}]`" + `.
+- List/delete: ` + "`GET /api/v1/webhooks`" + `, ` + "`DELETE /api/v1/webhooks/{id}`" + `, ` + "`GET /api/v1/accounts/{id}/webhooks`" + `, ` + "`DELETE /api/v1/accounts/{id}/webhooks/{wid}`" + ` (there is no single-hook GET).
 - URLs must be public http(s); localhost, loopback, link-local and private IPs are rejected (400 invalid_url / invalid_webhook).
 - Delivery: POST JSON Event with headers ` + "`X-Outlook-Event`" + ` (type), ` + "`X-Outlook-Delivery`" + ` (attempt number), ` + "`X-Outlook-Signature: sha256=<hex HMAC-SHA256 of raw body with secret>`" + `. Respond 2xx within 15 s.
 - Retries after a non-2xx: 30s, 2m, 10m, 30m, 2h, 6h, 12h; then marked dead. ` + "`GET /api/v1/webhooks/{id}/deliveries`" + ` -> ` + "`{items: [{id, webhook_id, account_id, event_type, attempts, next_attempt_at, last_error, dead, created_at}]}`" + `.
-- kind=discord: body ` + "`{kind:\"discord\", url:\"https://discord.com/api/webhooks/…\", name?, events?}`" + `; receives a formatted text message, no signature.
+- kind=discord: body ` + "`{kind:\"discord\", url:\"https://discord.com/api/webhooks/…\", name?, events?}`" + `; receives a formatted text message, no signature. The URL must be a plain ` + "`discord.com`" + `/` + "`discordapp.com`" + ` host with no port and no userinfo.
 - kind=telegram: body ` + "`{kind:\"telegram\", bot_token, chat_id, name?, events?}`" + ` (create the bot with ` + "`@BotFather`" + `, then ` + "`getUpdates`" + ` to find ` + "`chat_id`" + `); bot_token is never returned; a Telegram rejection at creation is 400 invalid_webhook, Telegram unreachable is 502 provider_error.
-- Notifications: one message per event, mail snippet ≤200 chars, chat ≤300, phones masked. Same retry schedule and deliveries log as kind=webhook.
+- Notifications: one message per event, mail snippet ≤200 chars, chat ≤300, phones masked. The whole message is capped at the transport's limit — 2,000 runes for Discord, 4,096 for Telegram — and cut with an ellipsis. Same retry schedule and deliveries log as kind=webhook; a Discord 429 (rate limit) is an ordinary retryable failure, not a permanent one.
 
 ### Account lifecycle
 - ` + "`GET /api/v1/accounts`" + ` -> ` + "`{items: [Account]}`" + `; ` + "`GET /api/v1/accounts/{id}`" + `.
