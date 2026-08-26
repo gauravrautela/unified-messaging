@@ -65,7 +65,7 @@ Routes are unchanged: `POST|GET /api/v1/webhooks`, `GET|DELETE /api/v1/webhooks/
 
 - `kind` defaults to `"webhook"`. Unknown kind → `400 invalid_webhook` ("kind must be webhook, discord or telegram").
 - Field presence per kind is validated (missing `url` / `bot_token` / `chat_id`, or a field that does not belong to the kind) → `400 invalid_webhook` with a field-specific message.
-- Telegram creation calls `getChat` once (`POST https://api.telegram.org/bot<token>/getChat {"chat_id"}`): `ok:false` → `400 invalid_webhook` with Telegram's `description`; transport failure or non-JSON → `502 provider_error`. The check has a 10 s timeout. It is skipped in tests via an injectable base URL on the sender (see §4).
+- Telegram creation calls `getChat` once (`POST https://api.telegram.org/bot<token>/getChat {"chat_id"}`): `ok:false` → `400 invalid_webhook` with Telegram's `description`; transport failure or non-JSON → `502 provider_error`. The check has a 5 s timeout. It is skipped in tests via an injectable base URL on the sender (see §4).
 - Events filter and the kind-aware default (`mail_received` for a mailbox, `chat_received` for a chat account, everything for developer-wide) are unchanged.
 - Responses: `kind` always present; `secret` only at creation and only for `webhook`; `url` absent for `telegram`; `telegram.chat_id` present for `telegram`; `bot_token` never.
 - The Discord `url` is returned as stored (the developer's own value).
