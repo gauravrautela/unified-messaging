@@ -36,14 +36,20 @@ func (s *Server) resolveChatAccount(w http.ResponseWriter, r *http.Request, id s
 	return acct, chatter, true
 }
 
-// selfAttendee resolves the account's own attendee row, falling back to a
-// bare stand-in keyed by the account's identifier when the roster sync has
-// not populated one yet (e.g. straight after linking, before the first
-// Chats() pull completes).
+// selfAttendee resolves the account's own attendee row, falling back to a bare
+// stand-in when the roster sync has not populated one yet (e.g. straight after
+// linking, before the first Chats() pull completes).
+//
+// The fallback deliberately carries no id. acct.Identifier is an E.164 phone
+// (+15551234567), not the …@s.whatsapp.net JID the roster keys attendees by, so
+// recording it as sender_id produced a message whose sender resolved to nothing
+// on GET /api/v1/attendees/{id}. An empty sender id is honest: the message is
+// still marked is_from_me, and the roster fills the sender in as soon as it
+// arrives.
 func (s *Server) selfAttendee(acct model.Account) (model.Attendee, error) {
 	self, err := s.store.SelfAttendee(acct.ID)
 	if errors.Is(err, store.ErrNotFound) {
-		return model.Attendee{ID: acct.Identifier, IsSelf: true}, nil
+		return model.Attendee{IsSelf: true}, nil
 	}
 	return self, err
 }
@@ -258,7 +264,6 @@ func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	s.withIdempotency(w, r, dev.ID, acct.ID, func() (int, any) {
 		phone := req.Phone
-		var existing model.Attendee
 		haveExisting := false
 		if req.AttendeeID != "" {
 			att, err := s.store.GetAttendee(acct.ID, req.AttendeeID)
@@ -269,11 +274,18 @@ func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 				return http.StatusInternalServerError, apiErr("internal", err.Error())
 			}
 			phone = att.Phone
-			existing, haveExisting = att, true
+			haveExisting = true
 		}
 
 		chatID, err := chatter.StartDirect(r.Context(), acct.ID, phone)
 		if err != nil {
+			// Only the not-connected case is remapped. StartDirect's other
+			// ErrNotFound — "this phone is not on WhatsApp" — deliberately stays
+			// a 502: a 404 here would be indistinguishable from the 404 this API
+			// uses for "belongs to another developer".
+			if errors.Is(err, provider.ErrNotConnected) {
+				return providerError(err)
+			}
 			return http.StatusBadGateway, apiErr("provider_error", err.Error())
 		}
 		if err := s.store.UpsertChat(model.Chat{ID: chatID, AccountID: acct.ID, Kind: "direct"}); err != nil {
@@ -281,16 +293,10 @@ func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case haveExisting:
-			// UpsertAttendee is a full profile overwrite, not a merge — reuse
-			// the attendee we already fetched (name, is_self intact) instead
-			// of writing back a bare {id, phone} that would blank it. Only
-			// write at all when there's something new to record.
-			if existing.Phone == "" && phone != "" {
-				existing.Phone = phone
-				if err := s.store.UpsertAttendee(existing, acct.ID); err != nil {
-					return http.StatusInternalServerError, apiErr("internal", err.Error())
-				}
-			}
+			// Nothing to write: phone was read from this very attendee a few
+			// lines up, so there is no new fact to record, and UpsertAttendee is
+			// a full profile overwrite rather than a merge — writing back a bare
+			// {id, phone} would blank the name and is_self we already have.
 		default:
 			// No attendee_id was given: phone alone identified the recipient,
 			// so there is no existing profile to protect and chatID doubles
@@ -451,7 +457,10 @@ func (s *Server) sendChatText(ctx context.Context, acct model.Account, chatter p
 	res, err := chatter.SendText(ctx, acct.ID, chatID, text, quotedID)
 	if err != nil {
 		_ = s.store.DeleteChatMessageRow(acct.ID, tmpID)
-		return model.ChatMessage{}, http.StatusBadGateway, apiErr("provider_error", err.Error())
+		// Same mapping the command routes use: a send against an account with
+		// no live socket is 409 reconnect_required, not a bare 502.
+		status, body := providerError(err)
+		return model.ChatMessage{}, status, body
 	}
 	// Promote the tmp row to the provider's id. This can lose a race: the
 	// chat runtime's own socket may deliver this same send back as an

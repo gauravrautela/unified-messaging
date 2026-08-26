@@ -89,14 +89,27 @@ func TestCommandsWithoutConnection(t *testing.T) {
 	if _, _, _, err := p.Chats(ctx, "acc_1"); !errors.Is(err, provider.ErrNotFound) {
 		t.Fatalf("Chats = %v, want ErrNotFound", err)
 	}
-	if _, err := p.SendText(ctx, "acc_1", "chat", "hi", ""); !errors.Is(err, provider.ErrNotFound) {
-		t.Fatalf("SendText = %v, want ErrNotFound", err)
-	}
-	if err := p.React(ctx, "acc_1", "chat", "m", "👍"); !errors.Is(err, provider.ErrNotFound) {
-		t.Fatalf("React = %v, want ErrNotFound", err)
-	}
-	if err := p.MarkRead(ctx, "acc_1", "chat", []string{"m"}); !errors.Is(err, provider.ErrNotFound) {
-		t.Fatalf("MarkRead = %v, want ErrNotFound", err)
+	// A command against a disconnected account is not a missing resource: 404
+	// is the shape this API reserves for "belongs to another developer", and a
+	// client seeing it would conclude the message vanished. It is a distinct
+	// sentinel the API maps to 409 reconnect_required.
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"SendText", func() error { _, err := p.SendText(ctx, "acc_1", "chat", "hi", ""); return err }()},
+		{"StartDirect", func() error { _, err := p.StartDirect(ctx, "acc_1", "+919888000000"); return err }()},
+		{"React", p.React(ctx, "acc_1", "chat", "m", "👍")},
+		{"Edit", p.Edit(ctx, "acc_1", "chat", "m", "hi")},
+		{"Delete", p.Delete(ctx, "acc_1", "chat", "m")},
+		{"MarkRead", p.MarkRead(ctx, "acc_1", "chat", []string{"m"})},
+	} {
+		if !errors.Is(tc.err, provider.ErrNotConnected) {
+			t.Fatalf("%s = %v, want ErrNotConnected", tc.name, tc.err)
+		}
+		if errors.Is(tc.err, provider.ErrNotFound) {
+			t.Fatalf("%s = %v, must not also read as ErrNotFound (that maps to 404)", tc.name, tc.err)
+		}
 	}
 	// Logout is the exception: no live connection already is the end state a
 	// logout wants, not a failure.
@@ -114,5 +127,17 @@ func TestNewClientDisablesAutoReconnect(t *testing.T) {
 	}
 	if c := p.newClient(p.container.NewDevice()); c.EnableAutoReconnect {
 		t.Fatal("whatsmeow auto-reconnect must be disabled")
+	}
+	// The pairing client needs a second flag: WhatsApp always sends a 515
+	// stream error straight after pair-success, and whatsmeow's handler for it
+	// is gated on DisableLoginAutoReconnect alone, not EnableAutoReconnect. Left
+	// unset, that spawns a background reconnect on the library's own context —
+	// a second live socket for a device the chat runtime is about to Attach.
+	pc := p.newPairingClient(p.container.NewDevice())
+	if pc.EnableAutoReconnect {
+		t.Fatal("pairing client: whatsmeow auto-reconnect must be disabled")
+	}
+	if !pc.DisableLoginAutoReconnect {
+		t.Fatal("pairing client: whatsmeow post-pairing (515) relogin must be disabled")
 	}
 }

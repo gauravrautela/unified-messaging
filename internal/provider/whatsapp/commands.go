@@ -14,9 +14,12 @@ import (
 )
 
 // Outbound commands. Every one of them resolves the live connection through
-// connFor and reports provider.ErrNotFound when the account is not connected
-// — that check happens before anything else, so a command against a
-// disconnected account never touches the network.
+// connFor and reports provider.ErrNotConnected when the account has no live
+// socket — that check happens before anything else, so a command against a
+// disconnected account never touches the network. It is deliberately not
+// ErrNotFound: the account and the message both exist, and the API turns this
+// into 409 reconnect_required rather than a 404 that would read as
+// "belongs to someone else".
 //
 // Logging follows the rule the rest of the package uses: chat ids only
 // through logChatID (a group id is opaque and logged verbatim, a direct chat
@@ -56,7 +59,7 @@ func toMessageIDs(ids []string) []types.MessageID {
 func (p *Provider) SendText(ctx context.Context, accountID, chatID, text, quotedID string) (provider.SendResult, error) {
 	c := p.connFor(accountID)
 	if c == nil {
-		return provider.SendResult{}, provider.ErrNotFound
+		return provider.SendResult{}, provider.ErrNotConnected
 	}
 	chat, err := types.ParseJID(chatID)
 	if err != nil {
@@ -78,7 +81,7 @@ func (p *Provider) SendText(ctx context.Context, accountID, chatID, text, quoted
 func (p *Provider) StartDirect(ctx context.Context, accountID, phoneE164 string) (string, error) {
 	c := p.connFor(accountID)
 	if c == nil {
-		return "", provider.ErrNotFound
+		return "", provider.ErrNotConnected
 	}
 	res, err := c.client.IsOnWhatsApp(ctx, []string{phoneE164})
 	if err != nil {
@@ -107,7 +110,7 @@ func (c *conn) selfJID() (types.JID, error) {
 func (p *Provider) React(ctx context.Context, accountID, chatID, messageID, emoji string) error {
 	c := p.connFor(accountID)
 	if c == nil {
-		return provider.ErrNotFound
+		return provider.ErrNotConnected
 	}
 	chat, err := types.ParseJID(chatID)
 	if err != nil {
@@ -130,7 +133,7 @@ func (p *Provider) React(ctx context.Context, accountID, chatID, messageID, emoj
 func (p *Provider) Edit(ctx context.Context, accountID, chatID, messageID, text string) error {
 	c := p.connFor(accountID)
 	if c == nil {
-		return provider.ErrNotFound
+		return provider.ErrNotConnected
 	}
 	chat, err := types.ParseJID(chatID)
 	if err != nil {
@@ -149,7 +152,7 @@ func (p *Provider) Edit(ctx context.Context, accountID, chatID, messageID, text 
 func (p *Provider) Delete(ctx context.Context, accountID, chatID, messageID string) error {
 	c := p.connFor(accountID)
 	if c == nil {
-		return provider.ErrNotFound
+		return provider.ErrNotConnected
 	}
 	chat, err := types.ParseJID(chatID)
 	if err != nil {
@@ -172,15 +175,18 @@ func (p *Provider) Delete(ctx context.Context, accountID, chatID, messageID stri
 //
 // whatsmeow's MarkRead wants the sender of the message being acknowledged,
 // which matters for a group's read receipts. v1 passes the chat JID as the
-// sender for every case: whatsmeow accepts that for direct chats (chat and
-// sender coincide there anyway), and for a group it degrades to marking the
-// chat read without attributing the receipt to any one participant. Correct
-// per-sender group receipts would need the sender recorded alongside each
-// stored message id, which is out of scope here.
+// sender for every case. For a direct chat that is correct — chat and sender
+// coincide. For a group it is not the participant who sent the message, so the
+// receipt is attributed to the group JID itself; the chat is marked read, but
+// per-sender attribution is lost. Getting that right would need the sender
+// recorded alongside each stored message id, which is out of scope here.
+//
+// v1 also caps a mark-read call at the 50 most recent message ids (see the
+// handler); the cap is documented in /docs §7.3.
 func (p *Provider) MarkRead(ctx context.Context, accountID, chatID string, messageIDs []string) error {
 	c := p.connFor(accountID)
 	if c == nil {
-		return provider.ErrNotFound
+		return provider.ErrNotConnected
 	}
 	chat, err := types.ParseJID(chatID)
 	if err != nil {

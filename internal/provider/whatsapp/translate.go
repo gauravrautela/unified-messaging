@@ -22,6 +22,24 @@ func chatKind(jid types.JID) string {
 	return "direct"
 }
 
+// rememberAttendee records a into seen, protecting a name or phone that has
+// already been resolved: the roster is assembled from several passes over the
+// same people (each group's participants, then the contact list), and a later
+// pass routinely has no name for a contact the first one resolved through the
+// contact store, or no phone for a participant exposed only as a privacy id.
+// Anything else about the newer record wins.
+func rememberAttendee(seen map[string]model.Attendee, a model.Attendee) {
+	if prev, ok := seen[a.ID]; ok {
+		if a.Name == "" {
+			a.Name = prev.Name
+		}
+		if a.Phone == "" {
+			a.Phone = prev.Phone
+		}
+	}
+	seen[a.ID] = a
+}
+
 // attendeeFrom builds the API identity for a WhatsApp user. Phone JIDs are the
 // stable public id; a LID (privacy id) is used only when no phone is known.
 func attendeeFrom(jid, alt types.JID, pushName string) model.Attendee {

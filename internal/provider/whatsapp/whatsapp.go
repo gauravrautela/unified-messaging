@@ -32,9 +32,8 @@ const Name = "WHATSAPP"
 // process: the device container is shared, and each linked account gets its
 // own client held in conns for the duration of its connection.
 type Provider struct {
-	container  *sqlstore.Container
-	deviceName string
-	log        *slog.Logger
+	container *sqlstore.Container
+	log       *slog.Logger
 
 	mu    sync.Mutex
 	conns map[string]*conn // accountID -> live connection (used by commands)
@@ -67,10 +66,9 @@ func New(db *sql.DB, deviceName string, log *slog.Logger) (*Provider, error) {
 		store.DeviceProps.Os = proto.String(deviceName)
 	}
 	return &Provider{
-		container:  c,
-		deviceName: deviceName,
-		log:        log.With("component", "whatsapp"),
-		conns:      map[string]*conn{},
+		container: c,
+		log:       log.With("component", "whatsapp"),
+		conns:     map[string]*conn{},
 	}, nil
 }
 
@@ -91,6 +89,21 @@ func (p *Provider) Chat() provider.Chatter       { return p }
 func (p *Provider) newClient(device *store.Device) *whatsmeow.Client {
 	c := whatsmeow.NewClient(device, waLog.Noop)
 	c.EnableAutoReconnect = false
+	return c
+}
+
+// newPairingClient is newClient for the one client that performs a QR pairing.
+//
+// WhatsApp always sends a 515 stream error immediately after pair-success, and
+// whatsmeow's handler for it reconnects in the background unless
+// DisableLoginAutoReconnect is set — EnableAutoReconnect does not gate it. That
+// reconnect runs on the library's own background context, which the link
+// session's cancel cannot reach, so it would leave a second live socket for the
+// device the chat runtime is about to Attach: StreamReplaced flapping right
+// after a successful link, plus a goroutine nothing ever closes.
+func (p *Provider) newPairingClient(device *store.Device) *whatsmeow.Client {
+	c := p.newClient(device)
+	c.DisableLoginAutoReconnect = true
 	return c
 }
 

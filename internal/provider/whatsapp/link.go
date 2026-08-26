@@ -30,11 +30,13 @@ func (p *Provider) StartLink(ctx context.Context) (provider.LinkSession, error) 
 	log := logx.From(ctx).With("component", "whatsapp")
 
 	device := p.container.NewDevice()
-	client := p.newClient(device)
+	client := p.newPairingClient(device)
 
-	// The QR channel's lifetime is ours, not the caller's: cancelling linkCtx is
-	// how the session tells whatsmeow to stop emitting codes and close the
-	// channel, which is what lets the pump goroutine finish.
+	// linkCtx exists to bound whatsmeow's QR emitter, not to inherit anything:
+	// the only caller passes context.Background(), because the pairing window
+	// outlives the request that opened it. Cancelling linkCtx is how the session
+	// tells whatsmeow to stop emitting codes and close the channel, which is
+	// what lets the pump goroutine finish.
 	linkCtx, cancel := context.WithCancel(ctx)
 
 	s := newLinkSession(p, log, client, device, cancel)

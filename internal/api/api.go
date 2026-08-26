@@ -457,14 +457,30 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 // writeProviderError translates backend failures into our own vocabulary, so
 // callers never have to special-case any provider's error codes.
 func writeProviderError(w http.ResponseWriter, err error) {
+	status, body := providerError(err)
+	writeJSON(w, status, body)
+}
+
+// providerError is the single mapping from a provider sentinel to a status and
+// body. It exists as its own function because the send path reports through a
+// (status, body) pair rather than writing directly, and the two must not drift:
+// before this, an account with no live socket was a 404 on one route and a 502
+// on the other.
+func providerError(err error) (int, any) {
 	switch {
+	case errors.Is(err, provider.ErrNotConnected):
+		// The account is fine and the caller owns it; only the live session is
+		// missing. Same 409 as a dead grant, because the caller's move is the
+		// same: wait for the reconnect, or mint a fresh connect link.
+		return http.StatusConflict, apiErr("reconnect_required",
+			"this account must be reconnected before it can be used")
 	case errors.Is(err, provider.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		return http.StatusNotFound, apiErr("not_found", err.Error())
 	case errors.Is(err, provider.ErrReauthRequired):
-		writeError(w, http.StatusConflict, "reconnect_required",
+		return http.StatusConflict, apiErr("reconnect_required",
 			"this account must be reconnected before it can be used")
 	default:
-		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
+		return http.StatusBadGateway, apiErr("provider_error", err.Error())
 	}
 }
 

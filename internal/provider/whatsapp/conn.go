@@ -198,9 +198,7 @@ func (p *Provider) Chats(ctx context.Context, accountID string) ([]model.Chat, [
 			if info, err := c.client.Store.Contacts.GetContact(ctx, part.JID); err == nil && info.Found {
 				a.Name = firstNonEmpty(info.FullName, info.PushName, info.BusinessName)
 			}
-			if prev, ok := seen[a.ID]; !ok || prev.Name == "" {
-				seen[a.ID] = a
-			}
+			rememberAttendee(seen, a)
 			role := ""
 			if part.IsAdmin || part.IsSuperAdmin {
 				role = "admin"
@@ -218,7 +216,7 @@ func (p *Provider) Chats(ctx context.Context, accountID string) ([]model.Chat, [
 			continue // a LID-only contact has no chat we can address by number
 		}
 		a := attendeeFrom(jid, types.JID{}, firstNonEmpty(info.FullName, info.PushName, info.BusinessName))
-		seen[a.ID] = a
+		rememberAttendee(seen, a)
 		chats = append(chats, model.Chat{AccountID: accountID, ID: a.ID, Kind: "direct", Name: a.Name})
 	}
 

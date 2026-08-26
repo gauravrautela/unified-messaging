@@ -298,9 +298,17 @@ func (s *Store) ReplaceChatMembers(accountID, chatID string, members []model.Cha
 
 // ---------- chat messages ----------
 
+// chatMessageSelect resolves the sender to a full Attendee, the same way
+// chatMembers does. A LEFT JOIN, not an inner one: a message can arrive from a
+// participant the roster has not caught up with yet, and it must still be
+// readable — it just carries a bare id. Every column is qualified because the
+// join makes account_id and id ambiguous.
 const chatMessageSelect = `
-	SELECT account_id, id, chat_id, sender_id, is_from_me, kind, text, quoted_id, sent_at, edited_at, deleted, status, reactions_json
-	FROM chat_messages`
+	SELECT m.account_id, m.id, m.chat_id, m.sender_id, COALESCE(a.phone, ''), COALESCE(a.name, ''),
+	       COALESCE(a.is_self, 0), m.is_from_me, m.kind, m.text, m.quoted_id, m.sent_at, m.edited_at,
+	       m.deleted, m.status, m.reactions_json
+	FROM chat_messages m
+	LEFT JOIN attendees a ON a.account_id = m.account_id AND a.id = m.sender_id`
 
 // UpsertChatMessage inserts a message and reports whether it was new. A
 // replayed id (reconnect replay, own-message echo) is a no-op.
@@ -323,7 +331,7 @@ func (s *Store) UpsertChatMessage(m model.ChatMessage) (bool, error) {
 }
 
 func (s *Store) GetChatMessage(accountID, id string) (model.ChatMessage, error) {
-	return scanChatMessage(s.db.QueryRow(chatMessageSelect+` WHERE account_id = ? AND id = ?`, accountID, id))
+	return scanChatMessage(s.db.QueryRow(chatMessageSelect+` WHERE m.account_id = ? AND m.id = ?`, accountID, id))
 }
 
 // ListChatMessages pages newest-first with a keyset cursor: `before` is the
@@ -333,7 +341,7 @@ func (s *Store) ListChatMessages(accountID, chatID, before string, limit int) ([
 		limit = 50
 	}
 	args := []any{accountID, chatID}
-	where := `account_id = ? AND chat_id = ?`
+	where := `m.account_id = ? AND m.chat_id = ?`
 	if before != "" {
 		var sentAt int64
 		err := s.db.QueryRow(`SELECT sent_at FROM chat_messages WHERE account_id = ? AND id = ?`, accountID, before).Scan(&sentAt)
@@ -342,11 +350,11 @@ func (s *Store) ListChatMessages(accountID, chatID, before string, limit int) ([
 		} else if err != nil {
 			return nil, "", err
 		}
-		where += ` AND (sent_at < ? OR (sent_at = ? AND id < ?))`
+		where += ` AND (m.sent_at < ? OR (m.sent_at = ? AND m.id < ?))`
 		args = append(args, sentAt, sentAt, before)
 	}
 	args = append(args, limit+1)
-	rows, err := s.db.Query(chatMessageSelect+` WHERE `+where+` ORDER BY sent_at DESC, id DESC LIMIT ?`, args...)
+	rows, err := s.db.Query(chatMessageSelect+` WHERE `+where+` ORDER BY m.sent_at DESC, m.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -456,7 +464,9 @@ func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	var sentAt int64
 	var editedAt sql.NullInt64
 	var reactionsJSON string
-	err := r.Scan(&m.AccountID, &m.ID, &m.ChatID, &m.Sender.ID, &isFromMe, &m.Kind, &m.Text, &m.QuotedMessageID,
+	var senderIsSelf int
+	err := r.Scan(&m.AccountID, &m.ID, &m.ChatID, &m.Sender.ID, &m.Sender.Phone, &m.Sender.Name, &senderIsSelf,
+		&isFromMe, &m.Kind, &m.Text, &m.QuotedMessageID,
 		&sentAt, &editedAt, &deleted, &m.Status, &reactionsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, ErrNotFound
@@ -464,6 +474,7 @@ func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	if err != nil {
 		return m, err
 	}
+	m.Sender.IsSelf = senderIsSelf == 1
 	m.IsFromMe = isFromMe == 1
 	m.Deleted = deleted == 1
 	m.SentAt = time.Unix(sentAt, 0).UTC()

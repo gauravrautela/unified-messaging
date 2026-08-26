@@ -1005,3 +1005,64 @@ func TestReplaceChatMembersIsAllOrNothing(t *testing.T) {
 		t.Fatalf("previous roster not intact after a failed replace: %+v", c.Members)
 	}
 }
+
+// A message's sender is an Attendee, not a bare id: spec §4 promises
+// sender: Attendee, and §1 exists so that a sender resolves to a person. Every
+// read path (list, get, and every chat_* webhook payload built from
+// GetChatMessage) went out with name: "" and is_self: false because
+// chatMessageSelect never joined attendees.
+func TestChatMessageSenderResolvesToAnAttendee(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "group", Name: "Team"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []model.Attendee{
+		{ID: "919888000001@s.whatsapp.net", Phone: "+919888000001", Name: "Ada"},
+		{ID: "919888000000@s.whatsapp.net", Phone: "+919888000000", Name: "Me", IsSelf: true},
+	} {
+		if err := s.UpsertAttendee(a, acct); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	for _, m := range []model.ChatMessage{
+		{AccountID: acct, ID: "m1", ChatID: "c1", Sender: model.Attendee{ID: "919888000001@s.whatsapp.net"},
+			Kind: "text", Text: "hi", SentAt: base},
+		{AccountID: acct, ID: "m2", ChatID: "c1", Sender: model.Attendee{ID: "919888000000@s.whatsapp.net"},
+			IsFromMe: true, Kind: "text", Text: "hello", SentAt: base.Add(time.Minute)},
+		// A sender we have no attendee row for yet must still round-trip its id.
+		{AccountID: acct, ID: "m3", ChatID: "c1", Sender: model.Attendee{ID: "919888000009@s.whatsapp.net"},
+			Kind: "text", Text: "who", SentAt: base.Add(2 * time.Minute)},
+	} {
+		if _, err := s.UpsertChatMessage(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.GetChatMessage(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Sender.Name != "Ada" || got.Sender.Phone != "+919888000001" || got.Sender.IsSelf {
+		t.Fatalf("GetChatMessage sender = %+v", got.Sender)
+	}
+	self, _ := s.GetChatMessage(acct, "m2")
+	if !self.Sender.IsSelf || self.Sender.Name != "Me" {
+		t.Fatalf("own message sender = %+v", self.Sender)
+	}
+	unknown, _ := s.GetChatMessage(acct, "m3")
+	if unknown.Sender.ID != "919888000009@s.whatsapp.net" || unknown.Sender.Name != "" {
+		t.Fatalf("unrostered sender = %+v", unknown.Sender)
+	}
+
+	page, _, err := s.ListChatMessages(acct, "c1", "", 10)
+	if err != nil || len(page) != 3 {
+		t.Fatalf("list = %v err=%v", ids(page), err)
+	}
+	for _, m := range page {
+		if m.ID == "m1" && m.Sender.Name != "Ada" {
+			t.Fatalf("ListChatMessages sender = %+v", m.Sender)
+		}
+	}
+}

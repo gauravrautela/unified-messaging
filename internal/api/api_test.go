@@ -2191,3 +2191,137 @@ func TestRequestLogScrubsConnectStateAndOAuthCode(t *testing.T) {
 		t.Fatalf("scrubbing removed the connect path entirely: %v", recs.All())
 	}
 }
+
+// --- not-connected is 409, not 404 (I5) ---
+
+// A command issued while the socket is in backoff must not look like a
+// cross-tenant 404: the account exists, the message exists, and the caller's
+// correct response is to wait or reconnect, not to conclude the message is
+// gone.
+func TestNotConnectedIsReconnectRequiredNot404(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.fake().SendResult = provider.SendResult{MessageID: "M1"}
+	send := withKey(httptest.NewRequest("POST", "/api/v1/chats/c1/messages?account_id="+acc, strings.NewReader(`{"text":"hi"}`)), key)
+	send.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, send)
+	if rec.Code != 201 {
+		t.Fatalf("seed message: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The account is still OK; only the live socket is gone.
+	s.fake().CommandErr = provider.ErrNotConnected
+
+	for _, tc := range []struct{ method, path, body string }{
+		{"PUT", "/api/v1/chats/c1/messages/M1/reaction?account_id=" + acc, `{"emoji":"👍"}`},
+		{"PATCH", "/api/v1/chats/c1/messages/M1?account_id=" + acc, `{"text":"edited"}`},
+		{"DELETE", "/api/v1/chats/c1/messages/M1?account_id=" + acc, ``},
+		{"PATCH", "/api/v1/chats/c1?account_id=" + acc, `{"read":true}`},
+		{"POST", "/api/v1/chats/c1/messages?account_id=" + acc, `{"text":"again"}`},
+	} {
+		req := withKey(httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "reconnect_required") {
+			t.Fatalf("%s %s while disconnected: %d %s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// --- sender resolution (I6) ---
+
+// The API's ChatMessage carries sender: Attendee, not a bare id. Until the
+// store joined attendees, every listed message — and every chat_* webhook
+// payload — went out with an empty name and is_self: false, including on the
+// caller's own messages.
+func TestListedMessagesCarryAResolvedSender(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	if err := db.UpsertAttendee(model.Attendee{ID: "919888000001@s.whatsapp.net",
+		Phone: "+919888000001", Name: "Ada"}, acc); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAttendee(model.Attendee{ID: "919900000000@s.whatsapp.net",
+		Phone: "+919900000000", Name: "Me", IsSelf: true}, acc); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []model.ChatMessage{
+		{AccountID: acc, ID: "M1", ChatID: "c1", Sender: model.Attendee{ID: "919888000001@s.whatsapp.net"},
+			Kind: "text", Text: "hi", SentAt: time.Now()},
+		{AccountID: acc, ID: "M2", ChatID: "c1", Sender: model.Attendee{ID: "919900000000@s.whatsapp.net"},
+			IsFromMe: true, Kind: "text", Text: "hello", SentAt: time.Now().Add(time.Minute)},
+	} {
+		if _, err := db.UpsertChatMessage(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest("GET", "/api/v1/chats/c1/messages?account_id="+acc, nil), key))
+	if rec.Code != 200 {
+		t.Fatalf("list messages: %d %s", rec.Code, rec.Body.String())
+	}
+	var page struct {
+		Items []model.ChatMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]model.ChatMessage{}
+	for _, m := range page.Items {
+		byID[m.ID] = m
+	}
+	if got := byID["M1"].Sender; got.Name != "Ada" || got.Phone != "+919888000001" || got.IsSelf {
+		t.Fatalf("inbound sender = %+v", got)
+	}
+	if got := byID["M2"].Sender; got.Name != "Me" || !got.IsSelf {
+		t.Fatalf("own-message sender = %+v", got)
+	}
+	// The single-message route reads through the same select.
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest("GET", "/api/v1/chats/c1/messages/M1?account_id="+acc, nil), key))
+	var one model.ChatMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &one); err != nil {
+		t.Fatal(err)
+	}
+	if one.Sender.Name != "Ada" {
+		t.Fatalf("get message sender = %+v", one.Sender)
+	}
+}
+
+// Before the roster has produced a self attendee, a send has no stable sender
+// id to record. It must leave the id empty rather than mint the account's
+// E.164 identifier, which is not the …@s.whatsapp.net JID the roster uses and
+// would 404 on GET /api/v1/attendees/{id}.
+func TestSendWithoutSelfAttendeeLeavesSenderIDEmpty(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID) // seeds attendee a1, which is not is_self
+	if _, err := db.SelfAttendee(acc); err == nil {
+		t.Fatal("test premise: this account must have no self attendee yet")
+	}
+	s.fake().SendResult = provider.SendResult{MessageID: "M1"}
+	req := withKey(httptest.NewRequest("POST", "/api/v1/chats/c1/messages?account_id="+acc, strings.NewReader(`{"text":"hi"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != 201 {
+		t.Fatalf("send: %d %s", rec.Code, rec.Body.String())
+	}
+	var msg model.ChatMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Sender.ID != "" {
+		t.Fatalf("sender id = %q, want empty (a minted id no /attendees lookup resolves)", msg.Sender.ID)
+	}
+	// is_from_me is what identifies the message as ours; the sender attendee
+	// simply is not resolvable yet, and the next roster pull fills it in.
+	if !msg.IsFromMe {
+		t.Fatalf("own send must still be is_from_me: %+v", msg)
+	}
+}

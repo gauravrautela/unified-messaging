@@ -31,6 +31,13 @@ var (
 	// ErrNotFound is a missing message, folder, or subscription.
 	ErrNotFound = errors.New("provider: not found")
 
+	// ErrNotConnected means the account is known and healthy but has no live
+	// session to the provider right now — a chat socket in backoff, say.
+	// Deliberately distinct from ErrNotFound: the resource exists, the caller
+	// owns it, and the right answer is to retry or reconnect, not to conclude
+	// it is gone.
+	ErrNotConnected = errors.New("provider: not connected")
+
 	// ErrSubscriptionExists means an equivalent push subscription is already
 	// registered upstream, typically because our local record was lost.
 	ErrSubscriptionExists = errors.New("provider: subscription already exists")

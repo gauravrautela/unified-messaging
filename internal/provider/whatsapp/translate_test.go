@@ -10,6 +10,8 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/gauravrautela/unified-messaging/internal/model"
 )
 
 func TestAttendeeFromPhoneAndLID(t *testing.T) {
@@ -106,5 +108,32 @@ func TestReceiptStatus(t *testing.T) {
 	}
 	if _, ok := receiptStatus(types.ReceiptTypeSender); ok {
 		t.Fatal("sender receipts must be ignored")
+	}
+}
+
+// The roster is built from two passes — group participants first (which
+// resolves names through the contact store) and then the contact list. A
+// contact with no name at all must not blank the name the group pass already
+// resolved for the same person.
+func TestRememberAttendeeKeepsAResolvedName(t *testing.T) {
+	seen := map[string]model.Attendee{}
+	resolved := model.Attendee{ID: "919888000000@s.whatsapp.net", Phone: "+919888000000", Name: "Ada"}
+	rememberAttendee(seen, resolved)
+	rememberAttendee(seen, model.Attendee{ID: "919888000000@s.whatsapp.net"})
+	if got := seen[resolved.ID]; got.Name != "Ada" || got.Phone != "+919888000000" {
+		t.Fatalf("a barer record blanked a resolved name or phone: %+v", got)
+	}
+	// A name arriving later still wins over a blank one.
+	seen = map[string]model.Attendee{}
+	rememberAttendee(seen, model.Attendee{ID: resolved.ID})
+	rememberAttendee(seen, resolved)
+	if got := seen[resolved.ID]; got.Name != "Ada" {
+		t.Fatalf("resolved name did not replace the blank one: %+v", got)
+	}
+	// Anything else about the newer record still overwrites: only the name is
+	// protected, and only against being blanked.
+	rememberAttendee(seen, model.Attendee{ID: resolved.ID, Name: "Ada L", IsSelf: true})
+	if got := seen[resolved.ID]; got.Name != "Ada L" || !got.IsSelf {
+		t.Fatalf("newer record did not win: %+v", got)
 	}
 }
