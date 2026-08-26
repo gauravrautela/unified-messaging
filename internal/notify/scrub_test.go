@@ -61,6 +61,26 @@ func TestScrubAndMaskDiscordURLRequireDiscordHost(t *testing.T) {
 	}
 }
 
+// The API rejects a Discord URL with a port, but a scrubber that only ever
+// runs on trusted input is no scrubber at all: a hook stored before that check
+// existed, or written straight to the store, must still be masked.
+func TestScrubToleratesADiscordPort(t *testing.T) {
+	u := "https://discord.com:8443/api/webhooks/1/SECRETTOKEN"
+	want := "https://discord.com:8443/api/webhooks/1/•••"
+	if got := MaskDiscordURL(u); got != want {
+		t.Errorf("MaskDiscordURL(%q) = %q, want %q", u, got, want)
+	}
+	got := Scrub(`Post "` + u + `": dial tcp: boom`)
+	if strings.Contains(got, "SECRETTOKEN") || !strings.Contains(got, "/api/webhooks/1/•••") {
+		t.Errorf("Scrub left the token behind a port: %q", got)
+	}
+	// A port must not turn a foreign host into a Discord one.
+	nonDiscord := "https://myservice.example.com:8443/api/webhooks/42/secret"
+	if got := Scrub(nonDiscord); got != nonDiscord {
+		t.Errorf("Scrub masked a non-discord host: %q", got)
+	}
+}
+
 func TestScrubErrHidesTelegramTokenAndDiscordToken(t *testing.T) {
 	err := ScrubErr(errors.New(`Post "https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage": dial tcp: timeout`))
 	if strings.Contains(err.Error(), "123456:ABC") || !strings.Contains(err.Error(), "bot•••/sendMessage") {

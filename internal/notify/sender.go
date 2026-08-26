@@ -67,8 +67,13 @@ func (r *Registry) For(kind string) (Sender, bool) {
 // ValidateTelegram checks the token/chat pair with getChat. A Telegram
 // rejection returns ErrTelegramRejected (wrapped); a transport problem
 // returns a plain error.
+//
+// The timeout is the only thing holding the create handler open (the server
+// sets no WriteTimeout), so it is deliberately tighter than the delivery
+// client's: a getChat that has not answered in 5 s is better reported as
+// 502 provider_error than left hanging on the caller.
 func (r *Registry) ValidateTelegram(ctx context.Context, botToken, chatID string) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_, err := telegramCall(ctx, r.client, r.telegramBase, botToken, "getChat", map[string]any{"chat_id": chatID})
 	return err
@@ -118,7 +123,10 @@ type discordSender struct{ client *http.Client }
 
 func (s discordSender) Send(ctx context.Context, h model.Webhook, ev model.Event, _ []byte, _ int) error {
 	body, _ := json.Marshal(map[string]any{
-		"content":          truncate(Format(ev, Markdown), discordMax),
+		// discordMax-1 leaves room for the ellipsis truncate appends when it
+		// cuts: the cap is inclusive and one rune over is a 400, which the
+		// dispatcher would retry seven times before dead-lettering.
+		"content":          truncate(Format(ev, Markdown), discordMax-1),
 		"allowed_mentions": map[string]any{"parse": []string{}},
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL, bytes.NewReader(body))
@@ -150,8 +158,9 @@ func (s telegramSender) Send(ctx context.Context, h model.Webhook, ev model.Even
 		return errors.New("telegram: config unreadable")
 	}
 	_, err := telegramCall(ctx, s.client, s.base, h.Telegram.BotToken, "sendMessage", map[string]any{
-		"chat_id":                  h.Telegram.ChatID,
-		"text":                     truncate(Format(ev, HTML), telegramMax),
+		"chat_id": h.Telegram.ChatID,
+		// telegramMax-1: see the discordMax-1 note above.
+		"text":                     truncate(Format(ev, HTML), telegramMax-1),
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
 	})

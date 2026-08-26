@@ -17,8 +17,10 @@ var (
 	// discordToken requires an actual Discord webhook host (discord.com or
 	// discordapp.com, optionally subdomained) so a developer's own webhook
 	// URL that merely happens to look like "/api/webhooks/<id>/<token>" is
-	// never masked.
-	discordToken = regexp.MustCompile(`(?i)(https?://(?:[a-z0-9-]+\.)?discord(?:app)?\.com/api/webhooks/\d+)/[^/\s"?]+`)
+	// never masked. An explicit ":port" is tolerated: the API rejects one at
+	// creation, but a hook stored before that check — or written straight to
+	// the store — must still be masked here.
+	discordToken = regexp.MustCompile(`(?i)(https?://(?:[a-z0-9-]+\.)?discord(?:app)?\.com(?::\d+)?/api/webhooks/\d+)/[^/\s"?]+`)
 )
 
 // Scrub removes credentials that transports embed in URLs: the Telegram bot

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
 )
@@ -85,6 +86,43 @@ func TestDiscordSenderTreats429AsFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "/api/webhooks/1/•••") ||
 		strings.Contains(err.Error(), "leaked-token") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Discord caps content at 2000 runes and Telegram text at 4096, both
+// inclusive. Overshooting by even one rune is a 400 — a permanent failure that
+// still burns the whole retry schedule — so the cut has to leave room for the
+// ellipsis truncate appends.
+func TestNotificationsStayWithinTransportCaps(t *testing.T) {
+	long := model.Event{Type: model.EventChatReceived, AccountID: "acc_1",
+		Chat: &model.Chat{Name: "Team"},
+		// The formatter caps the message text at chatSnippet, but a sender name
+		// is uncapped — as are a mail subject and its recipient list — so the
+		// rendered notification can be arbitrarily long.
+		Message: &model.ChatMessage{Sender: model.Attendee{Name: strings.Repeat("n", 5000)}, Text: strings.Repeat("x", 3000)}}
+
+	dsrv, dgot, _ := capture(t, 204, "")
+	ds, _ := NewRegistry(dsrv.Client()).For(model.WebhookKindDiscord)
+	if err := ds.Send(context.Background(), model.Webhook{Kind: model.WebhookKindDiscord,
+		URL: dsrv.URL + "/api/webhooks/1/tok"}, long, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	content, _ := (*dgot)[0]["content"].(string)
+	if n := utf8.RuneCountInString(content); n > discordMax {
+		t.Errorf("discord content = %d runes, want <= %d", n, discordMax)
+	}
+
+	tsrv, tgot, _ := capture(t, 200, `{"ok":true}`)
+	reg := NewRegistry(tsrv.Client())
+	reg.SetTelegramBase(tsrv.URL)
+	ts, _ := reg.For(model.WebhookKindTelegram)
+	if err := ts.Send(context.Background(), model.Webhook{Kind: model.WebhookKindTelegram,
+		Telegram: &model.TelegramTarget{BotToken: "123:ABC", ChatID: "-100"}}, long, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	text, _ := (*tgot)[0]["text"].(string)
+	if n := utf8.RuneCountInString(text); n > telegramMax {
+		t.Errorf("telegram text = %d runes, want <= %d", n, telegramMax)
 	}
 }
 
