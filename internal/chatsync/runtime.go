@@ -109,15 +109,13 @@ func (r *Runtime) Attach(accountID string) error {
 	// returned. Starting an actor then would wg.Add(1) on a WaitGroup a Wait
 	// has completed on — the reuse hazard the docs warn about — for a
 	// connection that is about to be torn down anyway.
+	// The check is repeated under r.mu right before wg.Add below, so a cancel
+	// landing between here and there cannot slip an actor past Wait().
 	r.mu.Lock()
-	runCtx := r.ctx
+	err := r.ctx.Err()
 	r.mu.Unlock()
-	// nil means Start has not run yet, which is not shutdown: Attach still
-	// works, exactly as it did before this guard.
-	if runCtx != nil {
-		if err := runCtx.Err(); err != nil {
-			return err
-		}
+	if err != nil {
+		return err
 	}
 	acct, err := r.store.GetAnyAccount(accountID)
 	if err != nil {
@@ -144,6 +142,10 @@ func (r *Runtime) Attach(accountID string) error {
 		// not a silent no-op. The old actor's own remove is identity-checked,
 		// so it cannot evict the replacement we are about to install.
 		delete(r.actors, accountID)
+	}
+	if err := r.ctx.Err(); err != nil {
+		r.mu.Unlock()
+		return err
 	}
 	if r.liveCount() >= r.opts.MaxAccounts {
 		r.mu.Unlock()

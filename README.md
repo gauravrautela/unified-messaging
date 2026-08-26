@@ -187,8 +187,9 @@ redirects and `notify_url` (if set) receives
 `{"status":"CREATED","account_id":"acc_…","identifier":"+15551234567","provider":"WHATSAPP"}`.
 Unlinking the device from the phone, or 30 consecutive reconnect failures,
 flips the account to `status: "CREDENTIALS"` and emits `account_status` —
-exactly like a revoked Outlook token — and there is no way back for that
-account id; mint a fresh connect link to pair again. See
+exactly like a revoked Outlook token. Mint a fresh connect link to pair
+again: relinking the same number reuses the account id (the old device
+keys are forgotten first). See
 [`docs/whatsapp-manual-checklist.md`](docs/whatsapp-manual-checklist.md) for
 the full manual walkthrough with a real phone.
 
@@ -507,6 +508,9 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   emitted and its first POST loses it; once it has failed once it is in SQLite
   and survives restarts. The poll re-converges the data but those events are
   not replayed.
+- **The event queue is bounded.** When it is full, `Emit` pushes back on the
+  producer for up to 5 s and then drops the event; the running total is
+  exposed as `dropped_events` on `/healthz` and logged as `dropped_total`.
 - **Scope listing is not incremental** for Outlook — the folder tree is relisted
   each round. Cheap at mailbox scale, but it is a full listing, not a delta.
 - **Open signup, no password reset, no login rate limiting.** Anyone can

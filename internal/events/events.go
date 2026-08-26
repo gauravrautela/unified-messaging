@@ -101,12 +101,16 @@ func (d *Dispatcher) Start(ctx context.Context) {
 		defer wg.Done()
 		t := time.NewTicker(d.RetryPoll)
 		defer t.Stop()
+		// Retries post on the same non-cancelled context as fresh deliveries:
+		// ctx only decides when this loop stops, never whether an accepted
+		// POST is cut off mid-flight.
+		retryCtx := context.WithoutCancel(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				d.retryDue(ctx)
+				d.retryDue(ctx, retryCtx)
 			}
 		}
 	}()
@@ -260,7 +264,10 @@ func (d *Dispatcher) schedule(dl store.Delivery, cause error) {
 }
 
 // retryDue re-sends every delivery whose time has come.
-func (d *Dispatcher) retryDue(ctx context.Context) {
+// retryDue re-attempts every due delivery. stop ends the loop between
+// deliveries (shutdown); postCtx is what each POST runs under, so one that a
+// subscriber has already accepted is never aborted mid-flight.
+func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 	due, err := d.store.DueDeliveries(time.Now(), 100)
 	if err != nil {
 		d.log.Error("listing due deliveries", "err", err)
@@ -272,7 +279,7 @@ func (d *Dispatcher) retryDue(ctx context.Context) {
 		d.log.Debug("retry tick", "due", len(due))
 	}
 	for _, dl := range due {
-		if ctx.Err() != nil {
+		if stop.Err() != nil {
 			return
 		}
 		h, err := d.store.GetAnyWebhook(dl.WebhookID)
@@ -284,7 +291,7 @@ func (d *Dispatcher) retryDue(ctx context.Context) {
 			continue
 		}
 		dl.Attempts++
-		if err := d.post(ctx, h, dl, dl.Attempts); err != nil {
+		if err := d.post(postCtx, h, dl, dl.Attempts); err != nil {
 			d.schedule(dl, err)
 			continue
 		}
