@@ -117,8 +117,15 @@ var apiRoutes = []string{
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
+	// dropped_events is the one place a lost webhook notification is visible:
+	// an event discarded by a saturated dispatcher never reaches
+	// webhook_deliveries, so nothing else in the API can report it.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		var dropped int64
+		if s.dispatcher != nil {
+			dropped = s.dispatcher.Dropped()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "dropped_events": dropped})
 	})
 
 	// --- connection flow (browser-facing; no API key) ---

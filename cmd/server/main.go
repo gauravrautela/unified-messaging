@@ -57,8 +57,16 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The dispatcher outlives the signal context on purpose. Cancelling both at
+	// the same instant is what made the shutdown "drain" a no-op: the delivery
+	// worker returned with events still queued, and every in-flight POST was
+	// aborted mid-request. dispCancel runs only after the chat runtime has
+	// stopped producing events. Spec §5: HTTP -> Runtime.Wait (<=10s) ->
+	// dispatcher drain.
+	dispCtx, dispCancel := context.WithCancel(context.Background())
+	defer dispCancel()
 	dispatcher := events.NewDispatcher(db, log)
-	dispatcher.Start(ctx)
+	dispatcher.Start(dispCtx)
 
 	// The account manager and the providers are mutually dependent: providers
 	// need a token source, and refreshing a token needs the provider that issued
@@ -142,9 +150,35 @@ func run(log *slog.Logger) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("http shutdown", "err", err)
 	}
-	chat.Wait()
+	// The signal context is already cancelled here, so the actors are unwinding.
+	// whatsmeow's Connect ignores the context it is handed, so an actor stuck in
+	// a dial cannot be cancelled — bound the wait rather than let one hung
+	// socket carry the process to SIGKILL.
+	if !waitBounded(chat.Wait, chatWaitTimeout) {
+		log.Warn("chat runtime did not stop in time", "timeout", chatWaitTimeout)
+	}
+	dispCancel()
 	dispatcher.Wait()
+	if n := dispatcher.Dropped(); n > 0 {
+		log.Warn("events dropped during this process's lifetime", "dropped_total", n)
+	}
 	return nil
+}
+
+// chatWaitTimeout is the spec's bound on Runtime.Wait during shutdown.
+const chatWaitTimeout = 10 * time.Second
+
+// waitBounded runs wait and reports whether it finished within d. The goroutine
+// it leaks on a timeout dies with the process moments later.
+func waitBounded(wait func(), d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { defer close(done); wait() }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 func logLevel() slog.Level {

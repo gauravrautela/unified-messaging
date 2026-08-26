@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
@@ -42,9 +43,17 @@ type Dispatcher struct {
 	queue  chan model.Event
 	done   chan struct{}
 
+	// dropped counts events discarded because the queue stayed full for
+	// EmitBlock. It is the only signal that anything was lost, so it is
+	// reported on /healthz as well as logged.
+	dropped atomic.Int64
+
 	// RetrySchedule and RetryPoll are settable before Start.
 	RetrySchedule []time.Duration
 	RetryPoll     time.Duration
+	// EmitBlock bounds how long Emit blocks on a full queue before giving up
+	// on the event. Settable before Start; tests shorten it.
+	EmitBlock time.Duration
 }
 
 func NewDispatcher(s *store.Store, log *slog.Logger) *Dispatcher {
@@ -52,14 +61,16 @@ func NewDispatcher(s *store.Store, log *slog.Logger) *Dispatcher {
 		store:  s,
 		log:    log.With("component", "events"),
 		client: &http.Client{Timeout: 15 * time.Second},
-		// Buffered so a slow subscriber never stalls the sync loop. If this
-		// fills, events are dropped with a warning rather than blocking sync.
-		// Once a delivery has been attempted it lives in the store, so only
-		// the first attempt is at risk here.
+		// Buffered so a slow subscriber never stalls the sync loop for the
+		// common burst. Once it fills, Emit blocks the producer for EmitBlock
+		// (see Emit) and only then drops, counting what it dropped: a delivery
+		// becomes durable at its first attempt, so an event dropped here is
+		// never written to webhook_deliveries and cannot be replayed.
 		queue:         make(chan model.Event, 1024),
 		done:          make(chan struct{}),
 		RetrySchedule: DefaultRetrySchedule,
 		RetryPoll:     30 * time.Second,
+		EmitBlock:     5 * time.Second,
 	}
 }
 
@@ -74,6 +85,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				d.drain(ctx)
 				return
 			case ev := <-d.queue:
 				d.deliver(ctx, ev)
@@ -100,14 +112,71 @@ func (d *Dispatcher) Start(ctx context.Context) {
 // delivery off mid-flight.
 func (d *Dispatcher) Wait() { <-d.done }
 
+// Dropped reports how many events have been discarded because the queue was
+// full for longer than EmitBlock. Non-zero means webhook subscribers missed
+// notifications that were never persisted and cannot be replayed.
+func (d *Dispatcher) Dropped() int64 { return d.dropped.Load() }
+
 func (d *Dispatcher) Emit(ev model.Event) {
 	if ev.Timestamp.IsZero() {
 		ev.Timestamp = time.Now().UTC()
 	}
+	// Fast path: the queue almost always has room, and an emitter must not pay
+	// for a timer it will not use.
 	select {
 	case d.queue <- ev:
+		return
 	default:
-		d.log.Warn("event queue full, dropping", "type", ev.Type, "account_id", ev.AccountID)
+	}
+	// Full queue: push back on the emitter rather than discard. The producers
+	// are per-account actors whose events the provider replays on reconnect and
+	// whose handlers are idempotent, so blocking them is the spec's
+	// back-pressure rule. The bound is what keeps an API request that emits
+	// inline from hanging on a stuck subscriber forever.
+	t := time.NewTimer(d.EmitBlock)
+	defer t.Stop()
+	select {
+	case d.queue <- ev:
+	case <-t.C:
+		n := d.dropped.Add(1)
+		d.log.Warn("event queue full, dropping", "type", ev.Type, "account_id", ev.AccountID,
+			"dropped_total", n)
+	}
+}
+
+// drainDeadline bounds the shutdown drain: whatever is already queued gets one
+// attempt, but a stuck subscriber must not hold the process open past the
+// platform's own termination grace period.
+const drainDeadline = 5 * time.Second
+
+// drain makes a best-effort first attempt at everything still queued when the
+// dispatcher is cancelled. Without it, Wait() only looked like the spec's
+// "dispatcher drain": a first attempt is what makes a delivery durable, so an
+// event discarded here is lost for good rather than retried from the store.
+//
+// The POSTs deliberately run on a context detached from the cancelled one —
+// requests built from ctx would abort mid-flight and be rescheduled even where
+// the subscriber had already accepted them.
+func (d *Dispatcher) drain(ctx context.Context) {
+	if len(d.queue) == 0 {
+		return
+	}
+	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainDeadline)
+	defer cancel()
+	n := 0
+	for {
+		select {
+		case ev := <-d.queue:
+			d.deliver(drainCtx, ev)
+			n++
+			if drainCtx.Err() != nil {
+				d.log.Warn("shutdown drain cut short", "delivered", n, "remaining", len(d.queue))
+				return
+			}
+		default:
+			d.log.Info("shutdown drain complete", "delivered", n)
+			return
+		}
 	}
 }
 

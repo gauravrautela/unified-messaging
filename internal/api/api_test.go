@@ -2104,3 +2104,25 @@ func TestReconnectWithoutChatRuntimeIs503(t *testing.T) {
 		t.Fatalf("reconnect without chat runtime: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// A dropped event is a silent, unrecoverable loss of a webhook notification
+// (it never reaches webhook_deliveries), so the count has to be visible
+// somewhere an operator already looks.
+func TestHealthzReportsDroppedEvents(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz = %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ok" {
+		t.Fatalf("healthz body = %v", body)
+	}
+	if _, ok := body["dropped_events"]; !ok {
+		t.Fatalf("healthz does not report the dropped-event counter: %v", body)
+	}
+}

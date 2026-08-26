@@ -244,3 +244,95 @@ func TestPayloadIdentifiesWebhook(t *testing.T) {
 		t.Fatalf("payload webhook = %+v, want {wh_1 crm-sync}", got.Webhook)
 	}
 }
+
+// --- back-pressure (I1) ---
+
+// A full queue must push back on the emitter rather than silently discarding
+// the event: the actor that produced it is the one place that can slow down,
+// and its handlers are idempotent, so blocking there is safe. Only after the
+// bound elapses may an event be dropped, and a dropped event must be counted.
+func TestEmitBlocksWhileQueueIsFullThenDropsAndCounts(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	log, recs := logx.Capture()
+	d := NewDispatcher(db, log)
+	d.EmitBlock = 80 * time.Millisecond
+
+	ev := model.Event{Type: model.EventMailReceived, AccountID: "acc_1"}
+	for i := 0; i < cap(d.queue); i++ {
+		d.Emit(ev)
+	}
+	if d.Dropped() != 0 {
+		t.Fatalf("filling the queue dropped %d events", d.Dropped())
+	}
+
+	start := time.Now()
+	d.Emit(ev)
+	waited := time.Since(start)
+	if waited < 60*time.Millisecond {
+		t.Fatalf("Emit returned after %v on a full queue; it must block for EmitBlock first", waited)
+	}
+	if got := d.Dropped(); got != 1 {
+		t.Fatalf("Dropped() = %d, want 1", got)
+	}
+	if !recs.Contains("dropped_total") {
+		t.Fatalf("drop was not logged with a running total: %v", recs.All())
+	}
+}
+
+// The blocking fallback is a bound, not a sleep: as soon as the consumer takes
+// one event the emitter proceeds, and nothing is dropped.
+func TestEmitProceedsWhenQueueDrainsWithinBound(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, log)
+	d.EmitBlock = 2 * time.Second
+
+	ev := model.Event{Type: model.EventMailReceived, AccountID: "acc_1"}
+	for i := 0; i < cap(d.queue); i++ {
+		d.Emit(ev)
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		<-d.queue
+	}()
+	start := time.Now()
+	d.Emit(ev)
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("Emit waited %v after the queue drained", waited)
+	}
+	if got := d.Dropped(); got != 0 {
+		t.Fatalf("Dropped() = %d, want 0", got)
+	}
+}
+
+// --- drain on shutdown (I2) ---
+
+// Cancelling the dispatcher's context must not throw away events that are
+// already queued: Wait() is documented as a drain, and until this landed it
+// only looked like one.
+func TestDeliveryWorkerDrainsQueuedEventsOnShutdown(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	rcv := newReceiver(t, http.StatusOK)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1",
+		URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, log)
+	for i := 0; i < 3; i++ {
+		d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already shutting down when the worker starts
+	d.Start(ctx)
+	d.Wait()
+
+	if rcv.count() != 3 {
+		t.Fatalf("delivered %d of 3 queued events on shutdown", rcv.count())
+	}
+}
