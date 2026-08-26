@@ -4,6 +4,7 @@ package logx
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type ctxKey struct{}
@@ -35,15 +37,49 @@ func NewRequestID() string {
 	return "req_" + hex.EncodeToString(b)
 }
 
+// digestKey keys Digest. It defaults to a value generated once per process, so
+// a service that never calls SetDigestKey still gets handles nobody can
+// precompute — they just stop correlating across restarts. Read on every
+// logged chat id, from every actor goroutine, so it is swapped atomically.
+var digestKey atomic.Pointer[[]byte]
+
+func init() {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		panic("logx: no entropy for the digest key: " + err.Error())
+	}
+	digestKey.Store(&k)
+}
+
+// SetDigestKey fixes the key Digest uses, so handles stay comparable across
+// restarts and across the instances of a deployment. Call it once, at startup,
+// before anything digests: the service passes the same 32-byte key it seals
+// tokens with. An empty key is ignored — it would be a silent downgrade to the
+// unkeyed hash this exists to avoid.
+func SetDigestKey(key []byte) {
+	if len(key) == 0 {
+		return
+	}
+	k := append([]byte(nil), key...)
+	digestKey.Store(&k)
+}
+
 // Digest returns a short, stable, one-way handle for an identifier that is
 // itself sensitive — a chat id that happens to be a phone number, say.
 //
-// It is for correlation, not identification: the same input always yields the
-// same handle, so lines about one conversation can be tied together, but the
-// original value cannot be read back out of a log.
+// It is for correlation, not identification: within a process (and across
+// processes sharing a key via SetDigestKey) the same input always yields the
+// same handle, so lines about one conversation can be tied together.
+//
+// It is an HMAC, not a bare hash, precisely because the inputs come from a
+// small space: an E.164 number has around 10^12 candidates, so an unkeyed
+// truncated SHA-256 is invertible by anyone who can build a table over a
+// country's numbering plan. Without the key, a handle cannot be tied back to
+// the number that produced it.
 func Digest(s string) string {
-	sum := sha256.Sum256([]byte(s))
-	return "h_" + hex.EncodeToString(sum[:])[:12]
+	mac := hmac.New(sha256.New, *digestKey.Load())
+	mac.Write([]byte(s))
+	return "h_" + hex.EncodeToString(mac.Sum(nil))[:12]
 }
 
 // secretKeys are matched as substrings of lower-cased map keys.

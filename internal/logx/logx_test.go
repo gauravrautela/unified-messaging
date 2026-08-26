@@ -2,6 +2,8 @@ package logx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -95,5 +97,41 @@ func TestDigest(t *testing.T) {
 	}
 	if Digest("") == "" {
 		t.Fatal("digest of an empty string must still be a handle")
+	}
+}
+
+// A digest is the mechanism behind the spec's "never logged: phone numbers of
+// attendees". An unkeyed truncated SHA-256 does not provide that: an E.164 JID
+// is drawn from a space small enough that a rainbow table over a country's
+// numbering plan inverts every handle. Keying it is what makes the doc
+// comment's claim true.
+func TestDigestIsKeyed(t *testing.T) {
+	const phone = "919888000000@s.whatsapp.net"
+
+	SetDigestKey([]byte("00000000000000000000000000000001"))
+	first := Digest(phone)
+	if first != Digest(phone) {
+		t.Fatal("digest must stay stable within a process for a fixed key")
+	}
+
+	SetDigestKey([]byte("00000000000000000000000000000002"))
+	second := Digest(phone)
+	if first == second {
+		t.Fatal("digest is not keyed: two different keys produced the same handle")
+	}
+	if !strings.HasPrefix(second, "h_") || len(second) != len("h_")+12 {
+		t.Fatalf("keying changed the handle shape: %q", second)
+	}
+
+	// The plain SHA-256 an attacker would precompute must not match.
+	sum := sha256.Sum256([]byte(phone))
+	if unkeyed := "h_" + hex.EncodeToString(sum[:])[:12]; second == unkeyed || first == unkeyed {
+		t.Fatal("digest is still a bare truncated SHA-256")
+	}
+
+	// An empty key is ignored rather than silently weakening the digest.
+	SetDigestKey(nil)
+	if Digest(phone) != second {
+		t.Fatal("SetDigestKey(nil) must not replace the key in use")
 	}
 }

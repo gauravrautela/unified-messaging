@@ -19,6 +19,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/chatsync"
 	"github.com/gauravrautela/unified-messaging/internal/config"
 	"github.com/gauravrautela/unified-messaging/internal/events"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
@@ -45,6 +46,12 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	// Keys logx.Digest, the one-way handle chat ids and phone numbers are logged
+	// through. Unkeyed it is invertible by table lookup over a numbering plan;
+	// keyed with the same secret that seals tokens, handles still correlate
+	// across restarts and deployments but say nothing to anyone else.
+	logx.SetDigestKey(cfg.TokenKey)
 
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
