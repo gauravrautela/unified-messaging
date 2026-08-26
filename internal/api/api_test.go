@@ -1143,6 +1143,11 @@ func TestDocsPageIsPublicAndCoversEveryRoute(t *testing.T) {
 			t.Errorf("docs page missing %q", want)
 		}
 	}
+	for _, want := range []string{"chat_received", "Linked devices", "Idempotency-Key"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("docs page missing %q", want)
+		}
+	}
 }
 
 func TestDashboardAndMailLinkToDocs(t *testing.T) {
@@ -1179,6 +1184,11 @@ func TestLLMsTxtIsPublicMarkdownCoveringEveryRoute(t *testing.T) {
 		}
 	}
 	for _, want := range []string{"# ", "Authorization: Bearer", "X-Outlook-Signature", "mail_received", "session_required", "account_id"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("llms.txt missing %q", want)
+		}
+	}
+	for _, want := range []string{"chat_received", "Linked devices", "Idempotency-Key"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("llms.txt missing %q", want)
 		}

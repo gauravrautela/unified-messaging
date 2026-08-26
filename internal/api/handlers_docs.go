@@ -36,6 +36,8 @@ func routeGroup(path string) string {
 		return "Webhooks"
 	case strings.HasPrefix(path, "/api/v1/accounts"):
 		return "Accounts"
+	case strings.HasPrefix(path, "/api/v1/chats"), strings.HasPrefix(path, "/api/v1/attendees"):
+		return "Chat"
 	default:
 		return "Mail"
 	}
@@ -90,11 +92,12 @@ footer{margin-top:3rem;color:var(--muted);font-size:.85rem}
   <a href="#read">4. Read mail</a>
   <a href="#write">5. Send &amp; update</a>
   <a href="#webhooks">6. Webhooks</a>
-  <a href="#lifecycle">7. Account lifecycle</a>
-  <a href="#errors">8. Errors &amp; debugging</a>
-  <a href="#walkthrough">9. Full walkthrough</a>
-  <a href="#reference">10. Endpoint reference</a>
-  <a href="#limits">11. Known limits</a>
+  <a href="#chat">7. Chat (WhatsApp)</a>
+  <a href="#lifecycle">8. Account lifecycle</a>
+  <a href="#errors">9. Errors &amp; debugging</a>
+  <a href="#walkthrough">10. Full walkthrough</a>
+  <a href="#reference">11. Endpoint reference</a>
+  <a href="#limits">12. Known limits</a>
 </nav>
 <main>
 
@@ -102,12 +105,12 @@ footer{margin-top:3rem;color:var(--muted);font-size:.85rem}
 <p class="sub">Everything an integrator needs to connect end users&rsquo; mailboxes, read and send mail through one API, and receive webhooks when new mail arrives. Base URL for this deployment: <code>{{.Base}}</code>. Building with an AI assistant? Give it <a href="/llms.txt"><code>/llms.txt</code></a> &mdash; the same guide as exact, machine-readable Markdown.</p>
 
 <h2 id="overview">1. Overview</h2>
-<p>The service sits between your application and your users&rsquo; mail providers (Outlook / Microsoft 365 today). You never see a provider payload &mdash; every message, folder and event comes back in one normalized shape.</p>
+<p>The service sits between your application and your users&rsquo; mail and chat providers (Outlook / Microsoft 365, and WhatsApp). You never see a provider payload &mdash; every message, folder, chat and event comes back in one normalized shape.</p>
 <table>
 <tr><th>Concept</th><th>What it is</th></tr>
 <tr><td><b>Developer</b></td><td>You. One login (email + password) on the <a href="/dashboard">dashboard</a>, owning everything below.</td></tr>
 <tr><td><b>API key</b></td><td>A bearer token your server sends on every API call. Create as many as you like; revoke individually.</td></tr>
-<tr><td><b>Account</b></td><td>One connected mailbox belonging to one of <i>your</i> end users. Identified by <code>account_id</code>. Everything mail-related is scoped to an account.</td></tr>
+<tr><td><b>Account</b></td><td>One connected mailbox or WhatsApp number belonging to one of <i>your</i> end users &mdash; <code>kind: "mail"|"chat"</code>. Identified by <code>account_id</code>. Everything mail- or chat-related is scoped to an account.</td></tr>
 <tr><td><b>Webhook</b></td><td>A URL you own that we POST normalized events to (<code>mail_received</code> and friends), signed and retried.</td></tr>
 </table>
 <div class="note">Tenancy is strict: an account, webhook or email that belongs to another developer answers <b>404</b>, never 403 &mdash; ids are not enumerable across tenants.</div>
@@ -268,7 +271,70 @@ const ok = crypto.timingSafeEqual(Buffer.from(want), Buffer.from(req.get("X-Outl
 <li>Inspect the queue for a hook: <code>GET /api/v1/webhooks/{id}/deliveries</code> lists pending and dead deliveries with <code>attempts</code>, <code>next_attempt_at</code> and <code>last_error</code>.</li>
 </ul>
 
-<h2 id="lifecycle">7. Account lifecycle</h2>
+<h2 id="chat">7. Chat (WhatsApp)</h2>
+<div class="note warn">WhatsApp is integrated through the <b>linked-device model</b> &mdash; the same mechanism as whatsapp.web.com &mdash; not the official WhatsApp Business API. The end user links this service as an additional device on their phone by scanning a QR code; nothing is registered as a business number. Meta can ban a number it judges to be automating WhatsApp, so treat this like any other unofficial client: message at a human pace, never send unsolicited bulk messages, and make sure the person you are connecting understands and accepts that risk. The consent screen below exists so they see this before a QR code ever appears.</div>
+<p>Device keys (the credentials that keep the phone's linked-device session alive) are written by whatsmeow into tables inside this service's own SQLite file, <b>unsealed</b> &mdash; unlike OAuth refresh tokens, which are AES-256-GCM sealed before they touch disk. Anyone who can read the database file can impersonate a linked WhatsApp device. Run this behind disk-level or filesystem encryption if you turn WhatsApp on for anything beyond local testing.</p>
+<h3>7.1 Link a number</h3>
+<p>Same <code>hosted-auth</code> call as mail, naming the provider:</p>
+<pre><code>curl -s -X POST {{.Base}}/api/v1/hosted-auth \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"provider": "WHATSAPP", "notify_url": "https://api.example.com/hooks/wa-connected"}'
+# {"url":"{{.Base}}/connect/&lt;state&gt;","state":"…","provider":"WHATSAPP","expires_at":"…"}</code></pre>
+<div class="note">There is no default provider once WhatsApp is enabled: an unnamed <code>hosted-auth</code> call still resolves to the sole registered <i>mail</i> provider (unambiguous while exactly one is registered), never to a chat provider. Naming <code>"provider"</code> is required to connect WhatsApp, and required for mail too the moment a second mail provider ever joins the registry. An ambiguous, unnamed call gets <code>400 {"error":{"code":"unknown_provider","message":"provider is required"}}</code>.</div>
+<p>Opening <code>url</code> shows a disclosure page instead of a provider sign-in screen &mdash; there is no third-party consent screen to redirect to, since WhatsApp itself never sees this as an OAuth client. The end user must tick the consent checkbox before a QR code is requested:</p>
+<ol class="steps">
+<li><code>GET /connect/{state}</code> renders the disclosure and a hidden QR area.</li>
+<li><code>POST /connect/{state}/consent</code> (no body) records acceptance. <code>204</code>; <code>410</code> if the link already expired.</li>
+<li><code>GET /connect/{state}/qr</code>, polled every ~2s: <code>409 consent_required</code> before step 2 runs; afterwards <code>{"status":"waiting"}</code>, then <code>{"status":"waiting","png_base64":"…","expires_in":170}</code> once whatsmeow has a code, then <code>{"status":"paired","account_id":"acc_…"}</code> (or <code>"expired"</code>/<code>"failed"</code>) once the phone scans it or the ~3&nbsp;minute pairing window elapses.</li>
+</ol>
+<p><code>notify_url</code> and the account shape on success are exactly the mail flow's, with a WhatsApp phone number where mail has an email address:</p>
+<pre><code>{"status":"CREATED","account_id":"acc_…","identifier":"+15551234567","provider":"WHATSAPP"}</code></pre>
+<p>The account object adds a live <code>connection</code>, absent on mail accounts:</p>
+<pre><code>{"id":"acc_…","provider":"WHATSAPP","kind":"chat","identifier":"+15551234567","status":"OK",
+ "connection":{"state":"connected","since":"2026-08-24T09:00:00Z","reconnects":0}}</code></pre>
+<h3>7.2 Objects</h3>
+<table>
+<tr><th>Object</th><th>Shape</th></tr>
+<tr><td>Chat</td><td><code>{id, account_id, kind: "direct"|"group", name, unread_count, last_message_at?, archived, muted, members?: [Attendee]}</code></td></tr>
+<tr><td>Attendee</td><td><code>{id, phone?, name, is_self}</code> &mdash; <code>id</code> is the stable provider id (phone JID when known); <code>phone</code> is E.164 when resolvable</td></tr>
+<tr><td>ChatMessage</td><td><code>{id, account_id, chat_id, sender: Attendee, is_from_me, kind: "text"|"unsupported", text, quoted_message_id?, sent_at, edited_at?, deleted, status?, reactions: [Reaction]}</code></td></tr>
+<tr><td>Reaction</td><td><code>{attendee_id, emoji, at}</code></td></tr>
+<tr><td>Connection</td><td><code>{state: "connecting"|"connected"|"backoff"|"stopped"|"error", since, reconnects, last_error?}</code> &mdash; chat accounts only</td></tr>
+</table>
+<h3>7.3 Chats &amp; messages</h3>
+<pre><code>curl -s "{{.Base}}/api/v1/chats?account_id=$ACC&amp;limit=50" -H "Authorization: Bearer $API_KEY"
+# {"items":[Chat, …], "limit":50, "offset":0}
+
+curl -s "{{.Base}}/api/v1/chats/$CHAT_ID/messages?account_id=$ACC&amp;limit=50" -H "Authorization: Bearer $API_KEY"
+# {"items":[ChatMessage, …], "next_before":"…"}   # paginate with ?before=&lt;that value&gt;, newest first</code></pre>
+<pre><code>curl -s -X POST "{{.Base}}/api/v1/chats/$CHAT_ID/messages?account_id=$ACC" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"text": "On my way", "quoted_message_id": "…"}'
+# 201 ChatMessage
+
+curl -s -X POST "{{.Base}}/api/v1/chats?account_id=$ACC" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"account_id": "acc_…", "phone": "+15559876543", "text": "Hi!"}'
+# 201 {"chat": Chat, "message": ChatMessage}   # starts a new direct chat and sends the first message in one call</code></pre>
+<p><code>PATCH /api/v1/chats/{id}</code> takes <code>{"read": true}</code> (marks every message in the chat read on the phone too), <code>{"archived": true}</code> and/or <code>{"muted": true}</code>.</p>
+<p>Edit, delete and react act on the message id: <code>PATCH /api/v1/chats/{id}/messages/{mid}</code> (<code>{"text": "…"}</code>), <code>DELETE</code> (204, revokes for everyone), <code>PUT .../reaction</code> (<code>{"emoji": "👍"}</code>, empty string removes it). All three return <code>403 not_own_message</code> on a message you did not send &mdash; WhatsApp itself has no concept of editing someone else's message.</p>
+<div class="note"><code>Idempotency-Key</code> is honored on every chat write (send, edit, delete, react, start-chat). It is scoped per developer and per operation (method + path + account + body): the same key with the same body replays the original response; the same key with a <b>different</b> body is a client bug and gets <code>409 idempotency_conflict</code>. Optional but recommended for sends, since a retried network timeout must never double-send a message.</div>
+<h3>7.4 Reconnect</h3>
+<p>A chat account's socket can drop on its own (network blip, phone offline); the runtime reconnects with backoff automatically. <code>POST /api/v1/accounts/{id}/reconnect</code> forces it now &mdash; the chat counterpart of mail's <code>resync</code> &mdash; and, like resync, is rejected with <code>400 unsupported_for_kind</code> on a mail account.</p>
+<h3>7.5 Events</h3>
+<p>The same webhook mechanism as mail, with chat-specific types:</p>
+<table>
+<tr><th>Type</th><th>When</th></tr>
+<tr><td><code>chat_received</code></td><td>An inbound message arrived. Carries the <code>ChatMessage</code> and its <code>Chat</code>.</td></tr>
+<tr><td><code>chat_sent</code></td><td>A message sent through the API (or echoed back by the phone) was recorded.</td></tr>
+<tr><td><code>chat_updated</code></td><td>A message was edited, marked read, or a chat's <code>archived</code>/<code>muted</code> flags changed.</td></tr>
+<tr><td><code>chat_reaction</code></td><td>A reaction was added or removed on a message.</td></tr>
+<tr><td><code>chat_deleted</code></td><td>A message was deleted/revoked.</td></tr>
+<tr><td><code>account_status</code></td><td>The account's connection state changed &mdash; see below. Can arrive at <b>any time</b>, independent of any request you made.</td></tr>
+</table>
+<h3>7.6 Connection loss and unlinking</h3>
+<p>Unlinking the device from the phone (WhatsApp &rarr; Settings &rarr; Linked devices &rarr; Log out) or 30 consecutive reconnect failures both flip the account to <code>status: "CREDENTIALS"</code> and emit <code>account_status</code>, exactly like a revoked mail token. There is no way to relink the same account id automatically &mdash; a WhatsApp logout is deliberate on the phone's part; mint a fresh <code>hosted-auth</code> connect link to pair a new device. A transient drop instead shows up as <code>connection.state: "backoff"</code> while the runtime retries (capped at 5&nbsp;minutes between attempts) without ever touching <code>status</code>.</p>
+<h2 id="lifecycle">8. Account lifecycle</h2>
 <table>
 <tr><th>Status</th><th>Meaning</th><th>What to do</th></tr>
 <tr><td><code>OK</code></td><td>Token valid, syncing.</td><td>Nothing.</td></tr>
@@ -279,22 +345,24 @@ const ok = crypto.timingSafeEqual(Buffer.from(want), Buffer.from(req.get("X-Outl
 <li><code>DELETE /api/v1/accounts/{id}</code> disconnects: tokens, mirror, subscriptions and per-account webhooks are removed.</li>
 </ul>
 
-<h2 id="errors">8. Errors &amp; debugging</h2>
+<h2 id="errors">9. Errors &amp; debugging</h2>
 <p>Every error is JSON with a stable machine-readable code:</p>
 <pre><code>{"error":{"code":"account_not_found","message":"no such account: acc_…"}}</code></pre>
 <table>
 <tr><th>Status</th><th>Codes</th></tr>
-<tr><td>400</td><td><code>invalid_body</code>, <code>missing_account_id</code>, <code>missing_recipients</code>, <code>invalid_webhook</code>, <code>invalid_url</code>, <code>unknown_folder_role</code>, <code>missing_name</code></td></tr>
+<tr><td>400</td><td><code>invalid_body</code>, <code>missing_account_id</code>, <code>missing_recipients</code>, <code>invalid_webhook</code>, <code>invalid_url</code>, <code>unknown_folder_role</code>, <code>missing_name</code>, <code>unknown_provider</code> (also "provider is required"), <code>unsupported_for_kind</code> (a mail route on a chat account or vice versa), <code>missing_text</code>, <code>missing_recipient</code>, <code>missing_emoji</code>, <code>empty_patch</code></td></tr>
 <tr><td>401</td><td><code>unauthorized</code> &mdash; missing, invalid or revoked key</td></tr>
-<tr><td>403</td><td><code>session_required</code> &mdash; key management needs the dashboard session</td></tr>
+<tr><td>403</td><td><code>session_required</code> &mdash; key management needs the dashboard session; <code>not_own_message</code> &mdash; editing, deleting or the like on a chat message you did not send</td></tr>
 <tr><td>404</td><td><code>account_not_found</code>, <code>not_found</code> &mdash; including anything owned by another developer</td></tr>
-<tr><td>409</td><td><code>account_not_ok</code>, <code>reconnect_required</code></td></tr>
+<tr><td>409</td><td><code>account_not_ok</code>, <code>reconnect_required</code>, <code>consent_required</code> (WhatsApp <code>/qr</code> polled before consent), <code>idempotency_conflict</code> (an <code>Idempotency-Key</code> reused with a different request)</td></tr>
+<tr><td>410</td><td><code>expired</code> &mdash; the connect link (or its ~3-minute WhatsApp pairing window) elapsed</td></tr>
 <tr><td>415</td><td><code>json_required</code> &mdash; dashboard-session writes must send <code>Content-Type: application/json</code></td></tr>
-<tr><td>502</td><td><code>provider_error</code> &mdash; the mail provider failed; the message carries its error code</td></tr>
+<tr><td>502</td><td><code>provider_error</code> &mdash; the mail or chat provider failed; the message carries its error code</td></tr>
+<tr><td>503</td><td><code>capacity</code> &mdash; the chat runtime is at <code>WHATSAPP_MAX_ACCOUNTS</code> live connections, or disabled</td></tr>
 </table>
 <p>Every response carries <code>X-Request-Id</code>. Send your own value in the request header to have it echoed and used in our logs; quote it when reporting a problem.</p>
 
-<h2 id="walkthrough">9. Full walkthrough</h2>
+<h2 id="walkthrough">10. Full walkthrough</h2>
 <pre><code>export API_KEY=um_…            # from the dashboard
 export BASE={{.Base}}
 
@@ -321,21 +389,26 @@ curl -s -X POST "$BASE/api/v1/emails/$MSG/reply?account_id=$ACC" -H "Authorizati
 # 6. from now on, every new inbound message is POSTed to https://api.example.com/hooks/mail
 #    verify X-Outlook-Signature, dedupe on (type, email.id), respond 2xx.</code></pre>
 
-<h2 id="reference">10. Endpoint reference</h2>
-<p>Generated from the routes this server registers. All require a developer credential; mail routes additionally require <code>?account_id</code> (or <code>account_id</code> in the JSON body for sends and drafts).</p>
+<h2 id="reference">11. Endpoint reference</h2>
+<p>Generated from the routes this server registers. All require a developer credential; mail and chat routes additionally require <code>?account_id</code> (or <code>account_id</code> in the JSON body for sends, drafts and <code>POST /api/v1/chats</code>).</p>
 <table>
 <tr><th>Group</th><th>Method</th><th>Path</th></tr>
 {{range .Routes}}<tr data-route="{{.Method}} {{.Path}}"><td>{{.Group}}</td><td><span class="m {{.Method}}">{{.Method}}</span></td><td><code>{{.Path}}</code></td></tr>
 {{end}}</table>
 
-<h2 id="limits">11. Known limits</h2>
+<h2 id="limits">12. Known limits</h2>
 <ul>
-<li>Outlook / Microsoft 365 is the only provider today. Calendar and contacts are not exposed.</li>
+<li>Outlook / Microsoft 365 and WhatsApp are the only providers today. Calendar and contacts are not exposed for either.</li>
 <li>Backfill is bounded (30 days by default); older mail is fetched on demand by <code>GET /api/v1/emails/{id}</code>.</li>
 <li>Inline attachment uploads are capped by the provider (~3&nbsp;MB).</li>
 <li>Webhook delivery is at-least-once; the very first attempt is in-memory, so a crash between an event and its first POST can lose it &mdash; the next sync re-converges the mirror but does not replay the event.</li>
 <li>Paging is offset-based; a mailbox that changes during pagination can shift items between pages.</li>
 <li>Webhook URLs are checked for literal private/loopback addresses only; hostnames are not resolved.</li>
+<li><b>WhatsApp: text only.</b> Media messages arrive as <code>kind: "unsupported"</code>; there is no way to send an attachment.</li>
+<li><b>WhatsApp: no history sync.</b> Linking a device only sees messages sent after pairing, the same as WhatsApp Web/Desktop.</li>
+<li><b>WhatsApp: QR linking only.</b> Phone-number pairing codes are not implemented.</li>
+<li><b>WhatsApp: one socket per account,</b> capped process-wide at <code>WHATSAPP_MAX_ACCOUNTS</code> (default 200); beyond that, connecting or reconnecting an account gets <code>503 capacity</code>.</li>
+<li><b>WhatsApp: reconnect backoff up to 5 minutes;</b> 30 consecutive failures flips the account to <code>status: "CREDENTIALS"</code> ("unreachable") rather than retrying forever.</li>
 </ul>
 
 <footer>Signed in? Manage keys and connected accounts on the <a href="/dashboard">dashboard</a>. Problems? Include the <code>X-Request-Id</code> from the failing response.</footer>

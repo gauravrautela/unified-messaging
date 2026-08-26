@@ -32,6 +32,18 @@ type Config struct {
 
 	// TokenKey is the 32-byte AES key protecting refresh tokens at rest.
 	TokenKey []byte
+
+	// WhatsAppEnabled turns on the WhatsApp adapter (a whatsmeow linked-device
+	// client) at startup. Off by default: it opens a socket per linked account
+	// and stores device keys unsealed in SQLite, so an operator opts in
+	// deliberately.
+	WhatsAppEnabled bool
+	// WhatsAppMaxAccounts caps how many WhatsApp accounts the chat runtime
+	// keeps a live socket open for at once.
+	WhatsAppMaxAccounts int
+	// WhatsAppDeviceName is what the end user sees in WhatsApp's own "Linked
+	// devices" list after pairing.
+	WhatsAppDeviceName string
 }
 
 func Load() (*Config, error) {
@@ -44,6 +56,10 @@ func Load() (*Config, error) {
 		Tenant:        env("MS_TENANT", "consumers"),
 		RedirectURI:   env("MS_REDIRECT_URI", "http://localhost:8080/oauth/callback"),
 		SessionTTL:    time.Duration(envInt("SESSION_TTL_DAYS", 30)) * 24 * time.Hour,
+
+		WhatsAppEnabled:     envBool("WHATSAPP_ENABLED", false),
+		WhatsAppMaxAccounts: envInt("WHATSAPP_MAX_ACCOUNTS", 200),
+		WhatsAppDeviceName:  env("WHATSAPP_DEVICE_NAME", "Unified Messaging"),
 	}
 
 	// offline_access is what earns us a refresh token; without it the
@@ -86,4 +102,14 @@ func envInt(k string, def int) int {
 		return def
 	}
 	return n
+}
+
+// envBool accepts "1" or "true" (case-insensitive) as truthy; anything else,
+// including unset, is false.
+func envBool(k string, def bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	return v == "1" || strings.EqualFold(v, "true")
 }

@@ -30,6 +30,11 @@ type Store struct {
 // tagged with component=store.
 func (s *Store) SetLogger(l *slog.Logger) { s.log = l }
 
+// DB exposes the underlying handle for a provider that needs to keep its own
+// tables in the same SQLite file — the WhatsApp adapter's whatsmeow device
+// store, notably — rather than opening a second connection to it.
+func (s *Store) DB() *sql.DB { return s.db }
+
 // trace records one query at DEBUG: which operation, how long it took, and the
 // ids involved. Never called with a token, secret, or hash column.
 func (s *Store) trace(op string, start time.Time, kv ...any) {

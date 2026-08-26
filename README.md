@@ -6,10 +6,15 @@ One Go service that connects end-user accounts over OAuth, keeps a local mirror
 in sync, exposes a provider-neutral REST API over it, and pushes normalized
 webhooks when messages arrive.
 
-**Outlook / Microsoft 365 is the first provider.** It is an implementation of
-the contracts in [`internal/provider`](internal/provider/provider.go), not the
-architecture. Nothing outside `internal/provider/outlook` knows Microsoft Graph
-exists.
+**Outlook / Microsoft 365 is the first provider; WhatsApp is the second.** Both
+are implementations of the contracts in
+[`internal/provider`](internal/provider/provider.go), not the architecture.
+Nothing outside `internal/provider/outlook` knows Microsoft Graph exists, and
+nothing outside `internal/provider/whatsapp` knows whatsmeow exists. Outlook is
+a **mail** provider (`kind: "mail"`, OAuth); WhatsApp is a **chat** provider
+(`kind: "chat"`, QR-linked) — see "Providers" below for what that split means
+for the API and for `internal/chatsync`, the chat counterpart of
+`internal/syncer`.
 
 **Status: proof of concept.** It proves the mechanisms that carry real risk.
 Multi-tenancy, API-key management and a developer dashboard are in; billing
@@ -20,12 +25,14 @@ developer) are still deliberately absent.
 
 ```
 internal/
-  model/        provider-neutral types — Account, Email, Folder, Event
+  model/        provider-neutral types — Account, Email, Chat, ChatMessage, Event
   provider/     the contracts every backend implements, plus a registry
-    outlook/    Microsoft Graph implementation
-  accounts/     identity and token custody, provider-agnostic
-  syncer/       backfill, incremental sync, push subscription upkeep
-  store/        SQLite: accounts, sealed tokens, cursors, the mail mirror
+    outlook/    Microsoft Graph implementation (mail)
+    whatsapp/   whatsmeow linked-device implementation (chat)
+  accounts/     identity and token/device custody, provider-agnostic
+  syncer/       mail: backfill, incremental sync, push subscription upkeep
+  chatsync/     chat: one persistent socket per linked account, reconnect/backoff
+  store/        SQLite: accounts, sealed tokens, cursors, the mail + chat mirror
   events/       normalized outbound webhooks
   api/          the HTTP surface
 ```
@@ -36,15 +43,17 @@ internal/
 
 | Area | Included |
 |---|---|
-| **Providers** | Contract-driven registry; a backend supplies an `Authenticator`, a `Mailbox`, and optionally a `Pusher` |
-| **Connect** | Auth-code + PKCE flow, single-use connect links, `notify_url` callback, silent token refresh, reconnect detection |
-| **Read** | List/get emails, threads, folders (with well-known roles), attachments, search, paging — served from the local store |
-| **Write** | Send, **reply and reply-all in-thread**, forward, drafts, attachments, mark read/flagged |
-| **Sync** | Bounded backfill, per-scope incremental cursors, push subscriptions with auto-renewal, lifecycle handling, polling as the safety net |
-| **Events** | `mail_received`, `mail_sent`, `mail_updated`, `mail_deleted`, `account_status` — HMAC-signed, retried |
+| **Providers** | Contract-driven registry; a mail backend supplies an `Authenticator` and a `Mailbox`, optionally a `Pusher`; a chat backend supplies a `Linker` and a `Chatter` |
+| **Connect (mail)** | Auth-code + PKCE flow, single-use connect links, `notify_url` callback, silent token refresh, reconnect detection |
+| **Connect (chat)** | Disclosure + explicit consent, QR pairing (whatsmeow), single-use connect links, same `notify_url` callback shape as mail |
+| **Read** | List/get emails, threads, folders (well-known roles), attachments, search, paging; list/get chats, messages, attendees — all served from the local store |
+| **Write** | Mail: send, **reply and reply-all in-thread**, forward, drafts, attachments, mark read/flagged. Chat: send, start a chat, edit, delete, react, mark read — with idempotent retries via `Idempotency-Key` |
+| **Sync** | Mail: bounded backfill, per-scope incremental cursors, push subscriptions with auto-renewal, polling as the safety net. Chat: one persistent socket per linked account with reconnect/backoff, capped account count |
+| **Events** | Mail: `mail_received`, `mail_sent`, `mail_updated`, `mail_deleted`. Chat: `chat_received`, `chat_sent`, `chat_updated`, `chat_reaction`, `chat_deleted`. Both: `account_status` — HMAC-signed, retried |
 
 Not included: calendar, contacts, open/click tracking, folder management, and
-any provider other than Outlook.
+any provider other than Outlook and WhatsApp. WhatsApp is text-only (no
+media) with no history sync.
 
 ---
 
@@ -130,6 +139,66 @@ Then set `PUBLIC_BASE_URL` to the HTTPS origin it prints, **add
 registration, point `MS_REDIRECT_URI` at it, and restart. Startup logs
 `push_notifications=true` when subscriptions are active.
 
+### 6. Optional: WhatsApp
+
+WhatsApp is integrated through the **linked-device model** — the same
+mechanism as `web.whatsapp.com` — not the official WhatsApp Business API. The
+end user links this service as an additional device on their own phone by
+scanning a QR code; nothing is registered as a business number, and there is
+no Meta app registration to do.
+
+> **Read this before turning it on.** Meta can ban a phone number it judges to
+> be automating WhatsApp (bulk sends, non-human pacing, spam reports). This is
+> exactly the risk every unofficial WhatsApp client carries. The connect flow
+> shows the end user a disclosure and requires an explicit consent click before
+> a QR code is ever generated — don't build a UI on top of it that skips or
+> hides that step. Send at a human pace; this is not a marketing/broadcast
+> channel.
+>
+> **Device keys are stored unsealed.** Unlike OAuth refresh tokens (sealed
+> with AES-256-GCM before touching disk — see "Token custody" below),
+> whatsmeow writes its own device-credential tables straight into this
+> service's SQLite file, in the clear: anyone who can read the database file
+> can impersonate a linked device. If you turn this on for anything beyond
+> local testing, put the database on encrypted disk (or run the whole host
+> encrypted-at-rest) — there is no application-level mitigation for this.
+
+Enable it:
+
+```bash
+WHATSAPP_ENABLED=true
+```
+
+Then connect the same way as a mailbox, naming the provider explicitly (an
+unnamed `hosted-auth` call only ever defaults to the sole *mail* provider —
+pairing a phone number is always something a caller must ask for by name):
+
+```bash
+curl -s -X POST localhost:8080/api/v1/hosted-auth \
+  -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"provider": "WHATSAPP"}' | jq -r .url
+```
+
+Opening that URL shows the disclosure above with a consent checkbox; ticking
+it and clicking through starts a pairing session and displays a QR code
+(`GET /connect/{state}/qr`, polled by the page). Scan it in WhatsApp on your
+phone: **Settings → Linked devices → Link a device**. On success the page
+redirects and `notify_url` (if set) receives
+`{"status":"CREATED","account_id":"acc_…","identifier":"+15551234567","provider":"WHATSAPP"}`.
+Unlinking the device from the phone, or 30 consecutive reconnect failures,
+flips the account to `status: "CREDENTIALS"` and emits `account_status` —
+exactly like a revoked Outlook token — and there is no way back for that
+account id; mint a fresh connect link to pair again. See
+[`docs/whatsapp-manual-checklist.md`](docs/whatsapp-manual-checklist.md) for
+the full manual walkthrough with a real phone.
+
+**Known limits:** text messages only (media arrives as `kind: "unsupported"`,
+none can be sent); no history sync (a newly linked device only sees messages
+sent after pairing, same as WhatsApp Web); QR linking only, no phone-number
+pairing codes; one live socket per account, capped process-wide by
+`WHATSAPP_MAX_ACCOUNTS`; reconnect backoff rises to 5 minutes between
+attempts.
+
 ---
 
 ## UI
@@ -170,12 +239,13 @@ All mail routes require `?account_id=…`.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/v1/providers` | Which backends are configured, and whether each supports push |
-| `POST` | `/api/v1/hosted-auth` | Mint a connect link. Body (all optional): `provider`, `success_redirect_url`, `failure_redirect_url`, `notify_url`, `expires_in_minutes`, `force_consent` |
+| `GET` | `/api/v1/providers` | `{items: [{name, kind: "mail"\|"chat", auth: "oauth"\|"link", push_notifications}]}` — WhatsApp reports `kind: "chat", auth: "link"` |
+| `POST` | `/api/v1/hosted-auth` | Mint a connect link. Body (all optional unless several providers of one kind are registered): `provider`, `success_redirect_url`, `failure_redirect_url`, `notify_url`, `expires_in_minutes`, `force_consent`. `provider` is **required** to connect WhatsApp — the unnamed-call default only ever resolves to a lone mail provider |
 | `GET` | `/api/v1/accounts` | |
-| `GET` | `/api/v1/accounts/{id}` | |
-| `DELETE` | `/api/v1/accounts/{id}` | Also removes the upstream push subscription |
-| `POST` | `/api/v1/accounts/{id}/resync` | Force a sync now |
+| `GET` | `/api/v1/accounts/{id}` | Chat accounts add `connection: {state, since, reconnects, last_error?}` |
+| `DELETE` | `/api/v1/accounts/{id}` | Mail: also removes the upstream push subscription. Chat: also logs the linked device out |
+| `POST` | `/api/v1/accounts/{id}/resync` | Mail only. Force a sync now; `400 unsupported_for_kind` on a chat account |
+| `POST` | `/api/v1/accounts/{id}/reconnect` | Chat only. Force the socket to reconnect now; `400 unsupported_for_kind` on a mail account; `503 capacity` at `WHATSAPP_MAX_ACCOUNTS` |
 
 ### Mail
 
@@ -193,6 +263,30 @@ All mail routes require `?account_id=…`.
 | `GET` | `/api/v1/emails/{id}/attachments/{aid}` | Raw bytes |
 | `POST` | `/api/v1/drafts` | |
 | `POST` | `/api/v1/drafts/{id}/send` | |
+
+### Chat (WhatsApp)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/v1/chats` | `kind=direct\|group`, `unread=true`, `q=`, `limit`, `offset` |
+| `POST` | `/api/v1/chats` | `{"account_id","phone" or "attendee_id","text"}` → `201 {"chat","message"}`. Starts a direct chat and sends the first message |
+| `GET` | `/api/v1/chats/{id}` | |
+| `PATCH` | `/api/v1/chats/{id}` | `{"read":true}` and/or `{"archived":true}`/`{"muted":true}` |
+| `GET` | `/api/v1/chats/{id}/messages` | `before=`, `limit` — `{"items","next_before"}`, newest first |
+| `POST` | `/api/v1/chats/{id}/messages` | `{"text","quoted_message_id"}`. Supports `Idempotency-Key` |
+| `GET` | `/api/v1/chats/{id}/messages/{mid}` | |
+| `PATCH` | `/api/v1/chats/{id}/messages/{mid}` | `{"text"}`. `403 not_own_message` if you didn't send it |
+| `DELETE` | `/api/v1/chats/{id}/messages/{mid}` | Revokes for everyone. `403 not_own_message` if you didn't send it |
+| `PUT` | `/api/v1/chats/{id}/messages/{mid}/reaction` | `{"emoji"}` (`""` removes it). `403 not_own_message` doesn't apply — you can react to anyone's message |
+| `GET` | `/api/v1/attendees` | `q=` searches name/phone |
+| `GET` | `/api/v1/attendees/{id}` | |
+
+All chat routes require `?account_id=…` (or in the body for `POST /api/v1/chats`)
+and return `400 unsupported_for_kind` against a mail account. `Idempotency-Key`
+on a write is scoped per developer and per operation (method, path, account,
+body): the same key+body replays the first response; the same key with a
+different body is `409 idempotency_conflict` — use it on any chat write you
+might retry, since a retried send must never double-send a message.
 
 ### Webhooks
 
@@ -218,12 +312,24 @@ missed. The dashboard's account card has a small **Set webhook** form for the
 same thing.
 
 Each delivery is `{"type", "account_id", "timestamp", "webhook": {"id", "name"},
-"email": {...}}` where `email` is the full normalized message: `body`,
-`body_plain` (markup stripped), `from`/`to`/`cc`/`bcc`/`reply_to`, `role`
-(well-known folder: `inbox`, `sentitems`, …), `internet_message_id`,
-`thread_id`, `has_attachments`, and for new mail the `attachments` list
-(id, name, mime_type, size) so no follow-up call is needed. `webhook.name` is
-whatever you passed as `name` when registering the hook.
+...}` where the rest of the payload depends on `type`. For mail, `"email"` is
+the full normalized message: `body`, `body_plain` (markup stripped),
+`from`/`to`/`cc`/`bcc`/`reply_to`, `role` (well-known folder: `inbox`,
+`sentitems`, …), `internet_message_id`, `thread_id`, `has_attachments`, and for
+new mail the `attachments` list (id, name, mime_type, size) so no follow-up
+call is needed. For chat, `"message"` (a `ChatMessage`) and `"chat"` (a
+`Chat`) carry the equivalent; `chat_reaction` additionally carries
+`"reaction"`, and `"message_ids"` names the affected messages for
+`chat_updated`/`chat_deleted`. `webhook.name` is whatever you passed as `name`
+when registering the hook.
+
+Chat event names: `chat_received` (inbound), `chat_sent` (sent via the API or
+echoed back from the phone), `chat_updated` (edit, mark-read, or a chat's
+`archived`/`muted` flags changed), `chat_reaction`, `chat_deleted`.
+`account_status` covers both providers — connection lost/regained, or the
+terminal `CREDENTIALS` state — and, for a chat account, can arrive with no
+request of yours in flight at all: the socket can drop or a device can be
+unlinked from the phone at any time.
 
 Deliveries carry `X-Outlook-Event`, `X-Outlook-Delivery` (attempt number) and,
 when a secret is set, `X-Outlook-Signature: sha256=<hex hmac of the raw body>`.
@@ -287,12 +393,17 @@ curl -s -X POST "localhost:8080/api/v1/emails/$MSG_ID/reply" \
          webhooks / REST
 ```
 
-**The provider seam.** `internal/provider` defines three contracts. An
-`Authenticator` attaches accounts and keeps grants alive. A `Mailbox` reads and
-writes messages. A `Pusher` is optional — a provider without one simply does not
-implement it, and the core polls instead. The registry resolves an account's
-provider from the `provider` field stored on it, so adding a backend touches no
-code above that line.
+**The provider seam.** `internal/provider` defines the contracts a mail
+backend implements — an `Authenticator` attaches accounts and keeps grants
+alive, a `Mailbox` reads and writes messages, a `Pusher` is optional (a
+provider without one simply does not implement it, and the core polls
+instead) — and the chat counterparts a linked-device backend implements
+instead: a `Linker` runs the QR pairing session, a `Chatter` reads and writes
+chats/messages. `Provider.Kind()` (`"mail"` or `"chat"`) is what the API and
+`internal/chatsync` branch on; nothing needs a provider's name to know which
+set of routes and events apply to its accounts. The registry resolves an
+account's provider from the `provider` field stored on it, so adding a
+backend touches no code above that line.
 
 **Scopes are the key abstraction.** A `Scope` is one unit of incremental sync.
 Microsoft Graph exposes message delta only per mail folder, so the Outlook
@@ -321,6 +432,8 @@ Composing a fresh message with hand-written headers does not thread reliably.
 
 ## Adding a provider
 
+**A mail provider:**
+
 1. Create `internal/provider/<name>/`.
 2. Implement `provider.Authenticator`, `provider.Mailbox`, and — only if the
    backend can push — `provider.Pusher`.
@@ -329,6 +442,19 @@ Composing a fresh message with hand-written headers does not thread reliably.
    behaviour based on these, so a provider that never returns `ErrCursorExpired`
    will stall permanently the first time a cursor goes stale.
 4. Add it to the registry in [`cmd/server/main.go`](cmd/server/main.go).
+
+**A chat provider** (see `internal/provider/whatsapp` for a worked example):
+
+1. Create `internal/provider/<name>/`.
+2. Implement `provider.Linker` (runs a pairing session and yields a stream of
+   `LinkCode`s and a terminal `LinkResult`) and `provider.Chatter` (chats,
+   messages, send/edit/delete/react, `StartDirect`, `MarkRead`, `Logout`).
+3. `internal/chatsync` owns reconnect/backoff, capacity, and turning inbound
+   provider events into the store + dispatcher; the adapter itself holds no
+   policy — see the doc comment atop `internal/provider/whatsapp/whatsapp.go`.
+4. Wire it conditionally in `cmd/server/main.go` (WhatsApp only constructs and
+   registers its provider `if cfg.WhatsAppEnabled`), following whatever
+   config gate makes sense for the backend.
 
 Push endpoints are namespaced per provider (`/notifications/{provider}`), so
 each backend's validation scheme and payload format stay independent.
@@ -359,6 +485,18 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
 
 ## Known gaps
 
+- **WhatsApp device keys are stored unsealed** in whatsmeow's own SQLite
+  tables, unlike OAuth refresh tokens (AES-256-GCM sealed). Run behind
+  disk-level encryption if you enable it for anything beyond local testing —
+  see "Setup" §6.
+- **WhatsApp is text-only, with no media and no history sync.** A media
+  message arrives as `kind: "unsupported"`; none can be sent. A newly linked
+  device only sees messages sent after pairing.
+- **WhatsApp pairing is QR-only** — there is no phone-number pairing code
+  flow.
+- **WhatsApp accounts cap at `WHATSAPP_MAX_ACCOUNTS`** live sockets
+  process-wide (default 200); beyond that, connecting or reconnecting an
+  account gets `503 capacity`.
 - **Attachments >3 MB on send** need Graph upload sessions; not implemented.
 - **Search** is SQL `LIKE` over locally synced mail, not server-side search.
 - **`/sendMail` returns no ID**, so a plain Outlook send has no message ID until
@@ -415,6 +553,15 @@ is logged by its safe 12-character prefix, never in full; a session token is
 never logged at all. The net effect: passwords, full API keys, session cookie
 values, and `Authorization` header values do not appear in the log at any
 level.
+
+The same discipline applies to chat: a QR pairing code is only ever held
+in-memory on the connect page's poll response, never logged (`GET
+/connect/{state}/qr` carries no request body for `logBody` to touch in the
+first place). `logx.Redact`'s content-key rule (`"text"`, `"body"`) reduces a
+chat message's text to a byte count rather than logging it, and
+`internal/chatsync`/`internal/provider/whatsapp` identify a chat by its
+account id or a one-way digest (`logx.Digest`) rather than logging a phone
+number or chat id in the clear.
 
 ## Development
 

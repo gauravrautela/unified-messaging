@@ -22,6 +22,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
+	"github.com/gauravrautela/unified-messaging/internal/provider/whatsapp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
 )
@@ -77,6 +78,16 @@ func run(log *slog.Logger) error {
 			acctMgr,
 		),
 	)
+	// WhatsApp is opt-in: it opens a socket per linked account and stores
+	// device keys unsealed in SQLite, so it only joins the registry when an
+	// operator has deliberately turned it on.
+	if cfg.WhatsAppEnabled {
+		wa, err := whatsapp.New(db.DB(), cfg.WhatsAppDeviceName, log)
+		if err != nil {
+			return err
+		}
+		registry.Add(wa)
+	}
 	acctMgr.SetRegistry(registry)
 
 	authSvc := auth.New(db, log, cfg.SessionTTL)
@@ -91,9 +102,7 @@ func run(log *slog.Logger) error {
 	sync := syncer.New(db, registry, acctMgr, dispatcher, log, opts)
 	sync.Start(ctx)
 
-	// Full wiring of chat providers and their configuration is Task 11; this
-	// just gives the API server a live runtime to attach linked accounts to.
-	chat := chatsync.New(db, registry, acctMgr, dispatcher, log, chatsync.Options{MaxAccounts: 200})
+	chat := chatsync.New(db, registry, acctMgr, dispatcher, log, chatsync.Options{MaxAccounts: cfg.WhatsAppMaxAccounts})
 	chat.Start(ctx)
 
 	srv := &http.Server{
@@ -116,6 +125,8 @@ func run(log *slog.Logger) error {
 			"session_ttl", cfg.SessionTTL,
 			"backfill", opts.BackfillWindow,
 			"poll_every", opts.PollInterval,
+			"whatsapp", cfg.WhatsAppEnabled,
+			"max_chat_accounts", cfg.WhatsAppMaxAccounts,
 			"debug", os.Getenv("DEBUG") != "")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server stopped", "err", err)

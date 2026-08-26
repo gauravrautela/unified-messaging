@@ -306,6 +306,16 @@ func NewRegistry(ps ...Provider) *Registry {
 	return r
 }
 
+// Add registers an additional provider after construction, for a backend
+// whose wiring (e.g. reading config, opening its own store handle) is
+// conditional and so cannot always go through the NewRegistry(...) call at
+// startup. Only ever called during startup, before the registry is served
+// to any request handler, so — like the rest of this type — it takes no
+// lock.
+func (r *Registry) Add(p Provider) {
+	r.byName[p.Name()] = p
+}
+
 func (r *Registry) Get(name string) (Provider, error) {
 	p, ok := r.byName[name]
 	if !ok {
