@@ -2005,3 +2005,58 @@ func TestScrubErrRedactsJIDs(t *testing.T) {
 		t.Fatalf("scrubErr(%q) = %q, want the digest %q", withJID, got, logx.Digest(withJID))
 	}
 }
+
+// TestDeleteChatAccountScrubsLogoutError proves a whatsmeow-shaped logout
+// error carrying a JID (which embeds a phone number) never reaches the log
+// verbatim: scrubErr's digest shows up instead of the phone number.
+func TestDeleteChatAccountScrubsLogoutError(t *testing.T) {
+	s, db, recs := newTestServerWithLog(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.fake().CommandErr = errors.New("logout failed for 919888000000@s.whatsapp.net")
+	defer func() { s.fake().CommandErr = nil }()
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest("DELETE", "/api/v1/accounts/"+acc, nil), key))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	if recs.Contains("919888000000") {
+		t.Fatalf("logout error leaked the phone number into the logs: %v", recs.All())
+	}
+	if !recs.Contains(logx.Digest("logout failed for 919888000000@s.whatsapp.net")) {
+		t.Fatalf("expected the scrubbed digest in the logs: %v", recs.All())
+	}
+}
+
+// TestDeleteChatAccountToleratesNilChatRuntime proves delete does not panic
+// when the chat runtime is not wired (chat disabled deployments): DeleteLinked
+// still runs and the account is removed, with no Detach call against a nil
+// runtime.
+func TestDeleteChatAccountToleratesNilChatRuntime(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.chat = nil
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest("DELETE", "/api/v1/accounts/"+acc, nil), key))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete with nil chat runtime: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestReconnectWithoutChatRuntimeIs503 proves reconnect fails safely — 503
+// capacity, not a nil-pointer panic — when the chat runtime is not wired.
+func TestReconnectWithoutChatRuntimeIs503(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	s.chat = nil
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest("POST", "/api/v1/accounts/"+acc+"/reconnect", nil), key))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "chat runtime disabled") {
+		t.Fatalf("reconnect without chat runtime: %d %s", rec.Code, rec.Body.String())
+	}
+}

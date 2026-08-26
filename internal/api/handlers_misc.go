@@ -91,15 +91,22 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 	if acct.Kind == model.AccountKindChat {
 		logx.From(r.Context()).Info("deleting chat account", "account_id", id)
-		s.chat.Detach(id)
+		// Logout and unlink before detaching: if DeleteLinked fails, the actor
+		// is still attached, so the account is left in a state the runtime can
+		// still explain rather than a live account with no actor behind it. A
+		// provider-side logout the live actor observes flips the account to
+		// CREDENTIALS on its own, which is a consistent, relinkable state.
 		if p, err := s.registry.Get(acct.Provider); err == nil && p.Chat() != nil {
 			if err := p.Chat().Logout(ctx, id); err != nil {
-				logx.From(r.Context()).Warn("logout on delete", "account_id", id, "err", err)
+				logx.From(r.Context()).Warn("logout on delete", "account_id", id, "err", scrubErr(err.Error()))
 			}
 		}
 		if err := s.accts.DeleteLinked(ctx, id); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
+		}
+		if s.chat != nil {
+			s.chat.Detach(id)
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -162,6 +169,10 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 	if acct.Status != model.AccountOK {
 		writeError(w, http.StatusConflict, "account_not_ok",
 			"account status is "+acct.Status+"; it must be relinked first")
+		return
+	}
+	if s.chat == nil {
+		writeError(w, http.StatusServiceUnavailable, "capacity", "chat runtime disabled")
 		return
 	}
 	logx.From(r.Context()).Info("reconnect requested", "account_id", acct.ID)
