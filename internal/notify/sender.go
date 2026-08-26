@@ -184,5 +184,8 @@ func telegramCall(ctx context.Context, client *http.Client, base, token, method 
 	if !tr.OK {
 		return nil, fmt.Errorf("%w: %s", ErrTelegramRejected, Scrub(tr.Description))
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("telegram: %s: status %d", method, resp.StatusCode)
+	}
 	return tr.Result, nil
 }

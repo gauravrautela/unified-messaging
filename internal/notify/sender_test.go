@@ -47,6 +47,18 @@ func TestWebhookSenderKeepsHeadersAndSignature(t *testing.T) {
 	}
 }
 
+func TestWebhookSenderOmitsSignatureWithoutSecret(t *testing.T) {
+	srv, _, hdr := capture(t, 200, "")
+	s, _ := NewRegistry(srv.Client()).For(model.WebhookKindWebhook)
+	h := model.Webhook{Kind: model.WebhookKindWebhook, URL: srv.URL}
+	if err := s.Send(context.Background(), h, chatEv, []byte(`{"type":"chat_received"}`), 1); err != nil {
+		t.Fatal(err)
+	}
+	if sig := hdr.Get("X-Outlook-Signature"); sig != "" {
+		t.Fatalf("signature header present without secret: %q", sig)
+	}
+}
+
 func TestDiscordSenderPostsFormattedContentWithoutMentions(t *testing.T) {
 	srv, got, _ := capture(t, 204, "")
 	reg := NewRegistry(srv.Client())
@@ -66,11 +78,12 @@ func TestDiscordSenderPostsFormattedContentWithoutMentions(t *testing.T) {
 	}
 }
 
-func TestDiscordSenderTreats429AsFailureAndScrubsURL(t *testing.T) {
-	srv, _, _ := capture(t, 429, `{"retry_after":1.2}`)
+func TestDiscordSenderTreats429AsFailure(t *testing.T) {
+	srv, _, _ := capture(t, 429, `{"message":"rate limited https://discord.com/api/webhooks/1/leaked-token"}`)
 	s, _ := NewRegistry(srv.Client()).For(model.WebhookKindDiscord)
 	err := s.Send(context.Background(), model.Webhook{Kind: model.WebhookKindDiscord, URL: srv.URL + "/api/webhooks/1/s3cr3t"}, chatEv, nil, 1)
-	if err == nil || !strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "s3cr3t") {
+	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "/api/webhooks/1/•••") ||
+		strings.Contains(err.Error(), "leaked-token") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -124,13 +137,30 @@ func TestValidateTelegram(t *testing.T) {
 	}
 	reg = NewRegistry(&http.Client{})
 	reg.SetTelegramBase("http://127.0.0.1:1")
-	if err := reg.ValidateTelegram(context.Background(), "1:A", "-100"); err == nil || errors.Is(err, ErrTelegramRejected) {
+	err = reg.ValidateTelegram(context.Background(), "1:A", "-100")
+	if err == nil || errors.Is(err, ErrTelegramRejected) {
 		t.Fatalf("unreachable must be a transport error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "1:A") {
+		t.Fatalf("err leaks bot token: %v", err)
+	}
+}
+
+func TestTelegramCallRequires2xxEvenWhenOK(t *testing.T) {
+	srv, _, _ := capture(t, 500, `{"ok":true}`)
+	reg := NewRegistry(srv.Client())
+	reg.SetTelegramBase(srv.URL)
+	err := reg.ValidateTelegram(context.Background(), "1:A", "-100")
+	if err == nil || errors.Is(err, ErrTelegramRejected) || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestUnknownKind(t *testing.T) {
 	if _, ok := NewRegistry(&http.Client{}).For("slack"); ok {
 		t.Fatal("slack is not a kind")
+	}
+	if s, ok := NewRegistry(&http.Client{}).For(""); !ok || s == nil {
+		t.Fatal(`For("") should default to the webhook sender`)
 	}
 }
