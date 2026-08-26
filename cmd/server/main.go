@@ -76,7 +76,8 @@ func run(log *slog.Logger) error {
 	// dispatcher drain.
 	dispCtx, dispCancel := context.WithCancel(context.Background())
 	defer dispCancel()
-	dispatcher := events.NewDispatcher(db, notify.NewRegistry(nil), log)
+	senders := notify.NewRegistry(nil)
+	dispatcher := events.NewDispatcher(db, senders, log)
 	dispatcher.Start(dispCtx)
 
 	// The account manager and the providers are mutually dependent: providers
@@ -126,7 +127,7 @@ func run(log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, dispatcher, log).Routes(),
+		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, dispatcher, senders, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

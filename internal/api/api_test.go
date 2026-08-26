@@ -62,7 +62,7 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 	chat := chatsync.New(db, registry, acctMgr, disp, log, chatsync.Options{MaxAccounts: maxChatAccounts})
 	chat.Start(ctx)
 
-	srv := NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, disp, log)
+	srv := NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, disp, nil, log)
 	srv.fakeChat = fakeChat
 	return srv, db, recs
 }
@@ -115,7 +115,7 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 	disp := events.NewDispatcher(db, nil, log)
 	sync := syncer.New(db, registry, nil, disp, log, syncer.Options{PollInterval: time.Hour})
 	authSvc := auth.New(db, log, cfg.SessionTTL)
-	return NewServer(cfg, db, registry, nil, sync, authSvc, nil, disp, log), db
+	return NewServer(cfg, db, registry, nil, sync, authSvc, nil, disp, nil, log), db
 }
 
 // mailStub is a bare-bones mail-kind provider.Provider for exercising
@@ -2503,4 +2503,106 @@ func TestAccountWebhookDefaultsToChatReceivedForChatAccounts(t *testing.T) {
 	if len(created.Events) != 1 || created.Events[0] != model.EventChatReceived {
 		t.Fatalf("events = %v, want [chat_received]", created.Events)
 	}
+}
+
+// telegramStub answers getChat/sendMessage; per-test success or rejection.
+func telegramStub(t *testing.T, ok bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ok {
+			_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+			return
+		}
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: chat not found"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestCreateWebhookKinds(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.senders.SetTelegramBase(telegramStub(t, true).URL)
+	h := s.Routes()
+	_, key := seedDev(t, s, "a@x.com")
+	post := func(body string) (*httptest.ResponseRecorder, map[string]any) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/webhooks", strings.NewReader(body)), key))
+		var m map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &m)
+		return rec, m
+	}
+	// webhook (default kind) keeps returning the secret once.
+	rec, m := post(`{"url":"https://hook.example.com","secret":"s3"}`)
+	if rec.Code != 201 || m["kind"] != "webhook" || m["secret"] != "s3" {
+		t.Fatalf("webhook: %d %v", rec.Code, m)
+	}
+	// discord: only its own host, no secret.
+	rec, m = post(`{"kind":"discord","url":"https://discord.com/api/webhooks/1/abc"}`)
+	if rec.Code != 201 || m["kind"] != "discord" || m["url"] != "https://discord.com/api/webhooks/1/abc" || m["secret"] != nil {
+		t.Fatalf("discord: %d %v", rec.Code, m)
+	}
+	rec, _ = post(`{"kind":"discord","url":"https://evil.example.com/api/webhooks/1/abc"}`)
+	if rec.Code != 400 {
+		t.Fatalf("discord bad host: %d", rec.Code)
+	}
+	rec, _ = post(`{"kind":"discord","url":"https://discord.com/api/webhooks/1/abc","secret":"x"}`)
+	if rec.Code != 400 {
+		t.Fatalf("discord with secret: %d", rec.Code)
+	}
+	// telegram: token never comes back, url absent, chat_id present.
+	rec, m = post(`{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}`)
+	if rec.Code != 201 || m["kind"] != "telegram" || m["url"] != nil || m["bot_token"] != nil ||
+		m["telegram"].(map[string]any)["chat_id"] != "-100" || strings.Contains(rec.Body.String(), "123:ABC") {
+		t.Fatalf("telegram: %d %s", rec.Code, rec.Body.String())
+	}
+	rec, _ = post(`{"kind":"telegram","chat_id":"-100"}`)
+	if rec.Code != 400 {
+		t.Fatalf("telegram missing token: %d", rec.Code)
+	}
+	rec, _ = post(`{"kind":"slack","url":"https://hooks.slack.com/x"}`)
+	if rec.Code != 400 {
+		t.Fatalf("unknown kind: %d", rec.Code)
+	}
+	// Listing never leaks the token either.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/webhooks", nil), key))
+	if strings.Contains(rec.Body.String(), "123:ABC") || !strings.Contains(rec.Body.String(), `"chat_id":"-100"`) {
+		t.Fatalf("list: %s", rec.Body.String())
+	}
+}
+
+func TestCreateTelegramWebhookRejectedByTelegramIs400(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.senders.SetTelegramBase(telegramStub(t, false).URL)
+	_, key := seedDev(t, s, "a@x.com")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}`)), key))
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "chat not found") || strings.Contains(rec.Body.String(), "123:ABC") {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHostedAuthCarriesDiscordHookToTheAccount(t *testing.T) {
+	// Same flow as TestHostedAuthStoresPendingWebhook, with kind=discord: the
+	// pending state must keep the kind and the bound hook must be discord.
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"webhook":{"kind":"discord","url":"https://discord.com/api/webhooks/1/abc"}}`)), key))
+	if rec.Code != 200 {
+		t.Fatalf("hosted-auth: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct{ State string }
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	pending, err := db.PeekOAuthState(out.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Webhook == nil || pending.Webhook.Kind != "discord" {
+		t.Fatalf("pending = %+v", pending.Webhook)
+	}
+	_ = dev
 }

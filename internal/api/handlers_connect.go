@@ -84,12 +84,20 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	var pendingHook *store.PendingWebhook
 	if req.Webhook != nil {
+		req.Webhook.normalise()
 		if err := req.Webhook.validate(); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
 			return
 		}
+		// A bad Telegram token/chat pair should fail at link-mint time, not
+		// silently at bind time once the account already exists.
+		if st, code, msg := s.checkTelegram(r.Context(), *req.Webhook); st != 0 {
+			writeError(w, st, code, msg)
+			return
+		}
 		pendingHook = &store.PendingWebhook{
-			Name: req.Webhook.Name, URL: req.Webhook.URL, Secret: req.Webhook.Secret,
+			Name: req.Webhook.Name, Kind: req.Webhook.Kind, URL: req.Webhook.URL, Secret: req.Webhook.Secret,
+			BotToken: req.Webhook.BotToken, ChatID: req.Webhook.ChatID,
 			// Left as given: the default depends on the account's kind, which is
 			// only known once the link completes and the hook is bound.
 			Events: req.Webhook.Events,
@@ -314,8 +322,9 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// that backfill emits is missed.
 	if pending.Webhook != nil {
 		if _, err := s.createAccountWebhook(pending.DeveloperID, acct.ID, webhookRequest{
-			Name: pending.Webhook.Name, URL: pending.Webhook.URL,
-			Secret: pending.Webhook.Secret, Events: pending.Webhook.Events,
+			Name: pending.Webhook.Name, Kind: pending.Webhook.Kind, URL: pending.Webhook.URL,
+			Secret: pending.Webhook.Secret, BotToken: pending.Webhook.BotToken, ChatID: pending.Webhook.ChatID,
+			Events: pending.Webhook.Events,
 		}); err != nil {
 			s.log.Error("registering connect-time webhook", "account_id", acct.ID, "err", err)
 		}

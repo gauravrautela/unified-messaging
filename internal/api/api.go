@@ -20,6 +20,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
@@ -34,6 +35,7 @@ type Server struct {
 	auth       *auth.Service
 	chat       *chatsync.Runtime
 	dispatcher *events.Dispatcher
+	senders    *notify.Registry
 	log        *slog.Logger
 
 	// links tracks in-flight QR pairing attempts, keyed by connect state.
@@ -54,10 +56,14 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry, a *accounts.Manager,
-	sy *syncer.Syncer, au *auth.Service, chat *chatsync.Runtime, dispatcher *events.Dispatcher, log *slog.Logger) *Server {
+	sy *syncer.Syncer, au *auth.Service, chat *chatsync.Runtime, dispatcher *events.Dispatcher,
+	senders *notify.Registry, log *slog.Logger) *Server {
+	if senders == nil {
+		senders = notify.NewRegistry(nil)
+	}
 	srv := &Server{
 		cfg: cfg, store: s, registry: reg, accts: a, syncer: sy, auth: au,
-		chat: chat, dispatcher: dispatcher, log: log, links: newLinkRegistry(),
+		chat: chat, dispatcher: dispatcher, senders: senders, log: log, links: newLinkRegistry(),
 	}
 	go srv.sweepLinks()
 	return srv

@@ -439,8 +439,9 @@ func (s *Server) finishLink(state string, pending store.OAuthState, l *link, res
 
 	if pending.Webhook != nil {
 		if _, err := s.createAccountWebhook(pending.DeveloperID, acct.ID, webhookRequest{
-			Name: pending.Webhook.Name, URL: pending.Webhook.URL,
-			Secret: pending.Webhook.Secret, Events: pending.Webhook.Events,
+			Name: pending.Webhook.Name, Kind: pending.Webhook.Kind, URL: pending.Webhook.URL,
+			Secret: pending.Webhook.Secret, BotToken: pending.Webhook.BotToken, ChatID: pending.Webhook.ChatID,
+			Events: pending.Webhook.Events,
 		}); err != nil {
 			log.Error("binding connect-time webhook", "account_id", acct.ID, "err", err)
 		}

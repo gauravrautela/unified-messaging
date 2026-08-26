@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -188,18 +190,55 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 
 // webhookRequest is the body for registering a hook, global or per-account.
 type webhookRequest struct {
-	Name   string   `json:"name,omitempty"`
-	URL    string   `json:"url"`
-	Secret string   `json:"secret,omitempty"`
-	Events []string `json:"events,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Kind     string   `json:"kind,omitempty"`
+	URL      string   `json:"url,omitempty"`
+	Secret   string   `json:"secret,omitempty"`
+	BotToken string   `json:"bot_token,omitempty"`
+	ChatID   string   `json:"chat_id,omitempty"`
+	Events   []string `json:"events,omitempty"`
+}
+
+// normalise fills in the default kind so every existing caller that never
+// mentions "kind" keeps getting a plain JSON webhook.
+func (r *webhookRequest) normalise() {
+	if r.Kind == "" {
+		r.Kind = model.WebhookKindWebhook
+	}
 }
 
 func (r webhookRequest) validate() error {
-	if r.URL == "" {
-		return errors.New("url is required")
+	if !model.KnownWebhookKind(r.Kind) {
+		return errors.New("kind must be webhook, discord or telegram")
 	}
-	if err := publicHTTPURL(r.URL); err != nil {
-		return err
+	switch r.Kind {
+	case model.WebhookKindWebhook:
+		if r.URL == "" {
+			return errors.New("url is required")
+		}
+		if err := publicHTTPURL(r.URL); err != nil {
+			return err
+		}
+		if r.BotToken != "" || r.ChatID != "" {
+			return errors.New("bot_token and chat_id apply to kind=telegram only")
+		}
+	case model.WebhookKindDiscord:
+		if err := discordWebhookURL(r.URL); err != nil {
+			return err
+		}
+		if r.Secret != "" {
+			return errors.New("secret applies to kind=webhook only")
+		}
+		if r.BotToken != "" || r.ChatID != "" {
+			return errors.New("bot_token and chat_id apply to kind=telegram only")
+		}
+	case model.WebhookKindTelegram:
+		if r.BotToken == "" || r.ChatID == "" {
+			return errors.New("bot_token and chat_id are required for kind=telegram")
+		}
+		if r.URL != "" || r.Secret != "" {
+			return errors.New("url and secret do not apply to kind=telegram")
+		}
 	}
 	for _, e := range r.Events {
 		if !model.KnownEvent(e) {
@@ -207,6 +246,42 @@ func (r webhookRequest) validate() error {
 		}
 	}
 	return nil
+}
+
+// discordWebhookURL accepts only Discord's own incoming-webhook endpoint.
+func discordWebhookURL(raw string) error {
+	if raw == "" {
+		return errors.New("url is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" {
+		return errors.New("url must be an https Discord webhook URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "discord.com" && host != "discordapp.com" {
+		return errors.New("url must be on discord.com or discordapp.com")
+	}
+	if !strings.HasPrefix(u.Path, "/api/webhooks/") {
+		return errors.New("url must be a Discord incoming-webhook URL (/api/webhooks/…)")
+	}
+	return nil
+}
+
+// checkTelegram verifies a telegram target once at creation. It returns the
+// HTTP status and error code to answer with, or 0 when the target is fine.
+func (s *Server) checkTelegram(ctx context.Context, req webhookRequest) (int, string, string) {
+	if req.Kind != model.WebhookKindTelegram {
+		return 0, "", ""
+	}
+	err := s.senders.ValidateTelegram(ctx, req.BotToken, req.ChatID)
+	switch {
+	case err == nil:
+		return 0, "", ""
+	case errors.Is(err, notify.ErrTelegramRejected):
+		return http.StatusBadRequest, "invalid_webhook", err.Error()
+	default:
+		return http.StatusBadGateway, "provider_error", "telegram unreachable: " + err.Error()
+	}
 }
 
 // eventsOrDefault narrows an unspecified filter to "a new message arrived"
@@ -228,14 +303,24 @@ func newWebhook(developerID, accountID string, req webhookRequest) (model.Webhoo
 	if err != nil {
 		return model.Webhook{}, err
 	}
-	return model.Webhook{
-		ID: id, DeveloperID: developerID, AccountID: accountID, Name: req.Name, URL: req.URL, Secret: req.Secret,
+	w := model.Webhook{
+		ID: id, DeveloperID: developerID, AccountID: accountID, Name: req.Name, Kind: req.Kind,
 		Events: req.Events, CreatedAt: time.Now().UTC(),
-	}, nil
+	}
+	switch req.Kind {
+	case model.WebhookKindWebhook:
+		w.URL, w.Secret = req.URL, req.Secret
+	case model.WebhookKindDiscord:
+		w.URL = req.URL
+	case model.WebhookKindTelegram:
+		w.Telegram = &model.TelegramTarget{ChatID: req.ChatID, BotToken: req.BotToken}
+	}
+	return w, nil
 }
 
 // createAccountWebhook is shared by the REST handler and the OAuth callback.
 func (s *Server) createAccountWebhook(developerID, accountID string, req webhookRequest) (model.Webhook, error) {
+	req.normalise()
 	acct, err := s.store.GetAccount(developerID, accountID)
 	if err != nil {
 		return model.Webhook{}, err
@@ -255,8 +340,13 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
+	req.normalise()
 	if err := req.validate(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
+		return
+	}
+	if st, code, msg := s.checkTelegram(r.Context(), req); st != 0 {
+		writeError(w, st, code, msg)
 		return
 	}
 	hook, err := newWebhook(dev.ID, "", req)
@@ -267,6 +357,9 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.SaveWebhook(hook); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
+	}
+	if hook.Kind != model.WebhookKindWebhook {
+		hook.Secret = ""
 	}
 	// Echo the secret back once so the caller can configure verification, then
 	// never again.
@@ -314,14 +407,22 @@ func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
+	req.normalise()
 	if err := req.validate(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
+		return
+	}
+	if st, code, msg := s.checkTelegram(r.Context(), req); st != 0 {
+		writeError(w, st, code, msg)
 		return
 	}
 	hook, err := s.createAccountWebhook(dev.ID, accountID, req)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
+	}
+	if hook.Kind != model.WebhookKindWebhook {
+		hook.Secret = ""
 	}
 	writeJSON(w, http.StatusCreated, hook)
 }
