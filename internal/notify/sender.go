@@ -30,6 +30,28 @@ type Sender interface {
 // message is Telegram's description. Callers map it to a 400.
 var ErrTelegramRejected = errors.New("telegram rejected the target")
 
+// StatusError is a non-2xx answer from a target, carrying the HTTP status as a
+// number so the delivery log can record it without anyone parsing the message.
+// Msg is the whole error text and is already scrubbed; Error returns it
+// verbatim, so wrapping a status in this type never changes what a caller
+// reads back from last_error.
+type StatusError struct {
+	Code int
+	Msg  string
+}
+
+func (e *StatusError) Error() string { return e.Msg }
+
+// StatusOf reports the HTTP status an error carries, or 0 when it carries
+// none — a transport failure, or a target that never answered.
+func StatusOf(err error) int {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	return 0
+}
+
 const (
 	discordMax  = 2000
 	telegramMax = 4096
@@ -102,7 +124,7 @@ func (s webhookSender) Send(ctx context.Context, h model.Webhook, _ model.Event,
 	}
 	resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+		return &StatusError{Code: resp.StatusCode, Msg: fmt.Sprintf("status %d", resp.StatusCode)}
 	}
 	return nil
 }
@@ -141,7 +163,8 @@ func (s discordSender) Send(ctx context.Context, h model.Webhook, ev model.Event
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		return fmt.Errorf("discord: status %d %s", resp.StatusCode, Scrub(strings.TrimSpace(string(snippet))))
+		return &StatusError{Code: resp.StatusCode,
+			Msg: fmt.Sprintf("discord: status %d %s", resp.StatusCode, Scrub(strings.TrimSpace(string(snippet))))}
 	}
 	return nil
 }

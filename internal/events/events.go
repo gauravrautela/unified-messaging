@@ -348,9 +348,20 @@ func (d *Dispatcher) send(ctx context.Context, h model.Webhook, dl store.Deliver
 	}
 
 	start := time.Now()
-	err := notify.ScrubErr(sender.Send(ctx, h, ev, dl.Payload, attempt))
+	// The status has to come off the sender's own error: ScrubErr rebuilds the
+	// message and drops the chain, which is deliberate — nothing downstream
+	// should be able to unwrap its way back to an unscrubbed string.
+	raw := sender.Send(ctx, h, ev, dl.Payload, attempt)
+	err := notify.ScrubErr(raw)
 	if err != nil {
-		log.Debug("delivery response", "dur", time.Since(start).Round(time.Millisecond), "err", err)
+		attrs := []any{"dur", time.Since(start).Round(time.Millisecond), "err", err}
+		// 0 means the failure carried no HTTP status at all (a transport error,
+		// or a target that never answered); saying "status=0" would read as a
+		// status, so leave the key off entirely.
+		if code := notify.StatusOf(raw); code != 0 {
+			attrs = append([]any{"status", code}, attrs...)
+		}
+		log.Debug("delivery response", attrs...)
 		log.Warn("webhook delivery failed", "target", targetLabel(h), "err", err)
 		return err
 	}

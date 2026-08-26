@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -423,5 +424,73 @@ func TestFailedDeliveryStoresScrubbedError(t *testing.T) {
 	dls, _ := db.ListDeliveries("wh_d")
 	if strings.Contains(dls[0].LastError, "topsecret") || !strings.Contains(dls[0].LastError, "500") {
 		t.Fatalf("last_error = %q", dls[0].LastError)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// The sibling test above points at a 127.0.0.1 httptest URL, which the
+// host-anchored scrubber correctly declines to mask — so it never actually
+// exercises masking. This one uses a real discord.com URL (saved straight into
+// the store, since the API now rejects anything but a plain discord.com host)
+// and a transport that fails with the URL in the error, which is exactly the
+// shape url.Error produces in production.
+func TestFailedDiscordDeliveryMasksTokenInLastError(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	const hookURL = "https://discord.com/api/webhooks/9/topsecret"
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_dm", DeveloperID: "dev_1", Kind: "discord",
+		URL: hookURL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial tcp: no route to %s", r.URL.String())
+	})}
+	d := NewDispatcher(db, notify.NewRegistry(client), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "s"}})
+	waitFor(t, func() bool {
+		dls, _ := db.ListDeliveries("wh_dm")
+		return len(dls) == 1 && dls[0].LastError != ""
+	})
+	dls, _ := db.ListDeliveries("wh_dm")
+	if strings.Contains(dls[0].LastError, "topsecret") || !strings.Contains(dls[0].LastError, "/api/webhooks/9/•••") {
+		t.Fatalf("last_error = %q", dls[0].LastError)
+	}
+}
+
+// A target that flaps between 404 and 429 has to be triageable from the log
+// without parsing an error string, so the failing "delivery response" line
+// carries the numeric status the way the succeeding one carries "ok".
+func TestFailedDeliveryLogsNumericStatus(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	bad := newReceiver(t, 503)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_st", DeveloperID: "dev_1",
+		URL: bad.URL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	log, recs := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "s"}})
+	waitFor(t, func() bool {
+		dls, _ := db.ListDeliveries("wh_st")
+		return len(dls) == 1
+	})
+	found := false
+	for _, l := range recs.All() {
+		if strings.Contains(l, `msg="delivery response"`) && strings.Contains(l, "status=503") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no delivery response line with status=503: %v", recs.All())
 	}
 }
