@@ -4,11 +4,7 @@
 package events
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -19,6 +15,7 @@ import (
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -37,11 +34,11 @@ var DefaultRetrySchedule = []time.Duration{
 }
 
 type Dispatcher struct {
-	store  *store.Store
-	log    *slog.Logger
-	client *http.Client
-	queue  chan model.Event
-	done   chan struct{}
+	store   *store.Store
+	senders *notify.Registry
+	log     *slog.Logger
+	queue   chan model.Event
+	done    chan struct{}
 
 	// dropped counts events discarded because the queue stayed full for
 	// EmitBlock. It is the only signal that anything was lost, so it is
@@ -56,11 +53,14 @@ type Dispatcher struct {
 	EmitBlock time.Duration
 }
 
-func NewDispatcher(s *store.Store, log *slog.Logger) *Dispatcher {
+func NewDispatcher(s *store.Store, senders *notify.Registry, log *slog.Logger) *Dispatcher {
+	if senders == nil {
+		senders = notify.NewRegistry(&http.Client{Timeout: 15 * time.Second})
+	}
 	return &Dispatcher{
-		store:  s,
-		log:    log.With("component", "events"),
-		client: &http.Client{Timeout: 15 * time.Second},
+		store:   s,
+		senders: senders,
+		log:     log.With("component", "events"),
 		// Buffered so a slow subscriber never stalls the sync loop for the
 		// common burst. Once it fills, Emit blocks the producer for EmitBlock
 		// (see Emit) and only then drops, counting what it dropped: a delivery
@@ -218,7 +218,7 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 		if id, err := accounts.NewID("dl"); err == nil {
 			dl.ID = id
 		}
-		if err := d.post(ctx, h, dl, 1); err != nil {
+		if err := d.send(ctx, h, dl, 1); err != nil {
 			d.enqueue(dl, err)
 			continue
 		}
@@ -244,7 +244,7 @@ func (d *Dispatcher) enqueue(dl store.Delivery, cause error) {
 // schedule records the outcome of a failed attempt and decides when, or
 // whether, the next one happens.
 func (d *Dispatcher) schedule(dl store.Delivery, cause error) {
-	dl.LastError = cause.Error()
+	dl.LastError = notify.ScrubErr(cause).Error()
 	// developer_id is not reachable from a Delivery alone; the rest of the
 	// correlation set is.
 	log := d.deliveryLog(dl, "")
@@ -291,7 +291,7 @@ func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 			continue
 		}
 		dl.Attempts++
-		if err := d.post(postCtx, h, dl, dl.Attempts); err != nil {
+		if err := d.send(postCtx, h, dl, dl.Attempts); err != nil {
 			d.schedule(dl, err)
 			continue
 		}
@@ -315,44 +315,47 @@ func subscribes(h model.Webhook, eventType string) bool {
 	return false
 }
 
-// post makes one attempt. Anything but a 2xx is a failure; the caller decides
-// what to do about it. Subscribers are told to treat delivery as
-// at-least-once and dedupe on (type, email_id).
-func (d *Dispatcher) post(ctx context.Context, h model.Webhook, dl store.Delivery, attempt int) error {
+// targetLabel names where a delivery goes without leaking a credential.
+func targetLabel(h model.Webhook) string {
+	switch h.Kind {
+	case model.WebhookKindDiscord:
+		return notify.MaskDiscordURL(h.URL)
+	case model.WebhookKindTelegram:
+		if h.Telegram != nil {
+			return "telegram:" + h.Telegram.ChatID
+		}
+		return "telegram:?"
+	}
+	return h.URL
+}
+
+// send performs one attempt through the sender for the hook's kind. Anything
+// but a 2xx is a failure; the caller decides what to do about it. Subscribers
+// are told to treat delivery as at-least-once and dedupe on (type, email_id).
+func (d *Dispatcher) send(ctx context.Context, h model.Webhook, dl store.Delivery, attempt int) error {
 	// signed reports only whether a secret exists; the secret itself and the
 	// signature derived from it stay out of the log.
-	log := d.deliveryLog(dl, h.DeveloperID).With("attempt", attempt)
-	log.Debug("delivery attempt", "url", h.URL, "payload_bytes", len(dl.Payload), "signed", h.Secret != "")
+	log := d.deliveryLog(dl, h.DeveloperID).With("attempt", attempt, "kind", h.Kind)
+	log.Debug("delivery attempt", "target", targetLabel(h), "payload_bytes", len(dl.Payload), "signed", h.Secret != "")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL, bytes.NewReader(dl.Payload))
-	if err != nil {
-		return err
+	sender, ok := d.senders.For(h.Kind)
+	if !ok {
+		return fmt.Errorf("unknown webhook kind %q", h.Kind)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Outlook-Event", dl.EventType)
-	req.Header.Set("X-Outlook-Delivery", fmt.Sprintf("%d", attempt))
-	if h.Secret != "" {
-		mac := hmac.New(sha256.New, []byte(h.Secret))
-		mac.Write(dl.Payload)
-		req.Header.Set("X-Outlook-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	var ev model.Event
+	if err := json.Unmarshal(dl.Payload, &ev); err != nil {
+		return err
 	}
 
 	start := time.Now()
-	resp, err := d.client.Do(req)
-	if err == nil {
-		resp.Body.Close()
-		log.Debug("delivery response", "status", resp.StatusCode,
-			"dur", time.Since(start).Round(time.Millisecond))
-		if resp.StatusCode < 300 {
-			return nil
-		}
-		err = fmt.Errorf("status %d", resp.StatusCode)
-	} else {
-		log.Debug("delivery response", "status", 0,
-			"dur", time.Since(start).Round(time.Millisecond), "err", err)
+	err := notify.ScrubErr(sender.Send(ctx, h, ev, dl.Payload, attempt))
+	if err != nil {
+		log.Debug("delivery response", "dur", time.Since(start).Round(time.Millisecond), "err", err)
+		log.Warn("webhook delivery failed", "target", targetLabel(h), "err", err)
+		return err
 	}
-	log.Warn("webhook delivery failed", "url", h.URL, "err", err)
-	return err
+	log.Debug("delivery response", "status", "ok", "dur", time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
 // deliveryLog is the correlation set every line about one delivery carries, so

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -25,6 +26,7 @@ func newTestStore(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
+	s.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	return s
 }
 
@@ -103,7 +105,7 @@ func TestDeliveryIsScopedToAccount(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log, recs := logx.Capture()
-	d := NewDispatcher(db, log)
+	d := NewDispatcher(db, nil, log)
 	d.Start(ctx)
 
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
@@ -136,7 +138,7 @@ func newFastDispatcherLog(t *testing.T, db *store.Store, log *slog.Logger, sched
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	d := NewDispatcher(db, log)
+	d := NewDispatcher(db, nil, log)
 	d.RetrySchedule = schedule
 	d.RetryPoll = 20 * time.Millisecond
 	d.Start(ctx)
@@ -255,7 +257,7 @@ func TestEmitBlocksWhileQueueIsFullThenDropsAndCounts(t *testing.T) {
 	db := newTestStore(t)
 	seedTenant(t, db)
 	log, recs := logx.Capture()
-	d := NewDispatcher(db, log)
+	d := NewDispatcher(db, nil, log)
 	d.EmitBlock = 80 * time.Millisecond
 
 	ev := model.Event{Type: model.EventMailReceived, AccountID: "acc_1"}
@@ -286,7 +288,7 @@ func TestEmitProceedsWhenQueueDrainsWithinBound(t *testing.T) {
 	db := newTestStore(t)
 	seedTenant(t, db)
 	log, _ := logx.Capture()
-	d := NewDispatcher(db, log)
+	d := NewDispatcher(db, nil, log)
 	d.EmitBlock = 2 * time.Second
 
 	ev := model.Event{Type: model.EventMailReceived, AccountID: "acc_1"}
@@ -322,7 +324,7 @@ func TestDeliveryWorkerDrainsQueuedEventsOnShutdown(t *testing.T) {
 	}
 
 	log, _ := logx.Capture()
-	d := NewDispatcher(db, log)
+	d := NewDispatcher(db, nil, log)
 	for i := 0; i < 3; i++ {
 		d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
 	}
@@ -334,5 +336,92 @@ func TestDeliveryWorkerDrainsQueuedEventsOnShutdown(t *testing.T) {
 
 	if rcv.count() != 3 {
 		t.Fatalf("delivered %d of 3 queued events on shutdown", rcv.count())
+	}
+}
+
+// One event fanned out to a webhook, discord and telegram hook must reach
+// each in its own shape: raw JSON, Markdown, and HTML respectively.
+func TestOneEventReachesEachKindInItsOwnShape(t *testing.T) {
+	db := newTestStore(t)
+	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
+	seedTenant(t, db)
+	wh := newReceiver(t, 200)
+	discord := newReceiver(t, 204)
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		// Decode first: encoding/json HTML-escapes "<"/">" on the wire (valid
+		// JSON either way), so comparing raw bytes against literal "<b>" tags
+		// would fail on a correct encoder. Every other consumer of this body
+		// (Telegram included) decodes JSON before reading text, so this test
+		// does too.
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		text, _ := m["text"].(string)
+		discord.mu.Lock() // reuse a mutex; the assertion below reads bodies under it
+		discord.bodies = append(discord.bodies, append([]byte("TG "+r.URL.Path+" "), text...))
+		discord.mu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(telegram.Close)
+	now := time.Now().UTC()
+	for _, h := range []model.Webhook{
+		{ID: "wh_a", DeveloperID: "dev_1", Kind: "webhook", URL: wh.URL, CreatedAt: now},
+		{ID: "wh_b", DeveloperID: "dev_1", Kind: "discord", URL: discord.URL + "/api/webhooks/1/t", CreatedAt: now},
+		{ID: "wh_c", DeveloperID: "dev_1", Kind: "telegram", Telegram: &model.TelegramTarget{BotToken: "1:A", ChatID: "-5"}, CreatedAt: now},
+	} {
+		if err := db.SaveWebhook(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg := notify.NewRegistry(nil)
+	reg.SetTelegramBase(telegram.URL)
+	d := NewDispatcher(db, reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Emit(model.Event{Type: model.EventChatReceived, AccountID: "acc_1",
+		Chat: &model.Chat{Name: "Team"}, Message: &model.ChatMessage{Sender: model.Attendee{Name: "Ada"}, Text: "hi"}})
+	waitFor(t, func() bool { return wh.count() == 1 && discord.count() >= 1 && len(discord.bodies) >= 2 })
+	discord.mu.Lock()
+	defer discord.mu.Unlock()
+	var sawJSON, sawMarkdown, sawHTML bool
+	for _, b := range discord.bodies {
+		s := string(b)
+		switch {
+		case strings.HasPrefix(s, "TG /bot1:A/sendMessage") && strings.Contains(s, "<b>Ada</b>"):
+			sawHTML = true
+		case strings.Contains(s, "**Ada**") && strings.Contains(s, "allowed_mentions"):
+			sawMarkdown = true
+		}
+	}
+	if strings.Contains(string(wh.bodies[0]), `"type":"chat_received"`) {
+		sawJSON = true
+	}
+	if !sawJSON || !sawMarkdown || !sawHTML {
+		t.Fatalf("json=%v markdown=%v html=%v bodies=%q", sawJSON, sawMarkdown, sawHTML, discord.bodies)
+	}
+}
+
+func TestFailedDeliveryStoresScrubbedError(t *testing.T) {
+	db := newTestStore(t)
+	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
+	seedTenant(t, db)
+	bad := newReceiver(t, 500)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_d", DeveloperID: "dev_1", Kind: "discord",
+		URL: bad.URL + "/api/webhooks/9/topsecret", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(db, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "s"}})
+	waitFor(t, func() bool {
+		dls, _ := db.ListDeliveries("wh_d")
+		return len(dls) == 1
+	})
+	dls, _ := db.ListDeliveries("wh_d")
+	if strings.Contains(dls[0].LastError, "topsecret") || !strings.Contains(dls[0].LastError, "500") {
+		t.Fatalf("last_error = %q", dls[0].LastError)
 	}
 }

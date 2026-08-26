@@ -123,7 +123,7 @@ func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	disp.Start(ctx)
 
 	registry := provider.NewRegistry(&simpleProvider{mb: mb})
@@ -188,7 +188,7 @@ func TestEnsureSubscriptionIsNoOpWithoutPush(t *testing.T) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := provider.NewRegistry(&simpleProvider{mb: &simpleMailbox{}})
-	s := New(db, registry, nil, events.NewDispatcher(db, log), log,
+	s := New(db, registry, nil, events.NewDispatcher(db, nil, log), log,
 		Options{PublicBaseURL: "https://example.test"})
 
 	if err := s.EnsureSubscription(context.Background(), "acc_1"); err != nil {

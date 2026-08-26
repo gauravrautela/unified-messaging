@@ -21,6 +21,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
 	"github.com/gauravrautela/unified-messaging/internal/provider/whatsapp"
@@ -58,6 +59,9 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer db.Close()
+	// The same key that seals OAuth tokens seals a telegram hook's bot token;
+	// a hook can't be saved without it.
+	db.SetSealKey(cfg.TokenKey)
 	db.SetLogger(log.With("component", "store"))
 	db.PurgeExpiredOAuthStates()
 
@@ -72,7 +76,7 @@ func run(log *slog.Logger) error {
 	// dispatcher drain.
 	dispCtx, dispCancel := context.WithCancel(context.Background())
 	defer dispCancel()
-	dispatcher := events.NewDispatcher(db, log)
+	dispatcher := events.NewDispatcher(db, notify.NewRegistry(nil), log)
 	dispatcher.Start(dispCtx)
 
 	// The account manager and the providers are mutually dependent: providers

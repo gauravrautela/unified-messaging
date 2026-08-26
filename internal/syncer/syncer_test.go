@@ -210,7 +210,7 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	disp.Start(ctx)
 
 	registry := provider.NewRegistry(outlook.New(nil, fakeTokens{}))
@@ -358,7 +358,7 @@ func TestPollSkipsChatAccounts(t *testing.T) {
 	_ = db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "+91", Status: model.AccountOK})
 	fake := providertest.NewFakeChat("FAKECHAT")
 	log, recs := logx.Capture()
-	s := New(db, provider.NewRegistry(fake), nil, events.NewDispatcher(db, log), log, Options{PollInterval: time.Hour})
+	s := New(db, provider.NewRegistry(fake), nil, events.NewDispatcher(db, nil, log), log, Options{PollInterval: time.Hour})
 	s.pollOnce(context.Background())
 	if recs.Contains("sync run started") {
 		t.Fatalf("chat account was polled: %v", recs.All())
@@ -378,7 +378,7 @@ func TestWakeCollapsesWhileInflight(t *testing.T) {
 	defer db.Close()
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := New(db, provider.NewRegistry(), nil, events.NewDispatcher(db, log), log, Options{})
+	s := New(db, provider.NewRegistry(), nil, events.NewDispatcher(db, nil, log), log, Options{})
 
 	s.mu.Lock()
 	s.inflight["acc_1"] = true
@@ -411,7 +411,7 @@ func TestSyncAccountOnChatAccountReturnsError(t *testing.T) {
 	_ = db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "+91", Status: model.AccountOK})
 	fake := providertest.NewFakeChat("FAKECHAT")
 	log, _ := logx.Capture()
-	s := New(db, provider.NewRegistry(fake), nil, events.NewDispatcher(db, log), log, Options{PollInterval: time.Hour})
+	s := New(db, provider.NewRegistry(fake), nil, events.NewDispatcher(db, nil, log), log, Options{PollInterval: time.Hour})
 
 	if err := s.SyncAccount(context.Background(), "acc_wa"); err == nil {
 		t.Fatal("SyncAccount on a chat account = nil error, want one")

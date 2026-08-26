@@ -57,7 +57,7 @@ func newHarness(t *testing.T) *harness {
 	h.mgr = accounts.NewManager(db, make([]byte, 32), log)
 	reg := provider.NewRegistry(h.fake)
 	h.mgr.SetRegistry(reg)
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	disp.Start(ctx)

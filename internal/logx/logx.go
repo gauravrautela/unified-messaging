@@ -85,7 +85,9 @@ func Digest(s string) string {
 // secretKeys are matched as substrings of lower-cased map keys.
 // Substring matching deliberately over-redacts (e.g., keyword, zip_code) because
 // under-redaction is the worse failure mode for security.
-var secretKeys = []string{"password", "secret", "token", "key", "code", "verifier", "cookie", "authorization", "client_state", "clientstate", "session"}
+// "bot_token" is listed explicitly even though the "token" substring already
+// covers it, so a Telegram bot token's redaction is not accidental.
+var secretKeys = []string{"password", "secret", "token", "bot_token", "key", "code", "verifier", "cookie", "authorization", "client_state", "clientstate", "session"}
 
 // contentKeys hold message content rather than secrets: mail bodies and
 // base64 attachment payloads. Per the logging rules they are logged as a size

@@ -40,6 +40,7 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
+	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
 		RedirectURI: "http://localhost:8080/oauth/callback",
@@ -52,7 +53,7 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 	registry := provider.NewRegistry(outlook.New(a, stubTokens{}), fakeChat)
 	acctMgr := accounts.NewManager(db, make([]byte, 32), log)
 	acctMgr.SetRegistry(registry)
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	sync := syncer.New(db, registry, acctMgr, disp, log, syncer.Options{PollInterval: time.Hour})
 	authSvc := auth.New(db, log, cfg.SessionTTL)
 
@@ -102,6 +103,7 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
+	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
 		RedirectURI: "http://localhost:8080/oauth/callback",
@@ -110,7 +112,7 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 	}
 	log, _ := logx.Capture()
 	registry := provider.NewRegistry(providers...)
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	sync := syncer.New(db, registry, nil, disp, log, syncer.Options{PollInterval: time.Hour})
 	authSvc := auth.New(db, log, cfg.SessionTTL)
 	return NewServer(cfg, db, registry, nil, sync, authSvc, nil, disp, log), db

@@ -96,7 +96,7 @@ func TestSoak(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	disp.Start(ctx)
