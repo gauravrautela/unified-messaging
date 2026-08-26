@@ -319,15 +319,36 @@ async function loadWebhook(id) {
 
 function renderWebhook(el, hook) {
   if (hook) {
+    var where = hook.kind === "telegram" ? "chat " + escapeHtml((hook.telegram || {}).chat_id || "")
+                                          : "<code>" + escapeHtml(hook.url || "") + "</code>";
     el.innerHTML =
-      "Webhook: <code>" + escapeHtml(hook.url) + "</code>" +
+      '<span class="kind">' + escapeHtml(hook.kind || "webhook") + "</span> " + where +
       '<button data-action="remove-webhook" data-wid="' + hook.id + '" class="danger">Remove</button>';
     return;
   }
   el.innerHTML =
-    '<input name="url" type="url" placeholder="https://your-app.example.com/hooks/mail" required>' +
-    '<input name="secret" type="text" placeholder="secret (optional)">' +
+    '<select name="kind">' +
+      '<option value="webhook">Webhook (JSON)</option>' +
+      '<option value="discord">Discord channel</option>' +
+      '<option value="telegram">Telegram chat</option>' +
+    '</select>' +
+    '<span data-kind-fields="webhook">' +
+      '<input name="url" type="url" placeholder="https://your-app.example.com/hooks/mail">' +
+      '<input name="secret" type="text" placeholder="secret (optional)">' +
+    '</span>' +
+    '<span data-kind-fields="discord" hidden>' +
+      '<input name="discord_url" type="url" placeholder="https://discord.com/api/webhooks/&hellip;">' +
+    '</span>' +
+    '<span data-kind-fields="telegram" hidden>' +
+      '<input name="bot_token" type="password" placeholder="bot token from @BotFather" autocomplete="off">' +
+      '<input name="chat_id" type="text" placeholder="chat id, e.g. -1001234567890">' +
+    '</span>' +
     '<button data-action="set-webhook">Set webhook</button>';
+  el.querySelector('select[name=kind]').addEventListener("change", function (e) {
+    el.querySelectorAll("[data-kind-fields]").forEach(function (span) {
+      span.hidden = span.dataset.kindFields !== e.target.value;
+    });
+  });
 }
 
 function escapeHtml(s) {
@@ -360,19 +381,22 @@ $("list").addEventListener("click", async (e) => {
   }
   if (action === "set-webhook") {
     const box = btn.closest("[data-hook]");
-    const url = box.querySelector('input[name=url]').value.trim();
-    const secret = box.querySelector('input[name=secret]').value.trim();
-    if (!url) return;
+    const kind = box.querySelector('select[name=kind]').value;
+    const val = (n) => { const i = box.querySelector('input[name=' + n + ']'); return i ? i.value.trim() : ""; };
+    const body = { kind };
+    if (kind === "webhook") { body.url = val("url"); body.secret = val("secret"); if (!body.url) return; }
+    if (kind === "discord") { body.url = val("discord_url"); if (!body.url) return; }
+    if (kind === "telegram") { body.bot_token = val("bot_token"); body.chat_id = val("chat_id"); if (!body.bot_token || !body.chat_id) return; }
     btn.disabled = true;
     try {
       await api("/api/v1/accounts/" + id + "/webhooks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, secret })
+        body: JSON.stringify(body)
       });
       loadWebhook(id);
     } catch (e) {
-      alert("Could not set webhook: " + e.message);
+      showRowMessage(id, "Could not set webhook: " + e.message, true);
       btn.disabled = false;
     }
     return;

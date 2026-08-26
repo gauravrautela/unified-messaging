@@ -747,6 +747,11 @@ func TestDashboardRendersWebhookForm(t *testing.T) {
 	if !strings.Contains(body, `data-action="set-webhook"`) || !strings.Contains(body, `/webhooks`) {
 		t.Fatal("dashboard has no set-webhook form wired to the account webhooks API")
 	}
+	for _, want := range []string{`name="kind"`, `value="discord"`, `value="telegram"`, `name="bot_token"`, `name="chat_id"`, `data-kind-fields`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard missing %q", want)
+		}
+	}
 }
 
 // One GET should give a caller the whole message: plain-text body, the folder
