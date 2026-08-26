@@ -543,6 +543,40 @@ func TestDashboardLinksToMailPage(t *testing.T) {
 	}
 }
 
+// The dashboard offers a provider picker for the connect flow and renders
+// chat accounts with a Reconnect action, a masked-phone helper, and a link
+// into the chat viewer.
+func TestDashboardShowsProviderPickerAndChatCards(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	_ = seedChat(t, s, db, dev.ID)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest("GET", "/dashboard", nil), dev.ID))
+	body := rec.Body.String()
+	for _, want := range []string{`id="provider"`, `data-action="reconnect"`, `/chat?account_id=`, `maskPhone(`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard missing %q", want)
+		}
+	}
+}
+
+// The chat viewer is session-gated exactly like the mail viewer, and renders
+// the chat list and message panes plus the chat REST endpoints it drives.
+func TestChatViewerIsSessionGated(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest("GET", "/chat?account_id=x", nil))
+	if rec.Code != 302 {
+		t.Fatalf("no session: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest("GET", "/chat?account_id=x", nil), dev.ID))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `id="chats"`) || !strings.Contains(rec.Body.String(), `id="messages"`) || !strings.Contains(rec.Body.String(), `/api/v1/chats`) {
+		t.Fatalf("viewer: %d", rec.Code)
+	}
+}
+
 func TestConnectRejectsUnknownState(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()

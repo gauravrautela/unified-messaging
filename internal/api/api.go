@@ -141,6 +141,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /mail", s.handleMailPage)
+	mux.HandleFunc("GET /chat", s.handleChatPage)
 
 	// --- inbound push from providers ---
 	// Deliberately unauthenticated by API key: providers cannot send custom

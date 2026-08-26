@@ -108,6 +108,9 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
 .status{display:inline-flex;align-items:center;gap:.4rem;font-size:.8rem;font-weight:600;padding:.2rem .55rem;border-radius:999px}
 .status.ok{color:var(--ok);background:color-mix(in srgb, var(--ok) 15%, transparent)}
 .status.bad{color:var(--warn);background:color-mix(in srgb, var(--warn) 15%, transparent)}
+.kind{display:inline-block;font-size:.7rem;font-weight:600;text-transform:uppercase;color:var(--muted);
+  border:1px solid var(--border);border-radius:6px;padding:.05rem .35rem;margin-right:.4rem}
+.row-msg{flex-basis:100%;font-size:.8rem;color:var(--muted);margin-top:.3rem}
 .actions{display:flex;gap:.4rem;flex-shrink:0}
 .hook{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin-top:.6rem;
   padding-top:.6rem;border-top:1px dashed var(--border);font-size:.8rem;color:var(--muted)}
@@ -133,6 +136,7 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
       </div>
       <div style="display:flex;gap:.75rem;align-items:center">
         <span class="sub">{{.Email}}</span>
+        <select id="provider" class="hidden"></select>
         <button id="connect-btn" class="primary">+ Connect account</button>
         <a class="btn" href="/docs">API docs</a>
         <form id="logout-form" method="post" action="/logout" style="margin:0"><button class="signout" type="submit">Log out</button></form>
@@ -189,10 +193,39 @@ function fmtTime(iso) {
 
 async function loadProviders() {
   const data = await api("/api/v1/providers");
-  const names = data.items.map((p) => p.name.charAt(0) + p.name.slice(1).toLowerCase());
+  const items = data.items || [];
+  const names = items.map((p) => p.name.charAt(0) + p.name.slice(1).toLowerCase());
   $("provider-line").textContent = names.length
     ? "Providers: " + names.join(", ")
     : "No providers configured";
+  const sel = $("provider");
+  sel.innerHTML = items.map((p) =>
+    '<option value="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + " (" + escapeHtml(p.kind) + ")</option>"
+  ).join("");
+  // A single provider still gets the element (a hidden <select> with one
+  // option), so the connect flow always has somewhere to read the choice
+  // from; only more than one option makes the picker worth showing.
+  sel.classList.toggle("hidden", items.length <= 1);
+}
+
+// Keeps the country code plus the first two and last three digits of a phone
+// number, masking the rest — e.g. "+91 88••• •855". This never leaves the
+// browser: the server-side account JSON keeps the real identifier, and this
+// function's whole job is making sure the page never shows it in full.
+function maskPhone(p) {
+  if (!p) return "";
+  const s = String(p);
+  const m = /^(\+\d{1,3})(\d+)$/.exec(s.replace(/[^\d+]/g, ""));
+  if (!m || m[2].length < 5) {
+    const n = s.length;
+    if (n <= 4) return s;
+    const keep = Math.max(1, Math.floor(n / 4));
+    return s.slice(0, keep) + "•".repeat(Math.max(3, n - keep * 2)) + s.slice(n - keep);
+  }
+  const cc = m[1], rest = m[2];
+  const first2 = rest.slice(0, 2), last3 = rest.slice(-3);
+  const midLen = Math.min(3, Math.max(1, rest.length - 5));
+  return cc + " " + first2 + "•".repeat(midLen) + " •" + last3;
 }
 
 async function loadAccounts() {
@@ -212,11 +245,20 @@ function renderAccounts(items) {
     list.innerHTML = '<div class="empty">No accounts connected yet.</div>';
     return;
   }
-  list.innerHTML = items.map((a) => (
+  list.innerHTML = items.map((a) => (a.kind === "chat" ? chatRow(a) : mailRow(a))).join("");
+  items.forEach((a) => loadWebhook(a.id));
+}
+
+function kindBadge(kind) {
+  return '<span class="kind">' + escapeHtml(kind || "") + "</span>";
+}
+
+function mailRow(a) {
+  return (
     '<div class="row" data-id="' + a.id + '">' +
       '<div class="who">' +
         '<div class="email">' + escapeHtml(a.email) + "</div>" +
-        '<div class="meta">' + escapeHtml(a.provider) + " &middot; " + fmtTime(a.last_synced_at) + "</div>" +
+        '<div class="meta">' + kindBadge(a.kind) + escapeHtml(a.provider) + " &middot; " + fmtTime(a.last_synced_at) + "</div>" +
       "</div>" +
       statusBadge(a.status) +
       '<div class="actions">' +
@@ -226,8 +268,40 @@ function renderAccounts(items) {
       "</div>" +
       '<div class="hook" data-hook>Loading webhook&hellip;</div>' +
     "</div>"
-  )).join("");
-  items.forEach((a) => loadWebhook(a.id));
+  );
+}
+
+// A chat account has no email and no folder-based sync: its identifier is a
+// phone number (always masked before it touches the DOM), and its liveness
+// is the socket state the chat runtime reports rather than a last-sync time.
+function chatRow(a) {
+  const conn = a.connection || {};
+  const state = conn.state || "unknown";
+  const ok = state === "connected";
+  return (
+    '<div class="row" data-id="' + a.id + '">' +
+      '<div class="who">' +
+        '<div class="email">' + escapeHtml(a.name || maskPhone(a.identifier)) + "</div>" +
+        '<div class="meta">' + kindBadge(a.kind) + escapeHtml(a.provider) + " &middot; " + escapeHtml(maskPhone(a.identifier)) + "</div>" +
+      "</div>" +
+      '<span class="status ' + (ok ? "ok" : "bad") + '">' + escapeHtml(state) + "</span>" +
+      '<div class="actions">' +
+        '<a class="btn" href="/chat?account_id=' + a.id + '">View chat</a>' +
+        '<button data-action="reconnect">Reconnect</button>' +
+        '<button data-action="disconnect" class="danger">Disconnect</button>' +
+      "</div>" +
+      '<div class="row-msg hidden" data-msg></div>' +
+      '<div class="hook" data-hook>Loading webhook&hellip;</div>' +
+    "</div>"
+  );
+}
+
+function showRowMessage(id, text, isErr) {
+  const el = document.querySelector('.row[data-id="' + id + '"] [data-msg]');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isErr ? "var(--danger)" : "var(--muted)";
+  el.classList.remove("hidden");
 }
 
 // Each account has at most one webhook from this UI: new mail for that user
@@ -270,6 +344,17 @@ $("list").addEventListener("click", async (e) => {
     btn.disabled = true;
     try { await api("/api/v1/accounts/" + id + "/resync", { method: "POST", headers: { "Content-Type": "application/json" } }); }
     catch (e) { alert("Resync failed: " + e.message); }
+    btn.disabled = false;
+    return;
+  }
+  if (action === "reconnect") {
+    btn.disabled = true;
+    try {
+      const res = await api("/api/v1/accounts/" + id + "/reconnect", { method: "POST", headers: { "Content-Type": "application/json" } });
+      showRowMessage(id, "Status: " + (res && res.status ? res.status : "reconnecting"), false);
+    } catch (e) {
+      showRowMessage(id, "Reconnect failed: " + e.message, true);
+    }
     btn.disabled = false;
     return;
   }
@@ -320,10 +405,13 @@ $("connect-btn").addEventListener("click", async () => {
   $("connect-btn").disabled = true;
   try {
     const dest = location.origin + location.pathname + "?connected=1";
+    const body = { success_redirect_url: dest };
+    const providerVal = $("provider").value;
+    if (providerVal) body.provider = providerVal;
     const data = await api("/api/v1/hosted-auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ success_redirect_url: dest })
+      body: JSON.stringify(body)
     });
     location.href = data.url;
   } catch (e) {
