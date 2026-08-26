@@ -173,16 +173,9 @@ func (b *builder) head(icon, title, where string) {
 }
 func (b *builder) line(s string) { b.sb.WriteString(b.esc(s) + "\n") }
 
-// bold renders a secondary emphasis line, e.g. a mail subject. In HTML it
-// uses <i> rather than <b>: <b> is reserved for the headline produced by
-// head(), so a subject never collides with it in the rendered notification.
-func (b *builder) bold(s string) {
-	if b.f == HTML {
-		b.sb.WriteString("<i>" + b.esc(s) + "</i>\n")
-		return
-	}
-	b.sb.WriteString(b.strong(s) + "\n")
-}
+// bold renders a secondary emphasis line, e.g. a mail subject, using the
+// same markup as the headline in both flavours.
+func (b *builder) bold(s string)            { b.sb.WriteString(b.strong(s) + "\n") }
 func (b *builder) boldInline(s, sep string) { b.sb.WriteString(b.strong(s) + sep) }
 func (b *builder) snippet(s string, n int)  { b.sb.WriteString(b.esc(truncate(s, n)) + "\n") }
 func (b *builder) snippetInline(s string, n int) {

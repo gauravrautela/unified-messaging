@@ -18,7 +18,7 @@ func TestFormatMailReceivedMarkdownAndHTML(t *testing.T) {
 		t.Fatalf("markdown:\n%s", md)
 	}
 	h := Format(ev, HTML)
-	if !strings.Contains(h, "<b>New mail</b>") || !strings.Contains(h, "Bob &lt;b&gt; &lt;bob@x.com&gt;") || strings.Contains(h, "<b>Q3") {
+	if !strings.Contains(h, "<b>New mail</b>") || !strings.Contains(h, "Bob &lt;b&gt; &lt;bob@x.com&gt;") || !strings.Contains(h, "<b>Q3 *plan*</b>") {
 		t.Fatalf("html:\n%s", h)
 	}
 }
