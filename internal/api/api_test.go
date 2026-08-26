@@ -2569,6 +2569,12 @@ func TestCreateWebhookKinds(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("discord url with credentials: %d", rec.Code)
 	}
+	// An explicit port is rejected: it survives Hostname() checks but would
+	// slip past the host-anchored scrubbers in logs and last_error.
+	rec, _ = post(`{"kind":"discord","url":"https://discord.com:8443/api/webhooks/1/abc"}`)
+	if rec.Code != 400 {
+		t.Fatalf("discord url with port: %d", rec.Code)
+	}
 	// telegram: token never comes back, url absent, chat_id present.
 	rec, m = post(`{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}`)
 	if rec.Code != 201 || m["kind"] != "telegram" || m["url"] != nil || m["bot_token"] != nil ||
@@ -2588,6 +2594,59 @@ func TestCreateWebhookKinds(t *testing.T) {
 	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/webhooks", nil), key))
 	if strings.Contains(rec.Body.String(), "123:ABC") || !strings.Contains(rec.Body.String(), `"chat_id":"-100"`) {
 		t.Fatalf("list: %s", rec.Body.String())
+	}
+}
+
+// logBody runs on every authenticated request under DEBUG logging. logx.Redact
+// only knows secret-looking *keys*, and "url" is not one of them, so the body
+// has to go through notify.Scrub as well or a live Discord bearer credential
+// lands in the log on the feature's own happy path.
+func TestRequestBodyLogScrubsDiscordToken(t *testing.T) {
+	s, _, recs := newTestServerWithLog(t)
+	_, key := seedDev(t, s, "a@x.com")
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/webhooks",
+		strings.NewReader(`{"kind":"discord","url":"https://discord.com/api/webhooks/1/SUPERSECRET"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	if !recs.Contains("/api/webhooks/1/•••") {
+		t.Fatalf("expected the request-body log to carry a masked url, got: %v", recs.All())
+	}
+	for _, l := range recs.All() {
+		if strings.Contains(l, "SUPERSECRET") {
+			t.Fatalf("log leaked the discord token: %q", l)
+		}
+	}
+}
+
+// Tenancy is decided before anything leaves the process: an account id that
+// belongs to another developer is a 404, and Telegram is never called with
+// the (real) bot token the caller supplied.
+func TestAccountWebhookCrossTenantIs404BeforeTelegram(t *testing.T) {
+	s, db := newTestServer(t)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("telegram called for a cross-tenant account: %s", r.URL.Path)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	t.Cleanup(stub.Close)
+	s.senders.SetTelegramBase(stub.URL)
+
+	owner, _ := seedDev(t, s, "owner@x.com")
+	if err := db.UpsertAccount(model.Account{ID: "acc_owned", DeveloperID: owner.ID,
+		Provider: "OUTLOOK", Email: "u@x.com", Status: model.AccountOK}); err != nil {
+		t.Fatal(err)
+	}
+	_, key := seedDev(t, s, "intruder@x.com")
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost,
+		"/api/v1/accounts/acc_owned/webhooks",
+		strings.NewReader(`{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}`)), key))
+	if rec.Code != 404 {
+		t.Fatalf("cross-tenant account webhook: status = %d, want 404 (%s)", rec.Code, rec.Body.String())
 	}
 }
 

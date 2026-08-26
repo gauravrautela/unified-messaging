@@ -403,7 +403,34 @@ func logBody(r *http.Request) {
 		log.Debug("request body", "bytes", len(raw), "json", false)
 		return
 	}
-	log.Debug("request body", "bytes", len(raw), "body", logx.Redact(v))
+	log.Debug("request body", "bytes", len(raw), "body", scrubValues(logx.Redact(v)))
+}
+
+// scrubValues runs every string leaf of a decoded JSON body through
+// notify.Scrub. logx.Redact only knows secret-looking *keys*, so a credential
+// that arrives inside a URL — a Discord webhook token under "url", a bot token
+// inside a Telegram API URL — survives it untouched. This is the second pass
+// that catches those; the two together are what makes the DEBUG body line safe
+// to keep on in a deployment.
+func scrubValues(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = scrubValues(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = scrubValues(val)
+		}
+		return out
+	case string:
+		return notify.Scrub(t)
+	default:
+		return v
+	}
 }
 
 // serveAs runs next with the developer in context and the logger enriched,

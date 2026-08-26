@@ -264,6 +264,12 @@ func discordWebhookURL(raw string) error {
 	if host != "discord.com" && host != "discordapp.com" {
 		return errors.New("url must be on discord.com or discordapp.com")
 	}
+	// Hostname() strips a port, so "discord.com:8443" would pass the check
+	// above while defeating the host-anchored scrubbers that keep the token
+	// out of logs and last_error. Discord never needs one.
+	if u.Port() != "" {
+		return errors.New("url must not specify a port")
+	}
 	if !strings.HasPrefix(u.Path, "/api/webhooks/") {
 		return errors.New("url must be a Discord incoming-webhook URL (/api/webhooks/…)")
 	}
