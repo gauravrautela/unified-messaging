@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
@@ -77,6 +78,67 @@ func TestSaveTelegramWebhookWithoutSealKeyFails(t *testing.T) {
 		Telegram: &model.TelegramTarget{ChatID: "1", BotToken: "t"}, CreatedAt: time.Now()})
 	if err == nil {
 		t.Fatal("expected an error without a seal key")
+	}
+}
+
+// A telegram hook makes no sense without somewhere to deliver to: the store
+// is the enforcement point, not the caller.
+func TestSaveTelegramWebhookWithoutTargetFails(t *testing.T) {
+	s := openWithKey(t)
+	err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Kind: model.WebhookKindTelegram,
+		CreatedAt: time.Now()})
+	if err == nil {
+		t.Fatal("expected an error for a telegram hook without a target")
+	}
+}
+
+// A hook saved under one seal key must stay listable — with an empty
+// Telegram target, never a stale token — from a process that opens the same
+// database without that key, and must log exactly one warning that never
+// carries the token.
+func TestWebhookConfigUnreadableWarnsWithoutSealKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "w.db")
+
+	s1, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.SetSealKey(testKey)
+	if err := s1.CreateDeveloper(model.Developer{ID: "dev_1", Email: "d@x.com"}, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Kind: model.WebhookKindTelegram,
+		Telegram: &model.TelegramTarget{ChatID: "-100123", BotToken: "123:ABC"}, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second store on the same file, deliberately never given the key.
+	s2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	log, recs := logx.Capture()
+	s2.SetLogger(log)
+
+	hooks, err := s2.ListWebhooks("dev_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hooks) != 1 || hooks[0].Telegram == nil ||
+		hooks[0].Telegram.BotToken != "" || hooks[0].Telegram.ChatID != "" {
+		t.Fatalf("expected a listable hook with an empty Telegram target, got %+v", hooks)
+	}
+	if !recs.Contains("webhook config unreadable") {
+		t.Fatalf("expected a warning, got: %v", recs.All())
+	}
+	for _, l := range recs.All() {
+		if contains(l, "123:ABC") {
+			t.Fatalf("log leaked the bot token: %q", l)
+		}
 	}
 }
 

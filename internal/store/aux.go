@@ -101,13 +101,20 @@ type webhookConfig struct {
 
 var errNoSealKey = errors.New("store: seal key not set")
 
+// errTelegramNeedsTarget guards against a telegram hook with nowhere to
+// deliver to: the store, not a caller, is the enforcement point for that.
+var errTelegramNeedsTarget = errors.New("store: telegram hook needs a target")
+
 func (s *Store) SaveWebhook(w model.Webhook) error {
 	if w.Kind == "" {
 		w.Kind = model.WebhookKindWebhook
 	}
 	ev, _ := json.Marshal(w.Events)
 	config := ""
-	if w.Kind == model.WebhookKindTelegram && w.Telegram != nil {
+	if w.Kind == model.WebhookKindTelegram {
+		if w.Telegram == nil {
+			return errTelegramNeedsTarget
+		}
 		if s.sealKey == nil {
 			return errNoSealKey
 		}
@@ -204,15 +211,25 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 		}
 		if w.Kind == model.WebhookKindTelegram {
 			w.Telegram = &model.TelegramTarget{}
-			if config != "" && s.sealKey != nil {
-				if raw, err := secretbox.Open(s.sealKey, config); err == nil {
-					var c webhookConfig
-					_ = json.Unmarshal([]byte(raw), &c)
-					w.Telegram.BotToken, w.Telegram.ChatID = c.BotToken, c.ChatID
-				} else if s.log != nil {
-					// Wrong key or corrupt row: keep the hook listable, deliveries
-					// to it fail with a clear error (see notify.telegramSender).
-					s.log.Warn("webhook config unreadable", "webhook_id", w.ID)
+			if config != "" {
+				switch {
+				case s.sealKey == nil:
+					// No key at all in this process: cannot even attempt to open it.
+					// Keep the hook listable, deliveries to it fail with a clear
+					// error (see notify.telegramSender).
+					if s.log != nil {
+						s.log.Warn("webhook config unreadable", "webhook_id", w.ID, "reason", "no seal key")
+					}
+				default:
+					if raw, err := secretbox.Open(s.sealKey, config); err == nil {
+						var c webhookConfig
+						_ = json.Unmarshal([]byte(raw), &c)
+						w.Telegram.BotToken, w.Telegram.ChatID = c.BotToken, c.ChatID
+					} else if s.log != nil {
+						// Wrong key or corrupt row: keep the hook listable, deliveries
+						// to it fail with a clear error (see notify.telegramSender).
+						s.log.Warn("webhook config unreadable", "webhook_id", w.ID, "reason", "open failed")
+					}
 				}
 			}
 		}
