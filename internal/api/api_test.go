@@ -2126,3 +2126,68 @@ func TestHealthzReportsDroppedEvents(t *testing.T) {
 		t.Fatalf("healthz does not report the dropped-event counter: %v", body)
 	}
 }
+
+// --- request-log scrubbing (I3) ---
+
+func TestScrubPathReducesConnectState(t *testing.T) {
+	const state = "s3cr3tstate-24-bytes-worth"
+	for _, tc := range []struct{ in, want string }{
+		{"/connect/" + state, "/connect/" + statePrefix(state)},
+		{"/connect/" + state + "/qr", "/connect/" + statePrefix(state) + "/qr"},
+		{"/connect/" + state + "/consent", "/connect/" + statePrefix(state) + "/consent"},
+		{"/connect/", "/connect/"},
+		{"/api/v1/accounts/acc_1", "/api/v1/accounts/acc_1"},
+		{"/oauth/callback", "/oauth/callback"},
+	} {
+		if got := scrubPath(tc.in); got != tc.want {
+			t.Fatalf("scrubPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestScrubQueryBlanksCodeAndState(t *testing.T) {
+	got := scrubQuery("code=M.C107_BAY.2.U.abc&state=s3cr3tstate&account_id=acc_1")
+	for _, leak := range []string{"M.C107_BAY", "s3cr3tstate"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("scrubQuery leaked %q: %q", leak, got)
+		}
+	}
+	for _, keep := range []string{"code=", "state="} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("scrubQuery dropped the %q key entirely: %q", keep, got)
+		}
+	}
+	if got := scrubQuery("account_id=acc_1&limit=10"); got != "account_id=acc_1&limit=10" {
+		t.Fatalf("scrubQuery mangled a harmless query: %q", got)
+	}
+	if got := scrubQuery(""); got != "" {
+		t.Fatalf("scrubQuery(\"\") = %q", got)
+	}
+}
+
+// The connect state is a 24-byte credential that can link an attacker's own
+// number into the developer's tenant, and an OAuth authorization code is no
+// better. Neither may reach the request log, at DEBUG or at INFO.
+func TestRequestLogScrubsConnectStateAndOAuthCode(t *testing.T) {
+	s, _, recs := newTestServerWithLog(t)
+	h := s.Routes()
+	const state = "aaaaaabbbbbbccccccdddddd"
+	const code = "M.C107_BAY.2.U.authcode"
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+state, nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+state+"/consent", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet,
+		"/oauth/callback?code="+code+"&state="+state, nil))
+
+	if recs.Contains(state) {
+		t.Fatalf("connect state leaked into the request log: %v", recs.All())
+	}
+	if recs.Contains(code) {
+		t.Fatalf("oauth authorization code leaked into the request log: %v", recs.All())
+	}
+	// The lines themselves must still be there, and still say what was called.
+	if !recs.Contains("/connect/" + statePrefix(state)) {
+		t.Fatalf("scrubbing removed the connect path entirely: %v", recs.All())
+	}
+}

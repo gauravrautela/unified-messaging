@@ -238,7 +238,7 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK, ctx: ctx}
 		log.Debug("request received",
-			"method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery,
+			"method", r.Method, "path", scrubPath(r.URL.Path), "query", scrubQuery(r.URL.RawQuery),
 			"content_type", r.Header.Get("Content-Type"), "content_length", r.ContentLength,
 			"has_authorization", r.Header.Get("Authorization") != "" || r.Header.Get("X-API-Key") != "",
 			"has_session_cookie", hasCookie(r, sessionCookie),
@@ -248,10 +248,52 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 
 		dev, _ := developerFrom(rec.ctx)
 		log.Info("http",
-			"method", r.Method, "path", r.URL.Path, "status", rec.status,
+			"method", r.Method, "path", scrubPath(r.URL.Path), "status", rec.status,
 			"bytes", rec.bytes, "dur", time.Since(start).Round(time.Millisecond),
 			"developer_id", dev.ID, "auth", authKindFrom(rec.ctx))
 	})
+}
+
+// scrubPath reduces the connect state in a /connect/{state}… path to the same
+// short prefix the rest of the codebase logs. The state is a 24-byte
+// credential, valid for 30 minutes, that grants the ability to fetch a QR code
+// and post consent — i.e. to link a device into someone else's tenant — so it
+// must not survive in a log line, at DEBUG or INFO.
+func scrubPath(p string) string {
+	const prefix = "/connect/"
+	if !strings.HasPrefix(p, prefix) {
+		return p
+	}
+	rest := p[len(prefix):]
+	tail := ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest, tail = rest[:i], rest[i:]
+	}
+	return prefix + statePrefix(rest) + tail
+}
+
+// scrubQuery blanks the values of query parameters that are credentials in
+// their own right: `code` is an OAuth authorization code (PKCE bounds the
+// damage, but it is still a bearer artefact), `state` is the connect token.
+// The keys are kept so the shape of the request stays readable.
+func scrubQuery(q string) string {
+	if q == "" || !strings.Contains(q, "code=") && !strings.Contains(q, "state=") {
+		return q
+	}
+	// Deliberately textual rather than url.ParseQuery: a malformed query still
+	// has to be scrubbed, and re-encoding one would change what is logged.
+	parts := strings.Split(q, "&")
+	for i, kv := range parts {
+		k, _, found := strings.Cut(kv, "=")
+		if !found {
+			continue
+		}
+		switch k {
+		case "code", "state":
+			parts[i] = k + "=[redacted]"
+		}
+	}
+	return strings.Join(parts, "&")
 }
 
 func hasCookie(r *http.Request, name string) bool {
