@@ -140,6 +140,86 @@ func TestWebhookConfigUnreadableWarnsWithoutSealKey(t *testing.T) {
 			t.Fatalf("log leaked the bot token: %q", l)
 		}
 	}
+
+	// ListWebhooksFor runs on every dispatched event, so the WARN has to be
+	// once per webhook id, not once per query: otherwise one un-openable row
+	// is a log line per event, forever. Later queries drop to DEBUG.
+	for i := 0; i < 3; i++ {
+		if _, err := s2.ListWebhooks("dev_1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	warns := 0
+	for _, l := range recs.All() {
+		if contains(l, "webhook config unreadable") && contains(l, "level=WARN") {
+			warns++
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("webhook config unreadable warned %d times, want exactly 1: %v", warns, recs.All())
+	}
+}
+
+// A pending connect-time hook that cannot be unsealed — TOKEN_ENCRYPTION_KEY
+// rotated, or a second instance with a different key — must not vanish in
+// silence: the account gets created and the hook the developer asked for is
+// never bound, and that has to be visible in the log (without the token).
+func TestPendingWebhookUnreadableWarns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "w.db")
+	s1, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.SetSealKey(testKey)
+	if err := s1.CreateDeveloper(model.Developer{ID: "dev_1", Email: "d@x.com"}, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.SaveOAuthState(store.OAuthState{State: "st_1", DeveloperID: "dev_1", Provider: "OUTLOOK",
+		Webhook:   &store.PendingWebhook{Kind: "telegram", BotToken: "123:ABC", ChatID: "-100"},
+		ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		key    []byte
+		reason string
+	}{
+		{"no key at all", nil, "no seal key"},
+		{"the wrong key", []byte("ffffffffffffffff0123456789abcdef"), "open failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s2, err := store.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s2.Close()
+			if tc.key != nil {
+				s2.SetSealKey(tc.key)
+			}
+			log, recs := logx.Capture()
+			s2.SetLogger(log)
+
+			o, err := s2.PeekOAuthState("st_1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if o.Webhook != nil {
+				t.Fatalf("expected no pending webhook, got %+v", o.Webhook)
+			}
+			if !recs.Contains("pending webhook unreadable") || !recs.Contains(tc.reason) {
+				t.Fatalf("expected a warning with reason %q, got: %v", tc.reason, recs.All())
+			}
+			for _, l := range recs.All() {
+				if contains(l, "123:ABC") {
+					t.Fatalf("log leaked the bot token: %q", l)
+				}
+			}
+		})
+	}
 }
 
 func contains(s, sub string) bool { return len(sub) > 0 && len(s) >= len(sub) && indexOf(s, sub) >= 0 }

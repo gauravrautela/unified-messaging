@@ -217,18 +217,16 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 					// No key at all in this process: cannot even attempt to open it.
 					// Keep the hook listable, deliveries to it fail with a clear
 					// error (see notify.telegramSender).
-					if s.log != nil {
-						s.log.Warn("webhook config unreadable", "webhook_id", w.ID, "reason", "no seal key")
-					}
+					s.warnConfigUnreadable(w.ID, "no seal key")
 				default:
 					if raw, err := secretbox.Open(s.sealKey, config); err == nil {
 						var c webhookConfig
 						_ = json.Unmarshal([]byte(raw), &c)
 						w.Telegram.BotToken, w.Telegram.ChatID = c.BotToken, c.ChatID
-					} else if s.log != nil {
+					} else {
 						// Wrong key or corrupt row: keep the hook listable, deliveries
 						// to it fail with a clear error (see notify.telegramSender).
-						s.log.Warn("webhook config unreadable", "webhook_id", w.ID, "reason", "open failed")
+						s.warnConfigUnreadable(w.ID, "open failed")
 					}
 				}
 			}
@@ -236,6 +234,22 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+// warnConfigUnreadable reports a hook whose sealed config cannot be opened.
+// The first sighting of a given webhook id is a WARN; every later one is a
+// DEBUG, because ListWebhooksFor runs on every dispatched event and the
+// condition is permanent until someone fixes the key — one un-openable row
+// would otherwise be an unbounded stream of identical warnings.
+func (s *Store) warnConfigUnreadable(webhookID, reason string) {
+	if s.log == nil {
+		return
+	}
+	if _, seen := s.warnedConfig.LoadOrStore(webhookID, struct{}{}); seen {
+		s.log.Debug("webhook config unreadable", "webhook_id", webhookID, "reason", reason)
+		return
+	}
+	s.log.Warn("webhook config unreadable", "webhook_id", webhookID, "reason", reason)
 }
 
 // ---------- webhook delivery retry queue ----------
@@ -378,16 +392,31 @@ func (s *Store) encodePendingWebhook(w *PendingWebhook) (string, error) {
 	return pendingWebhookSealedPrefix + sealed, nil
 }
 
+// warnPendingUnreadable reports a connect-time hook that cannot be unsealed.
+// Unlike the webhook-config warning this is not gated: an oauth_states row is
+// read a handful of times in its 30-minute life, not once per event.
+func (s *Store) warnPendingUnreadable(reason string) {
+	if s.log != nil {
+		s.log.Warn("pending webhook unreadable", "reason", reason)
+	}
+}
+
 func (s *Store) decodePendingWebhook(raw string) *PendingWebhook {
 	if raw == "" {
 		return nil
 	}
 	if sealed, ok := strings.CutPrefix(raw, pendingWebhookSealedPrefix); ok {
+		// A sealed blob we cannot open means the hook the developer paid for at
+		// mint time will never be bound to the account the callback creates.
+		// Nothing downstream can tell that apart from "no hook was requested",
+		// so say so here — reason only, never the token.
 		if s.sealKey == nil {
+			s.warnPendingUnreadable("no seal key")
 			return nil
 		}
 		opened, err := secretbox.Open(s.sealKey, sealed)
 		if err != nil {
+			s.warnPendingUnreadable("open failed")
 			return nil
 		}
 		raw = opened

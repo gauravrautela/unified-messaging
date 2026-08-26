@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -27,6 +28,11 @@ type Store struct {
 	// sealKey seals per-hook credentials (a Telegram bot token). Nil until
 	// SetSealKey; saving a hook that needs sealing without it is an error.
 	sealKey []byte
+	// warnedConfig remembers which webhook ids have already had their
+	// unreadable config reported. ListWebhooksFor runs on every dispatched
+	// event, so without this one un-openable row is a WARN per event forever;
+	// the spec asks for it once. Later encounters drop to DEBUG.
+	warnedConfig sync.Map // webhook id -> struct{}
 }
 
 // SetLogger attaches the logger the hot query paths trace to. Pass one already
