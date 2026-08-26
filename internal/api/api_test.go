@@ -2555,6 +2555,10 @@ func TestCreateWebhookKinds(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("discord with secret: %d", rec.Code)
 	}
+	rec, _ = post(`{"kind":"discord","url":"https://user:pass@discord.com/api/webhooks/1/abc"}`)
+	if rec.Code != 400 {
+		t.Fatalf("discord url with credentials: %d", rec.Code)
+	}
 	// telegram: token never comes back, url absent, chat_id present.
 	rec, m = post(`{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}`)
 	if rec.Code != 201 || m["kind"] != "telegram" || m["url"] != nil || m["bot_token"] != nil ||
@@ -2610,4 +2614,42 @@ func TestHostedAuthCarriesDiscordHookToTheAccount(t *testing.T) {
 		t.Fatalf("pending = %+v", pending.Webhook)
 	}
 	_ = dev
+}
+
+// A telegram hook attached to a hosted-auth link is checked against Telegram
+// right then, the same as a direct POST /api/v1/webhooks — waiting until the
+// link completes would strand the caller with a broken hook and no way to
+// have caught it earlier.
+func TestHostedAuthRejectsBadTelegramAtMintTime(t *testing.T) {
+	s, db := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+
+	s.senders.SetTelegramBase(telegramStub(t, false).URL)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"webhook":{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}}`)), key))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "chat not found") ||
+		strings.Contains(rec.Body.String(), "123:ABC") {
+		t.Fatalf("rejected: %d %s", rec.Code, rec.Body.String())
+	}
+
+	s.senders.SetTelegramBase(telegramStub(t, true).URL)
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"webhook":{"kind":"telegram","bot_token":"123:ABC","chat_id":"-100"}}`)), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accepted: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct{ State string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PeekOAuthState(out.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Webhook == nil || pending.Webhook.Kind != "telegram" ||
+		pending.Webhook.ChatID != "-100" || pending.Webhook.BotToken != "123:ABC" {
+		t.Fatalf("pending = %+v", pending.Webhook)
+	}
 }

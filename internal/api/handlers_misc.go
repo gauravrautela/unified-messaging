@@ -257,6 +257,9 @@ func discordWebhookURL(raw string) error {
 	if err != nil || u.Scheme != "https" {
 		return errors.New("url must be an https Discord webhook URL")
 	}
+	if u.User != nil {
+		return errors.New("url must not contain credentials")
+	}
 	host := strings.ToLower(u.Hostname())
 	if host != "discord.com" && host != "discordapp.com" {
 		return errors.New("url must be on discord.com or discordapp.com")
