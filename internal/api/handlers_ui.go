@@ -317,10 +317,21 @@ async function loadWebhook(id) {
   }
 }
 
+// maskDiscordURL mirrors notify.MaskDiscordURL for the browser. A Discord
+// webhook URL is a bearer credential: the API returns it in full to its own
+// developer, but a dashboard ends up in screenshots and screen shares, and the
+// server-side log path is masked for exactly the same reason.
+function maskDiscordURL(u) {
+  return String(u).replace(
+    /^(https?:\/\/(?:[a-z0-9-]+\.)?discord(?:app)?\.com(?::\d+)?\/api\/webhooks\/\d+)\/[^\/\s"?]+/i,
+    "$1/•••");
+}
+
 function renderWebhook(el, hook) {
   if (hook) {
+    var url = hook.kind === "discord" ? maskDiscordURL(hook.url || "") : (hook.url || "");
     var where = hook.kind === "telegram" ? "chat " + escapeHtml((hook.telegram || {}).chat_id || "")
-                                          : "<code>" + escapeHtml(hook.url || "") + "</code>";
+                                          : "<code>" + escapeHtml(url) + "</code>";
     el.innerHTML =
       '<span class="kind">' + escapeHtml(hook.kind || "webhook") + "</span> " + where +
       '<button data-action="remove-webhook" data-wid="' + hook.id + '" class="danger">Remove</button>';

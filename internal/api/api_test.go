@@ -752,6 +752,12 @@ func TestDashboardRendersWebhookForm(t *testing.T) {
 			t.Errorf("dashboard missing %q", want)
 		}
 	}
+	// A Discord webhook URL is a bearer credential, and a dashboard ends up in
+	// screenshots and screen shares. The card masks it client-side, mirroring
+	// notify.MaskDiscordURL — the hook is still returned in full by the API.
+	if !strings.Contains(body, `"$1/•••"`) {
+		t.Error("dashboard does not mask the discord token when rendering a hook")
+	}
 }
 
 // One GET should give a caller the whole message: plain-text body, the folder
