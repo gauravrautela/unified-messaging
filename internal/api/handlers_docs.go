@@ -270,6 +270,24 @@ const ok = crypto.timingSafeEqual(Buffer.from(want), Buffer.from(req.get("X-Outl
 <li>Delivery is <b>at-least-once</b>. Dedupe on <code>(type, email.id)</code>; the <code>X-Outlook-Delivery</code> attempt number tells you a redelivery from a first attempt.</li>
 <li>Inspect the queue for a hook: <code>GET /api/v1/webhooks/{id}/deliveries</code> lists pending and dead deliveries with <code>attempts</code>, <code>next_attempt_at</code> and <code>last_error</code>.</li>
 </ul>
+<h3 id="targets">6.4 Delivery targets: Discord and Telegram</h3>
+<p>A hook has a <code>kind</code>. <code>webhook</code> (the default) receives the JSON event above. <code>discord</code> and <code>telegram</code> receive a short human-readable notification instead &mdash; no signature header, no JSON &mdash; using the same event filter, retry schedule and <code>deliveries</code> log.</p>
+<pre><code># Discord: Server settings → Integrations → Webhooks → New webhook → Copy URL
+{"kind":"discord","url":"https://discord.com/api/webhooks/1234/abcd…","events":["chat_received","mail_received"]}
+
+# Telegram: create a bot with @BotFather, add it to your group/channel, then find the chat id
+#   curl https://api.telegram.org/bot&lt;token&gt;/getUpdates   → "chat":{"id":-1001234567890,…}
+{"kind":"telegram","bot_token":"123456:ABC-DEF…","chat_id":"-1001234567890","events":["chat_received"]}</code></pre>
+<p>The Telegram target is checked once at creation (<code>getChat</code>): a rejected token or chat answers <b>400 invalid_webhook</b> with Telegram&rsquo;s description. The bot token is stored encrypted and is never returned or logged; the response carries <code>telegram.chat_id</code> only. Discord URLs must be on <code>discord.com</code> or <code>discordapp.com</code>.</p>
+<p>What a notification looks like (Discord Markdown; Telegram gets the same in HTML):</p>
+<pre><code>💬 **WhatsApp** · Team chat
+**Alice**: Can we ship Thursday?
+
+📧 **New mail** · me@example.com
+From: Bob &lt;bob@example.com&gt;
+**Q3 plan**
+Hi — attaching the deck we discussed…</code></pre>
+<p>Text is cut at 200 characters for mail and 300 for chat; phone numbers are masked (<code>+91 98••• •855</code>); media shows as <code>[image]</code> etc. Not supported: attachments, replies from the channel, custom templates.</p>
 
 <h2 id="chat">7. Chat (WhatsApp)</h2>
 <div class="note warn">WhatsApp is integrated through the <b>linked-device model</b> &mdash; the same mechanism as web.whatsapp.com &mdash; not the official WhatsApp Business API. The end user links this service as an additional device on their phone by scanning a QR code; nothing is registered as a business number. Meta can ban a number it judges to be automating WhatsApp, so treat this like any other unofficial client: message at a human pace, never send unsolicited bulk messages, and make sure the person you are connecting understands and accepts that risk. The consent screen below exists so they see this before a QR code ever appears.</div>

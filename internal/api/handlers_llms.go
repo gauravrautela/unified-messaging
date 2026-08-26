@@ -93,7 +93,7 @@ Email (complete form, returned by GET /api/v1/emails/{id} and inside events; lis
 
 Webhook:
 ` + "```" + `
-{id, account_id?: "" (developer-wide) | "acc_…", name?, url, secret? (only at creation), events: [..], created_at}
+{id, account_id?: "" | "acc_…", name?, kind: "webhook"|"discord"|"telegram", url? (webhook/discord), secret? (webhook, creation only), telegram?: {chat_id}, events: [..], created_at}
 ` + "```" + `
 
 Event (webhook payload):
@@ -141,6 +141,9 @@ Error:
 - URLs must be public http(s); localhost, loopback, link-local and private IPs are rejected (400 invalid_url / invalid_webhook).
 - Delivery: POST JSON Event with headers ` + "`X-Outlook-Event`" + ` (type), ` + "`X-Outlook-Delivery`" + ` (attempt number), ` + "`X-Outlook-Signature: sha256=<hex HMAC-SHA256 of raw body with secret>`" + `. Respond 2xx within 15 s.
 - Retries after a non-2xx: 30s, 2m, 10m, 30m, 2h, 6h, 12h; then marked dead. ` + "`GET /api/v1/webhooks/{id}/deliveries`" + ` -> ` + "`{items: [{id, webhook_id, account_id, event_type, attempts, next_attempt_at, last_error, dead, created_at}]}`" + `.
+- kind=discord: body ` + "`{kind:\"discord\", url:\"https://discord.com/api/webhooks/…\", name?, events?}`" + `; receives a formatted text message, no signature.
+- kind=telegram: body ` + "`{kind:\"telegram\", bot_token, chat_id, name?, events?}`" + ` (create the bot with ` + "`@BotFather`" + `, then ` + "`getUpdates`" + ` to find ` + "`chat_id`" + `); bot_token is never returned; a Telegram rejection at creation is 400 invalid_webhook, Telegram unreachable is 502 provider_error.
+- Notifications: one message per event, mail snippet ≤200 chars, chat ≤300, phones masked. Same retry schedule and deliveries log as kind=webhook.
 
 ### Account lifecycle
 - ` + "`GET /api/v1/accounts`" + ` -> ` + "`{items: [Account]}`" + `; ` + "`GET /api/v1/accounts/{id}`" + `.
@@ -177,7 +180,7 @@ Error:
 | 409 | account_not_ok, reconnect_required (dead grant, or a chat account with no live socket right now — e.g. connection state "backoff"), consent_required (WhatsApp ` + "`/qr`" + ` polled before consent), idempotency_conflict (` + "`Idempotency-Key`" + ` reused with a different request) |
 | 410 | expired (connect link, or the ~3-minute WhatsApp pairing window) |
 | 415 | json_required (dashboard-session writes only) |
-| 502 | provider_error (message carries the provider's code) |
+| 502 | provider_error (message carries the provider's code; also: Telegram unreachable when creating a telegram hook) |
 | 503 | capacity (chat runtime at ` + "`WHATSAPP_MAX_ACCOUNTS`" + `, or disabled) |
 
 ## Endpoints (generated from the server's route table)
@@ -192,4 +195,5 @@ Error:
 - The event queue is bounded: a subscriber slow enough to fill it pushes back on the producer for 5 s, and only then is an event dropped. Drops are counted and reported as ` + "`dropped_events`" + ` on ` + "`GET /healthz`" + `; a dropped event is never persisted and cannot be replayed.
 - Webhook URL check is literal-IP only; hostnames are not resolved.
 - WhatsApp: text only — media arrives as ` + "`kind: \"unsupported\"`" + ` and cannot be sent. QR linking only, no phone-number pairing codes. One socket per account, capped process-wide at ` + "`WHATSAPP_MAX_ACCOUNTS`" + ` (default 200). Reconnect backoff up to 5 minutes; 30 consecutive failures -> ` + "`CREDENTIALS`" + ` (unreachable).
+- Discord/Telegram targets are one-way and text-only.
 `

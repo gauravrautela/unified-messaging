@@ -341,6 +341,30 @@ SQLite and retried on this schedule after the immediate first attempt:
 30s, 2m, 10m, 30m, 2h, 6h, 12h. After the last one it is marked `dead` and
 kept, visible via the `deliveries` endpoint. The queue survives restarts.
 
+**Forward to Discord / Telegram.** A hook has a `kind`: `webhook` (the
+default, above) sends the raw JSON event; `discord` and `telegram` instead
+send a short, human-readable notification — no signature header, no JSON —
+through the same event filter, retry schedule and `deliveries` log.
+
+```
+# Discord: Server settings → Integrations → Webhooks → New webhook → Copy URL
+{"kind":"discord","url":"https://discord.com/api/webhooks/1234/abcd…","events":["chat_received","mail_received"]}
+
+# Telegram: create a bot with @BotFather, add it to your group/channel, then find the chat id
+#   curl https://api.telegram.org/bot<token>/getUpdates   → "chat":{"id":-1001234567890,…}
+{"kind":"telegram","bot_token":"123456:ABC-DEF…","chat_id":"-1001234567890","events":["chat_received"]}
+```
+
+The Telegram target is checked once at creation (`getChat`): a rejected token
+or chat answers `400 invalid_webhook` with Telegram's own description; an
+unreachable Telegram is `502 provider_error`. The bot token is stored
+encrypted and is never returned or logged — the response carries
+`telegram.chat_id` only. Discord URLs must be on `discord.com` or
+`discordapp.com`. Notification text is cut at 200 characters for mail and 300
+for chat, phone numbers are masked (`+91 98••• •855`), and media shows as
+`[image]` etc. Not supported: attachments, replies from the channel, custom
+templates.
+
 ### Developers, sessions and API keys
 
 | Method | Path | Notes |
