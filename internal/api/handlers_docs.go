@@ -145,7 +145,7 @@ footer{margin-top:3rem;color:var(--muted);font-size:.85rem}
 <tr><td><code>success_redirect_url</code></td><td>Where the user&rsquo;s browser lands afterwards; we append <code>?account_id=…</code>. Optional.</td></tr>
 <tr><td><code>failure_redirect_url</code></td><td>Where the browser lands on cancel/error; we append <code>?error=…&amp;error_description=…</code>. Optional.</td></tr>
 <tr><td><code>notify_url</code></td><td>Server-to-server POST the moment the connection completes, so your backend learns the <code>account_id</code> without depending on the browser. Optional but recommended. Must be a public http(s) URL.</td></tr>
-<tr><td><code>webhook</code></td><td>Register this account&rsquo;s webhook <i>before its first sync</i>, so nothing is missed. <code>events</code> defaults to <code>["mail_received"]</code>. Optional.</td></tr>
+<tr><td><code>webhook</code></td><td>Register this account&rsquo;s webhook <i>before its first sync</i>, so nothing is missed. <code>events</code> defaults to <code>["mail_received"]</code> for a mailbox and <code>["chat_received"]</code> for a chat account. Optional.</td></tr>
 <tr><td><code>provider</code></td><td>Only needed when several providers are configured; see <code>GET /api/v1/providers</code>.</td></tr>
 <tr><td><code>force_consent</code></td><td>Re-prompt consent even if the provider would sign in silently (e.g. after a scope change).</td></tr>
 </table>
@@ -230,7 +230,7 @@ curl -s -X POST "{{.Base}}/api/v1/drafts/$DRAFT_ID/send?account_id=$ACC" -H "Aut
 <p>Register a URL and we POST normalized events to it. Two scopes:</p>
 <table>
 <tr><th>Scope</th><th>Register with</th><th>Receives</th></tr>
-<tr><td>Per account</td><td><code>POST /api/v1/accounts/{id}/webhooks</code> or the <code>webhook</code> field at connect time</td><td>Events for that account only. <code>events</code> defaults to <code>["mail_received"]</code>.</td></tr>
+<tr><td>Per account</td><td><code>POST /api/v1/accounts/{id}/webhooks</code> or the <code>webhook</code> field at connect time</td><td>Events for that account only. <code>events</code> defaults to <code>["mail_received"]</code> for a mailbox and <code>["chat_received"]</code> for a chat account.</td></tr>
 <tr><td>Developer-wide</td><td><code>POST /api/v1/webhooks</code></td><td>Events for every account you own. Empty <code>events</code> means everything.</td></tr>
 </table>
 <pre><code>curl -s -X POST "{{.Base}}/api/v1/accounts/$ACC/webhooks" \

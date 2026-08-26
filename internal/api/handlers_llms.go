@@ -135,7 +135,7 @@ Error:
 - ` + "`PATCH /api/v1/emails/{id}?account_id`" + ` body ` + "`{read?: bool, flagged?: bool}`" + ` -> Email.
 
 ### Webhooks
-- Per account: ` + "`POST /api/v1/accounts/{id}/webhooks`" + ` body ` + "`{url, secret?, name?, events?}`" + ` (events default ` + "`[\"mail_received\"]`" + `) -> 201 Webhook incl. secret once.
+- Per account: ` + "`POST /api/v1/accounts/{id}/webhooks`" + ` body ` + "`{url, secret?, name?, events?}`" + ` (events default ` + "`[\"mail_received\"]`" + ` for a mailbox, ` + "`[\"chat_received\"]`" + ` for a chat account) -> 201 Webhook incl. secret once.
 - Developer-wide: ` + "`POST /api/v1/webhooks`" + ` same body; empty ` + "`events`" + ` means all. ` + "`\"*\"`" + ` also means all.
 - List/delete: ` + "`GET|DELETE /api/v1/webhooks[/{id}]`" + `, ` + "`GET|DELETE /api/v1/accounts/{id}/webhooks[/{wid}]`" + `.
 - URLs must be public http(s); localhost, loopback, link-local and private IPs are rejected (400 invalid_url / invalid_webhook).

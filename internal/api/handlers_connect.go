@@ -90,7 +90,9 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 		}
 		pendingHook = &store.PendingWebhook{
 			Name: req.Webhook.Name, URL: req.Webhook.URL, Secret: req.Webhook.Secret,
-			Events: req.Webhook.eventsOrDefault(),
+			// Left as given: the default depends on the account's kind, which is
+			// only known once the link completes and the hook is bound.
+			Events: req.Webhook.Events,
 		}
 	}
 

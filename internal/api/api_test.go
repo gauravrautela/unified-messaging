@@ -611,10 +611,11 @@ func TestHostedAuthStoresPendingWebhook(t *testing.T) {
 	if pending.Webhook == nil || pending.Webhook.URL != "https://hook.example.com/in" || pending.Webhook.Secret != "s3" {
 		t.Fatalf("pending webhook not stored: %+v", pending.Webhook)
 	}
-	// Unspecified events default to new mail only — that is what the connect
-	// caller almost always wants, and it avoids surprising them with updates.
-	if len(pending.Webhook.Events) != 1 || pending.Webhook.Events[0] != "mail_received" {
-		t.Fatalf("events = %v, want [mail_received]", pending.Webhook.Events)
+	// The filter is stored as given; the kind-specific default (new mail for
+	// a mailbox, new chat message for a chat account) is applied when the
+	// hook is bound to the finished account.
+	if len(pending.Webhook.Events) != 0 {
+		t.Fatalf("events = %v, want none until bind", pending.Webhook.Events)
 	}
 }
 
@@ -2475,5 +2476,29 @@ func TestConsentRejectsANonLinkerState(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
 	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "not_found") {
 		t.Fatalf("consent on a mail state: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A webhook set on a chat account without an explicit filter must subscribe
+// to chat events, not new mail — otherwise a WhatsApp account's dashboard
+// "Set webhook" silently never fires.
+func TestAccountWebhookDefaultsToChatReceivedForChatAccounts(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/accounts/"+acc+"/webhooks",
+		strings.NewReader(`{"url":"https://hook.example.com","secret":"s3"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Routes().ServeHTTP(rec, withSession(t, s, req, dev.ID))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var created model.Webhook
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Events) != 1 || created.Events[0] != model.EventChatReceived {
+		t.Fatalf("events = %v, want [chat_received]", created.Events)
 	}
 }

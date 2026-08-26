@@ -209,11 +209,15 @@ func (r webhookRequest) validate() error {
 	return nil
 }
 
-// eventsOrDefault narrows an unspecified filter to new mail. Account-level
-// hooks are configured by callers who want "tell me when this user gets
-// mail"; the global endpoint keeps its historical "empty means everything".
-func (r webhookRequest) eventsOrDefault() []string {
+// eventsOrDefault narrows an unspecified filter to "a new message arrived"
+// for the account's kind: new mail for a mailbox, new chat message for a
+// chat account. Account-level hooks almost always want exactly that, and a
+// mail-only default on a WhatsApp account would silently never fire.
+func (r webhookRequest) eventsOrDefault(kind string) []string {
 	if len(r.Events) == 0 {
+		if kind == model.AccountKindChat {
+			return []string{model.EventChatReceived}
+		}
 		return []string{model.EventMailReceived}
 	}
 	return r.Events
@@ -232,7 +236,11 @@ func newWebhook(developerID, accountID string, req webhookRequest) (model.Webhoo
 
 // createAccountWebhook is shared by the REST handler and the OAuth callback.
 func (s *Server) createAccountWebhook(developerID, accountID string, req webhookRequest) (model.Webhook, error) {
-	req.Events = req.eventsOrDefault()
+	acct, err := s.store.GetAccount(developerID, accountID)
+	if err != nil {
+		return model.Webhook{}, err
+	}
+	req.Events = req.eventsOrDefault(acct.Kind)
 	hook, err := newWebhook(developerID, accountID, req)
 	if err != nil {
 		return hook, err

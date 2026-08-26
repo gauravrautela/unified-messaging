@@ -298,7 +298,7 @@ accounts' events.
 
 | Method | Path |
 |---|---|
-| `POST` | `/api/v1/accounts/{id}/webhooks` — `{"url": "...", "name": "...", "secret": "...", "events": ["mail_received"]}` (events default to `mail_received`) |
+| `POST` | `/api/v1/accounts/{id}/webhooks` — `{"url": "...", "name": "...", "secret": "...", "events": ["mail_received"]}` (events default to `mail_received` for a mailbox, `chat_received` for a chat account) |
 | `GET` | `/api/v1/accounts/{id}/webhooks` |
 | `DELETE` | `/api/v1/accounts/{id}/webhooks/{wid}` |
 | `POST` | `/api/v1/webhooks` — developer-wide; empty `events` means everything |
