@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -297,6 +298,54 @@ func TestOAuthStateCarriesPendingWebhook(t *testing.T) {
 	got, _ = s.TakeOAuthState("none")
 	if got.Webhook != nil {
 		t.Fatalf("expected no webhook, got %+v", got.Webhook)
+	}
+}
+
+// A pending telegram hook carries a bot token, which is a credential like any
+// other: it must not sit in the oauth_states row in clear for the up-to-30-
+// minute lifetime of the connect attempt.
+func TestOAuthStateSealsPendingTelegramBotToken(t *testing.T) {
+	s := newTestStore(t)
+	s.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	st := OAuthState{
+		State: "tg1", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute),
+		Webhook: &PendingWebhook{Kind: model.WebhookKindTelegram, BotToken: "123:ABC", ChatID: "-100123",
+			Events: []string{"chat_received"}},
+	}
+	if err := s.SaveOAuthState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw string
+	if err := s.db.QueryRow(`SELECT webhook_json FROM oauth_states WHERE state = ?`, "tg1").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw == "" || strings.Contains(raw, "123:ABC") {
+		t.Fatalf("bot token stored unsealed: %q", raw)
+	}
+
+	got, err := s.TakeOAuthState("tg1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Webhook == nil || got.Webhook.BotToken != "123:ABC" || got.Webhook.ChatID != "-100123" {
+		t.Fatalf("pending telegram webhook lost: %+v", got.Webhook)
+	}
+}
+
+// Without a seal key, a pending hook carrying a bot token cannot be saved:
+// storing it unsealed would leak the credential, and there is nothing to
+// unseal it with later anyway.
+func TestOAuthStateWithPendingBotTokenRequiresSealKey(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	st := OAuthState{
+		State: "tg2", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute),
+		Webhook: &PendingWebhook{Kind: model.WebhookKindTelegram, BotToken: "123:ABC", ChatID: "-100123"},
+	}
+	if err := s.SaveOAuthState(st); err == nil {
+		t.Fatal("expected an error without a seal key")
 	}
 }
 

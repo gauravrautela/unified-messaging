@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/secretbox"
 )
 
 // ---------- Graph change-notification subscriptions ----------
@@ -88,14 +90,38 @@ func (s *Store) DeleteSubscription(id string) error {
 
 // ---------- outbound webhooks ----------
 
-const webhookSelect = `SELECT id, developer_id, account_id, name, url, secret, events_json, created_at FROM webhooks`
+const webhookSelect = `SELECT id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config FROM webhooks`
+
+// webhookConfig is the sealed part of a hook: credentials that must not sit
+// in the row in clear. Only telegram hooks have one today.
+type webhookConfig struct {
+	BotToken string `json:"bot_token,omitempty"`
+	ChatID   string `json:"chat_id,omitempty"`
+}
+
+var errNoSealKey = errors.New("store: seal key not set")
 
 func (s *Store) SaveWebhook(w model.Webhook) error {
+	if w.Kind == "" {
+		w.Kind = model.WebhookKindWebhook
+	}
 	ev, _ := json.Marshal(w.Events)
+	config := ""
+	if w.Kind == model.WebhookKindTelegram && w.Telegram != nil {
+		if s.sealKey == nil {
+			return errNoSealKey
+		}
+		raw, _ := json.Marshal(webhookConfig{BotToken: w.Telegram.BotToken, ChatID: w.Telegram.ChatID})
+		sealed, err := secretbox.Seal(s.sealKey, string(raw))
+		if err != nil {
+			return err
+		}
+		config = sealed
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO webhooks (id, developer_id, account_id, name, url, secret, events_json, created_at)
-		VALUES (?,?,?,?,?,?,?,?)`,
-		w.ID, w.DeveloperID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix())
+		INSERT INTO webhooks (id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		w.ID, w.DeveloperID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix(), w.Kind, config)
 	return err
 }
 
@@ -165,13 +191,31 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 	out := []model.Webhook{}
 	for rows.Next() {
 		var w model.Webhook
-		var ev string
+		var ev, kind, config string
 		var created int64
-		if err := rows.Scan(&w.ID, &w.DeveloperID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created); err != nil {
+		if err := rows.Scan(&w.ID, &w.DeveloperID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created, &kind, &config); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(ev), &w.Events)
 		w.CreatedAt = time.Unix(created, 0).UTC()
+		w.Kind = kind
+		if w.Kind == "" {
+			w.Kind = model.WebhookKindWebhook
+		}
+		if w.Kind == model.WebhookKindTelegram {
+			w.Telegram = &model.TelegramTarget{}
+			if config != "" && s.sealKey != nil {
+				if raw, err := secretbox.Open(s.sealKey, config); err == nil {
+					var c webhookConfig
+					_ = json.Unmarshal([]byte(raw), &c)
+					w.Telegram.BotToken, w.Telegram.ChatID = c.BotToken, c.ChatID
+				} else if s.log != nil {
+					// Wrong key or corrupt row: keep the hook listable, deliveries
+					// to it fail with a clear error (see notify.telegramSender).
+					s.log.Warn("webhook config unreadable", "webhook_id", w.ID)
+				}
+			}
+		}
 		out = append(out, w)
 	}
 	return out, rows.Err()
@@ -282,23 +326,54 @@ type OAuthState struct {
 // PendingWebhook is a webhook requested at connect time, before the account
 // it will belong to exists.
 type PendingWebhook struct {
-	Name   string   `json:"name,omitempty"`
-	URL    string   `json:"url"`
-	Secret string   `json:"secret,omitempty"`
-	Events []string `json:"events,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Kind     string   `json:"kind,omitempty"`
+	URL      string   `json:"url,omitempty"`
+	Secret   string   `json:"secret,omitempty"`
+	BotToken string   `json:"bot_token,omitempty"`
+	ChatID   string   `json:"chat_id,omitempty"`
+	Events   []string `json:"events,omitempty"`
 }
 
-func encodePendingWebhook(w *PendingWebhook) string {
+// pendingWebhookSealedPrefix marks a webhook_json value that has been sealed
+// because it carries a bot token, so decode knows to open it first.
+const pendingWebhookSealedPrefix = "sealed:"
+
+// encodePendingWebhook serialises a pending hook for the webhook_json column.
+// When it carries a bot token, the whole JSON blob is sealed (prefixed
+// "sealed:") rather than stored in clear: this row lives for up to 30
+// minutes waiting on the OAuth callback, same as any other secret at rest.
+func (s *Store) encodePendingWebhook(w *PendingWebhook) (string, error) {
 	if w == nil {
-		return ""
+		return "", nil
 	}
 	b, _ := json.Marshal(w)
-	return string(b)
+	if w.BotToken == "" {
+		return string(b), nil
+	}
+	if s.sealKey == nil {
+		return "", errNoSealKey
+	}
+	sealed, err := secretbox.Seal(s.sealKey, string(b))
+	if err != nil {
+		return "", err
+	}
+	return pendingWebhookSealedPrefix + sealed, nil
 }
 
-func decodePendingWebhook(raw string) *PendingWebhook {
+func (s *Store) decodePendingWebhook(raw string) *PendingWebhook {
 	if raw == "" {
 		return nil
+	}
+	if sealed, ok := strings.CutPrefix(raw, pendingWebhookSealedPrefix); ok {
+		if s.sealKey == nil {
+			return nil
+		}
+		opened, err := secretbox.Open(s.sealKey, sealed)
+		if err != nil {
+			return nil
+		}
+		raw = opened
 	}
 	var w PendingWebhook
 	if err := json.Unmarshal([]byte(raw), &w); err != nil {
@@ -308,11 +383,15 @@ func decodePendingWebhook(raw string) *PendingWebhook {
 }
 
 func (s *Store) SaveOAuthState(o OAuthState) error {
-	_, err := s.db.Exec(`
+	wh, err := s.encodePendingWebhook(o.Webhook)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
 		INSERT INTO oauth_states (state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, created_at, expires_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		o.State, o.DeveloperID, o.Provider, o.Verifier, o.SuccessURL, o.FailureURL, o.NotifyURL,
-		encodePendingWebhook(o.Webhook), time.Now().Unix(), o.ExpiresAt.Unix())
+		wh, time.Now().Unix(), o.ExpiresAt.Unix())
 	return err
 }
 
@@ -344,7 +423,7 @@ func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at
 		FROM oauth_states WHERE state = ?`, state).
 		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented)
-	o.Webhook = decodePendingWebhook(wh)
+	o.Webhook = s.decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -381,7 +460,7 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at
 		FROM oauth_states WHERE state = ?`, state).
 		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented)
-	o.Webhook = decodePendingWebhook(wh)
+	o.Webhook = s.decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}

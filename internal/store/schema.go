@@ -128,6 +128,8 @@ CREATE TABLE IF NOT EXISTS webhooks (
   url          TEXT NOT NULL,
   secret       TEXT NOT NULL DEFAULT '',
   events_json  TEXT NOT NULL DEFAULT '[]',
+  kind         TEXT NOT NULL DEFAULT 'webhook',
+  config       TEXT NOT NULL DEFAULT '',
   created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhooks_by_developer ON webhooks(developer_id);
@@ -238,4 +240,6 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 var migrations = []string{
 	`ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'mail'`,
 	`ALTER TABLE oauth_states ADD COLUMN consented_at INTEGER`,
+	`ALTER TABLE webhooks ADD COLUMN kind TEXT NOT NULL DEFAULT 'webhook'`,
+	`ALTER TABLE webhooks ADD COLUMN config TEXT NOT NULL DEFAULT ''`,
 }

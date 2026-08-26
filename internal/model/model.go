@@ -130,6 +130,26 @@ type SendAttachment struct {
 	Content string `json:"content"`
 }
 
+// Webhook kinds. A "webhook" receives the JSON event; "discord" and
+// "telegram" receive a formatted notification (see internal/notify).
+const (
+	WebhookKindWebhook  = "webhook"
+	WebhookKindDiscord  = "discord"
+	WebhookKindTelegram = "telegram"
+)
+
+// KnownWebhookKind reports whether k is one of the three delivery kinds.
+func KnownWebhookKind(k string) bool {
+	return k == WebhookKindWebhook || k == WebhookKindDiscord || k == WebhookKindTelegram
+}
+
+// TelegramTarget is where a kind=telegram hook posts. The bot token is the
+// developer's own credential: sealed at rest, never serialised.
+type TelegramTarget struct {
+	ChatID   string `json:"chat_id"`
+	BotToken string `json:"-"`
+}
+
 // Webhook is a caller-registered endpoint we deliver normalized events to.
 type Webhook struct {
 	ID          string `json:"id"`
@@ -137,13 +157,18 @@ type Webhook struct {
 	// Name is a caller-chosen label echoed in every delivery, so one endpoint
 	// fed by several hooks can tell them apart.
 	Name string `json:"name,omitempty"`
-	// AccountID scopes the hook to one connected mailbox. Empty means global:
+	// AccountID scopes the hook to one connected account. Empty means global:
 	// the hook receives events from every account.
-	AccountID string    `json:"account_id,omitempty"`
-	URL       string    `json:"url"`
-	Secret    string    `json:"secret,omitempty"`
-	Events    []string  `json:"events"`
-	CreatedAt time.Time `json:"created_at"`
+	AccountID string `json:"account_id,omitempty"`
+	// Kind selects the transport and payload shape; see WebhookKind*.
+	Kind string `json:"kind"`
+	// URL is the developer endpoint (webhook) or the Discord incoming-webhook
+	// URL (discord); unused for telegram.
+	URL       string          `json:"url,omitempty"`
+	Secret    string          `json:"secret,omitempty"`
+	Telegram  *TelegramTarget `json:"telegram,omitempty"`
+	Events    []string        `json:"events"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 // Event names we emit.

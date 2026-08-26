@@ -24,11 +24,18 @@ type Store struct {
 	// log is nil until SetLogger is called. Tests never set it, so the store
 	// stays silent unless a process wires one in.
 	log *slog.Logger
+	// sealKey seals per-hook credentials (a Telegram bot token). Nil until
+	// SetSealKey; saving a hook that needs sealing without it is an error.
+	sealKey []byte
 }
 
 // SetLogger attaches the logger the hot query paths trace to. Pass one already
 // tagged with component=store.
 func (s *Store) SetLogger(l *slog.Logger) { s.log = l }
+
+// SetSealKey installs the key used to seal per-hook credentials at rest. It
+// is the same TOKEN_ENCRYPTION_KEY the account manager uses for OAuth tokens.
+func (s *Store) SetSealKey(key []byte) { s.sealKey = key }
 
 // DB exposes the underlying handle for a provider that needs to keep its own
 // tables in the same SQLite file — the WhatsApp adapter's whatsmeow device
