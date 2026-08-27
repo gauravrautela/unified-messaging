@@ -6,11 +6,12 @@ PRAGMA foreign_keys = ON;
 
 -- A developer is a tenant. Everything below is owned by exactly one.
 CREATE TABLE IF NOT EXISTS developers (
-  id            TEXT PRIMARY KEY,
-  email         TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  name          TEXT NOT NULL DEFAULT '',
-  created_at    INTEGER NOT NULL
+  id                    TEXT PRIMARY KEY,
+  email                 TEXT NOT NULL UNIQUE,
+  password_hash         TEXT NOT NULL,
+  name                  TEXT NOT NULL DEFAULT '',
+  created_at            INTEGER NOT NULL,
+  redirect_domains_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -242,4 +243,5 @@ var migrations = []string{
 	`ALTER TABLE oauth_states ADD COLUMN consented_at INTEGER`,
 	`ALTER TABLE webhooks ADD COLUMN kind TEXT NOT NULL DEFAULT 'webhook'`,
 	`ALTER TABLE webhooks ADD COLUMN config TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE developers ADD COLUMN redirect_domains_json TEXT NOT NULL DEFAULT '[]'`,
 }

@@ -222,6 +222,11 @@ type Developer struct {
 	Email     string    `json:"email"`
 	Name      string    `json:"name,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// RedirectDomains is the allowlist a hosted-auth success/failure redirect
+	// URL must match (an entry may be "*.example.com" to cover subdomains).
+	// Always present in JSON, "[]" when empty, so a caller can render it
+	// without a nil check.
+	RedirectDomains []string `json:"redirect_domains"`
 }
 
 // APIKey is the listable view of a key. The full key is returned exactly

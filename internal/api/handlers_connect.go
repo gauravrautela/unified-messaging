@@ -79,12 +79,24 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	ownHost := s.ownRedirectHost(r)
 	for _, u := range []string{req.SuccessRedirectURL, req.FailureRedirectURL} {
 		if u == "" {
 			continue
 		}
-		if parsed, err := url.Parse(u); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		parsed, err := url.Parse(u)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			writeError(w, http.StatusBadRequest, "invalid_url", "redirect urls must be absolute http(s) URLs")
+			return
+		}
+		// A genuine Microsoft/WhatsApp consent must not be able to bounce the
+		// end user's browser to a domain this developer does not control: the
+		// redirect host has to be this server's own origin (the dashboard's
+		// own Connect button) or on the developer's allowlist.
+		host := strings.ToLower(parsed.Hostname())
+		if !strings.EqualFold(host, ownHost) && !hostAllowed(host, dev.RedirectDomains) {
+			writeError(w, http.StatusBadRequest, "invalid_url",
+				"redirect host is not on your allowlist — add it under Settings → Redirect domains")
 			return
 		}
 	}
@@ -418,6 +430,39 @@ func (s *Server) baseURL(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+// ownRedirectHost is the hostname (no port) of this server's own origin, per
+// baseURL — always allowed as a hosted-auth redirect target regardless of a
+// developer's allowlist, since the dashboard's own Connect button redirects
+// here.
+func (s *Server) ownRedirectHost(r *http.Request) string {
+	u, err := url.Parse(s.baseURL(r))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// hostAllowed reports whether host is covered by domains: either an exact,
+// case-insensitive match, or a "*.example.com" entry, which covers any
+// subdomain (x.example.com, a.b.example.com) but not the apex itself.
+func hostAllowed(host string, domains []string) bool {
+	host = strings.ToLower(host)
+	for _, d := range domains {
+		d = strings.ToLower(d)
+		if rest, ok := strings.CutPrefix(d, "*."); ok {
+			suffix := "." + rest
+			if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
+				return true
+			}
+			continue
+		}
+		if host == d {
+			return true
+		}
+	}
+	return false
 }
 
 func appendQuery(raw string, extra url.Values) string {

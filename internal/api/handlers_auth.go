@@ -2,9 +2,12 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -364,4 +367,82 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- redirect-domain allowlist ----
+
+type setRedirectDomainsRequest struct {
+	Domains []string `json:"domains"`
+}
+
+// redirectDomainLabelRe is the shape of one dot-separated label of a redirect
+// domain entry, after an optional leading "*." wildcard is stripped.
+var redirectDomainLabelRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// maxRedirectDomains bounds how large one developer's allowlist can grow, so
+// the hosted-auth check and the dashboard textarea both stay cheap to render.
+const maxRedirectDomains = 20
+
+// normaliseRedirectDomains lower-cases, validates the shape of, and dedupes a
+// caller-supplied redirect-domain allowlist. Each entry must be a bare host —
+// no scheme, no path, no port — optionally prefixed with "*." to cover every
+// subdomain; an IP literal is rejected, since a "domain" allowlist entry that
+// is actually an address does not mean what a developer likely intends.
+func normaliseRedirectDomains(raw []string) ([]string, error) {
+	if len(raw) > maxRedirectDomains {
+		return nil, fmt.Errorf("at most %d redirect domains are allowed", maxRedirectDomains)
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, d := range raw {
+		d = strings.ToLower(strings.TrimSpace(d))
+		host := strings.TrimPrefix(d, "*.")
+		if host == "" {
+			return nil, fmt.Errorf("%q is not a valid redirect domain", d)
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			return nil, fmt.Errorf("%q must not be an IP address", d)
+		}
+		labels := strings.Split(host, ".")
+		if len(labels) < 2 {
+			return nil, fmt.Errorf("%q must have at least two labels", d)
+		}
+		for _, l := range labels {
+			if !redirectDomainLabelRe.MatchString(l) {
+				return nil, fmt.Errorf("%q is not a valid redirect domain", d)
+			}
+		}
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// handleSetRedirectDomains is session-only, like the other account-settings
+// mutations: an API key must not be able to widen its own developer's
+// hosted-auth redirect allowlist.
+func (s *Server) handleSetRedirectDomains(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSession(w, r) {
+		return
+	}
+	dev, _ := developerFrom(r.Context())
+	var req setRedirectDomainsRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	domains, err := normaliseRedirectDomains(req.Domains)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	if err := s.store.SetRedirectDomains(dev.ID, domains); err != nil {
+		logx.From(r.Context()).Error("setting redirect domains", "developer_id", dev.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "could not save the redirect domains")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"redirect_domains": domains})
 }

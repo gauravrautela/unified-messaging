@@ -175,6 +175,16 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
       </form>
       <p id="password-msg" class="sub hidden" style="margin-top:.75rem"></p>
     </div>
+
+    <h2 style="font-size:1.05rem;margin:2rem 0 .5rem">Settings</h2>
+    <p class="sub" style="margin-bottom:.75rem">Hosted-auth success/failure redirect URLs must land on one of these domains (one per line). Use <code>*.example.com</code> to cover every subdomain.</p>
+    <div class="card">
+      <form id="redirect-domains-form" style="display:flex;flex-direction:column;gap:.5rem;max-width:26rem">
+        <textarea id="redirect-domains" rows="4" placeholder="app.example.com&#10;*.example.com" style="font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text);resize:vertical"></textarea>
+        <button class="primary" type="submit" style="align-self:flex-start">Save</button>
+      </form>
+      <p id="redirect-domains-msg" class="sub hidden" style="margin-top:.75rem"></p>
+    </div>
   </div>
 
 </div>
@@ -527,6 +537,33 @@ $("password-form").addEventListener("submit", async (e) => {
   }
 });
 
+async function loadRedirectDomains() {
+  const me = await api("/api/v1/me");
+  $("redirect-domains").value = (me.redirect_domains || []).join("\n");
+}
+
+$("redirect-domains-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const msg = $("redirect-domains-msg");
+  msg.classList.remove("hidden");
+  msg.style.color = "var(--muted)";
+  msg.textContent = "Saving…";
+  const domains = $("redirect-domains").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  try {
+    const res = await api("/api/v1/me/redirect-domains", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains }),
+    });
+    $("redirect-domains").value = (res.redirect_domains || []).join("\n");
+    msg.style.color = "var(--ok)";
+    msg.textContent = "Saved.";
+  } catch (err) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Could not save: " + err.message;
+  }
+});
+
 (async function init() {
   if (new URLSearchParams(location.search).get("connected")) {
     $("banner").textContent = "Account connected.";
@@ -534,7 +571,7 @@ $("password-form").addEventListener("submit", async (e) => {
     history.replaceState(null, "", location.pathname);
   }
   await loadProviders();
-  await Promise.all([loadAccounts(), loadKeys()]);
+  await Promise.all([loadAccounts(), loadKeys(), loadRedirectDomains()]);
 })();
 </script>
 </body></html>`

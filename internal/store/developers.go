@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -33,9 +34,10 @@ func (s *Store) DeveloperByEmail(email string) (model.Developer, string, error) 
 	var d model.Developer
 	var hash string
 	var created int64
+	var rdJSON string
 	err := s.db.QueryRow(`
-		SELECT id, email, name, password_hash, created_at FROM developers WHERE email = ?`,
-		strings.ToLower(strings.TrimSpace(email))).Scan(&d.ID, &d.Email, &d.Name, &hash, &created)
+		SELECT id, email, name, password_hash, created_at, redirect_domains_json FROM developers WHERE email = ?`,
+		strings.ToLower(strings.TrimSpace(email))).Scan(&d.ID, &d.Email, &d.Name, &hash, &created, &rdJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, "", ErrNotFound
 	}
@@ -43,14 +45,16 @@ func (s *Store) DeveloperByEmail(email string) (model.Developer, string, error) 
 		return d, "", err
 	}
 	d.CreatedAt = time.Unix(created, 0).UTC()
+	d.RedirectDomains = decodeRedirectDomains(rdJSON)
 	return d, hash, nil
 }
 
 func (s *Store) GetDeveloper(id string) (model.Developer, error) {
 	var d model.Developer
 	var created int64
-	err := s.db.QueryRow(`SELECT id, email, name, created_at FROM developers WHERE id = ?`, id).
-		Scan(&d.ID, &d.Email, &d.Name, &created)
+	var rdJSON string
+	err := s.db.QueryRow(`SELECT id, email, name, created_at, redirect_domains_json FROM developers WHERE id = ?`, id).
+		Scan(&d.ID, &d.Email, &d.Name, &created, &rdJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -58,7 +62,58 @@ func (s *Store) GetDeveloper(id string) (model.Developer, error) {
 		return d, err
 	}
 	d.CreatedAt = time.Unix(created, 0).UTC()
+	d.RedirectDomains = decodeRedirectDomains(rdJSON)
 	return d, nil
+}
+
+// GetRedirectDomains returns the hosted-auth redirect allowlist for a
+// developer. Unset (fresh row, pre-migration default) reads as an empty,
+// non-nil slice.
+func (s *Store) GetRedirectDomains(developerID string) ([]string, error) {
+	var rdJSON string
+	err := s.db.QueryRow(`SELECT redirect_domains_json FROM developers WHERE id = ?`, developerID).Scan(&rdJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decodeRedirectDomains(rdJSON), nil
+}
+
+// SetRedirectDomains replaces a developer's hosted-auth redirect allowlist.
+// Validation of each entry's shape happens in internal/api; this is a plain
+// JSON-encoded write.
+func (s *Store) SetRedirectDomains(developerID string, domains []string) error {
+	if domains == nil {
+		domains = []string{}
+	}
+	raw, err := json.Marshal(domains)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`UPDATE developers SET redirect_domains_json = ? WHERE id = ?`, string(raw), developerID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// decodeRedirectDomains turns the stored JSON column into a slice that is
+// always non-nil, so callers (not least JSON responses) never have to
+// special-case nil vs empty.
+func decodeRedirectDomains(raw string) []string {
+	var out []string
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out
 }
 
 // DeveloperPasswordHash returns the stored bcrypt hash. Like
@@ -103,11 +158,12 @@ func (s *Store) CreateSession(hash, developerID string, expiresAt time.Time) err
 func (s *Store) SessionDeveloper(hash string, now time.Time) (model.Developer, time.Time, time.Time, error) {
 	var d model.Developer
 	var devCreated, sessCreated, exp int64
+	var rdJSON string
 	err := s.db.QueryRow(`
-		SELECT d.id, d.email, d.name, d.created_at, s.expires_at, s.created_at
+		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, s.expires_at, s.created_at
 		FROM sessions s JOIN developers d ON d.id = s.developer_id
 		WHERE s.id = ? AND s.expires_at > ?`, hash, now.Unix()).
-		Scan(&d.ID, &d.Email, &d.Name, &devCreated, &exp, &sessCreated)
+		Scan(&d.ID, &d.Email, &d.Name, &devCreated, &rdJSON, &exp, &sessCreated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, time.Time{}, time.Time{}, ErrNotFound
 	}
@@ -115,6 +171,7 @@ func (s *Store) SessionDeveloper(hash string, now time.Time) (model.Developer, t
 		return d, time.Time{}, time.Time{}, err
 	}
 	d.CreatedAt = time.Unix(devCreated, 0).UTC()
+	d.RedirectDomains = decodeRedirectDomains(rdJSON)
 	return d, time.Unix(exp, 0).UTC(), time.Unix(sessCreated, 0).UTC(), nil
 }
 
@@ -150,12 +207,13 @@ func (s *Store) DeveloperByKeyHash(hash string) (model.Developer, model.APIKey, 
 	var d model.Developer
 	var k model.APIKey
 	var dCreated, kCreated int64
+	var rdJSON string
 	var last, revoked sql.NullInt64
 	err := s.db.QueryRow(`
-		SELECT d.id, d.email, d.name, d.created_at, k.id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at
+		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, k.id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at
 		FROM api_keys k JOIN developers d ON d.id = k.developer_id
 		WHERE k.hash = ? AND k.revoked_at IS NULL`, hash).
-		Scan(&d.ID, &d.Email, &d.Name, &dCreated, &k.ID, &k.Name, &k.Prefix, &kCreated, &last, &revoked)
+		Scan(&d.ID, &d.Email, &d.Name, &dCreated, &rdJSON, &k.ID, &k.Name, &k.Prefix, &kCreated, &last, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, k, ErrNotFound
 	}
@@ -163,6 +221,7 @@ func (s *Store) DeveloperByKeyHash(hash string) (model.Developer, model.APIKey, 
 		return d, k, err
 	}
 	d.CreatedAt = time.Unix(dCreated, 0).UTC()
+	d.RedirectDomains = decodeRedirectDomains(rdJSON)
 	k.CreatedAt = time.Unix(kCreated, 0).UTC()
 	k.LastUsedAt = nullTime(last)
 	k.RevokedAt = nullTime(revoked)

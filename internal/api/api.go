@@ -78,6 +78,7 @@ var apiRoutes = []string{
 	"POST /api/v1/hosted-auth",
 	"GET /api/v1/me",
 	"POST /api/v1/me/password",
+	"PUT /api/v1/me/redirect-domains",
 	"GET /api/v1/api-keys",
 	"POST /api/v1/api-keys",
 	"DELETE /api/v1/api-keys/{id}",
@@ -169,11 +170,12 @@ func (s *Server) Routes() http.Handler {
 	handlers := map[string]http.HandlerFunc{
 		"POST /api/v1/hosted-auth": s.handleHostedAuth,
 
-		"GET /api/v1/me":               s.handleMe,
-		"POST /api/v1/me/password":     s.handleChangePassword,
-		"GET /api/v1/api-keys":         s.handleListAPIKeys,
-		"POST /api/v1/api-keys":        s.handleCreateAPIKey,
-		"DELETE /api/v1/api-keys/{id}": s.handleRevokeAPIKey,
+		"GET /api/v1/me":                  s.handleMe,
+		"POST /api/v1/me/password":        s.handleChangePassword,
+		"PUT /api/v1/me/redirect-domains": s.handleSetRedirectDomains,
+		"GET /api/v1/api-keys":            s.handleListAPIKeys,
+		"POST /api/v1/api-keys":           s.handleCreateAPIKey,
+		"DELETE /api/v1/api-keys/{id}":    s.handleRevokeAPIKey,
 
 		"GET /api/v1/providers":                       s.handleListProviders,
 		"GET /api/v1/accounts":                        s.handleListAccounts,

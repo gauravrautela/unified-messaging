@@ -404,6 +404,9 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	s, db := newTestServer(t)
 	h := s.Routes()
 	dev, key := seedDev(t, s, "a@x.com")
+	if err := db.SetRedirectDomains(dev.ID, []string{"app.example.com"}); err != nil {
+		t.Fatal(err)
+	}
 
 	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
 		strings.NewReader(`{"success_redirect_url":"https://app.example.com/done"}`)), key)
@@ -768,6 +771,9 @@ func TestDashboardRendersWebhookForm(t *testing.T) {
 	// notify.MaskDiscordURL — the hook is still returned in full by the API.
 	if !strings.Contains(body, `"$1/•••"`) {
 		t.Error("dashboard does not mask the discord token when rendering a hook")
+	}
+	if !strings.Contains(body, `id="redirect-domains"`) {
+		t.Error("dashboard has no redirect-domains settings field")
 	}
 }
 
@@ -1147,8 +1153,11 @@ func TestPageSessionRefreshesCookieExpiry(t *testing.T) {
 // delivery status code comes back through the API — so a loopback or
 // link-local target is an SSRF oracle and must be refused up front.
 func TestWebhookURLMustBePublic(t *testing.T) {
-	s, _ := newTestServer(t)
-	_, key := seedDev(t, s, "a@x.com")
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	if err := db.SetRedirectDomains(dev.ID, []string{"localhost"}); err != nil {
+		t.Fatal(err)
+	}
 	h := s.Routes()
 
 	post := func(t *testing.T, path, body string) int {
@@ -1183,8 +1192,11 @@ func TestWebhookURLMustBePublic(t *testing.T) {
 // end user's browser, never fetched by us, so the SSRF check must not apply
 // to them — only notify_url is a server-to-server target.
 func TestHostedAuthAllowsLocalRedirectURLsButNotLocalNotifyURL(t *testing.T) {
-	s, _ := newTestServer(t)
-	_, key := seedDev(t, s, "a@x.com")
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	if err := db.SetRedirectDomains(dev.ID, []string{"localhost", "127.0.0.1"}); err != nil {
+		t.Fatal(err)
+	}
 	post := func(body string) int {
 		req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(body)), key)
 		req.Header.Set("Content-Type", "application/json")
@@ -1197,6 +1209,62 @@ func TestHostedAuthAllowsLocalRedirectURLsButNotLocalNotifyURL(t *testing.T) {
 	}
 	if c := post(`{"notify_url":"http://127.0.0.1:9/hook"}`); c != http.StatusBadRequest {
 		t.Fatalf("local notify_url: status = %d, want 400", c)
+	}
+}
+
+// The open-redirect fix (I2): a hosted-auth success/failure redirect must
+// land on this server's own origin or on the developer's allowlist, a
+// wildcard entry covers subdomains but not the apex, an API key cannot touch
+// the allowlist, and malformed entries are rejected up front.
+func TestHostedAuthRedirectMustBeAllowlisted(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	mint := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, withKey(httptest.NewRequest("POST", "/api/v1/hosted-auth", strings.NewReader(body)), key))
+		return rec
+	}
+	if rec := mint(`{"success_redirect_url":"https://app.customer.com/done"}`); rec.Code != 400 || !strings.Contains(rec.Body.String(), "allowlist") {
+		t.Fatalf("unlisted host: %d %s", rec.Code, rec.Body.String())
+	}
+	// own origin is always fine (httptest host is example.com)
+	if rec := mint(`{"success_redirect_url":"http://example.com/dashboard"}`); rec.Code != 200 {
+		t.Fatalf("own origin: %d %s", rec.Code, rec.Body.String())
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "/api/v1/me/redirect-domains", strings.NewReader(`{"domains":["*.customer.com","exact.example.org"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rec, withSession(t, s, req, dev.ID))
+	if rec.Code != 200 {
+		t.Fatalf("set: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := mint(`{"success_redirect_url":"https://app.customer.com/done","failure_redirect_url":"https://exact.example.org/x"}`); rec.Code != 200 {
+		t.Fatalf("listed: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := mint(`{"success_redirect_url":"https://customer.com/done"}`); rec.Code != 400 {
+		t.Fatal("apex is not covered by *.customer.com")
+	}
+	// api key cannot change the list; bad entries rejected
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest("PUT", "/api/v1/me/redirect-domains", strings.NewReader(`{"domains":[]}`)), key))
+	if rec.Code != 403 {
+		t.Fatalf("api key: %d", rec.Code)
+	}
+	for _, bad := range []string{`{"domains":["10.0.0.1"]}`, `{"domains":["not a host"]}`, `{"domains":["http://x.com"]}`} {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest("PUT", "/api/v1/me/redirect-domains", strings.NewReader(bad))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rec, withSession(t, s, req, dev.ID))
+		if rec.Code != 400 {
+			t.Errorf("%s: %d", bad, rec.Code)
+		}
+	}
+	// GET /me shows the list
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest("GET", "/api/v1/me", nil), key))
+	if !strings.Contains(rec.Body.String(), `"redirect_domains":["*.customer.com","exact.example.org"]`) {
+		t.Fatalf("me: %s", rec.Body.String())
 	}
 }
 

@@ -98,6 +98,7 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		// Session-only endpoints refuse the key before any lookup.
 		{"DELETE /api/v1/api-keys/{id}", "DELETE", "/api/v1/api-keys/" + keysA[0].ID, nil, 403},
 		{"POST /api/v1/me/password", "POST", "/api/v1/me/password", body(`{"current_password":"longenoughpassword","new_password":"another strong one"}`), 403},
+		{"PUT /api/v1/me/redirect-domains", "PUT", "/api/v1/me/redirect-domains", body(`{"domains":[]}`), 403},
 	}
 	for _, tc := range cases {
 		var req *http.Request
