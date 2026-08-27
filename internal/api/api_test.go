@@ -953,6 +953,20 @@ func TestLogoutClearsSession(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("logout without a csrf token: %d %s", rec.Code, rec.Body.String())
 	}
+	// Refusing has to mean the session is untouched: a response that 403s but
+	// still ships a session-clearing cookie logs the visitor out anyway, which
+	// is the exact attack.
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			t.Fatalf("refused logout still touched the session cookie: %+v", c)
+		}
+	}
+	if raw := rec.Header().Get("Set-Cookie"); strings.Contains(raw, sessionCookie+"=;") || strings.Contains(raw, "Max-Age=0") {
+		t.Fatalf("refused logout cleared a cookie: %q", raw)
+	}
+	if _, _, err := s.auth.SessionDeveloper(context.Background(), mustCookie(t, noToken, sessionCookie)); err != nil {
+		t.Fatalf("refused logout deleted the session server-side: %v", err)
+	}
 
 	c := newCSRF(t, h)
 	req := withSession(t, s, httptest.NewRequest(http.MethodPost, "/logout",
@@ -2830,7 +2844,11 @@ func TestLoginRequiresCSRFAndSameOrigin(t *testing.T) {
 	req := httptest.NewRequest("POST", "/login", strings.NewReader("email=a%40x.com&password=longenoughpassword"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	h.ServeHTTP(rec, req)
-	if rec.Code != 403 || !strings.Contains(rec.Body.String(), "csrf") {
+	// The refusal is the form again, with the reason shown inline — these
+	// routes are reached by a person in a browser. Assert on the message, not
+	// on the string "csrf", which the re-rendered form's hidden field would
+	// satisfy no matter what the handler did.
+	if rec.Code != 403 || !strings.Contains(rec.Body.String(), csrfExpiredMessage) {
 		t.Fatalf("no token: %d %s", rec.Code, rec.Body.String())
 	}
 	// 2. fetch the form to get the token cookie, then post with it
@@ -2867,6 +2885,12 @@ func TestLoginRequiresCSRFAndSameOrigin(t *testing.T) {
 	}
 	if rec := post("http://example.com"); rec.Code != 303 {
 		t.Fatalf("same-origin (httptest host is example.com): %d %s", rec.Code, rec.Body.String())
+	}
+	// This service sends Referrer-Policy: no-referrer, so a real browser posts
+	// this form with `Origin: null` and no Referer. That is the *normal* case,
+	// not an attack: refusing it would refuse every genuine sign-in.
+	if rec := post("null"); rec.Code != 303 {
+		t.Fatalf("opaque origin (the browser case under no-referrer): %d %s", rec.Code, rec.Body.String())
 	}
 	// A stale or foreign token with the right cookie shape is still refused.
 	rec = httptest.NewRecorder()
@@ -2980,5 +3004,48 @@ func TestSessionPagesCarryTheCSRFField(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), `name="csrf" value="`+csrf.Value+`"`) {
 			t.Fatalf("%s: logout form lacks the csrf field", path)
 		}
+	}
+}
+
+// mustCookie reads a cookie off a request the test built, so an assertion can
+// name the exact token the server was handed.
+func mustCookie(t *testing.T, r *http.Request, name string) string {
+	t.Helper()
+	c, err := r.Cookie(name)
+	if err != nil {
+		t.Fatalf("request carries no %s cookie: %v", name, err)
+	}
+	return c.Value
+}
+
+// The CSRF cookie's 12-hour window slides: every render of a form re-issues
+// it, so a dashboard left open all day does not reach a point where its Log
+// out button starts failing.
+func TestCSRFCookieIsReissuedOnEveryRender(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+
+	c := newCSRF(t, h)
+
+	// Come back with the cookie already held, as a browser would.
+	second := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	req.AddCookie(c)
+	h.ServeHTTP(second, req)
+
+	if raw := second.Header().Get("Set-Cookie"); !strings.Contains(raw, csrfCookie+"=") {
+		t.Fatalf("second render did not re-issue the csrf cookie: %q", raw)
+	}
+	var got *http.Cookie
+	for _, sc := range second.Result().Cookies() {
+		if sc.Name == csrfCookie {
+			got = sc
+		}
+	}
+	if got == nil || got.Value != c.Value {
+		t.Fatalf("re-issued cookie = %+v, want the same value %q (a new one would invalidate open tabs)", got, c.Value)
+	}
+	if got.MaxAge != 12*3600 {
+		t.Fatalf("re-issued max-age = %d, want the full window back", got.MaxAge)
 	}
 }

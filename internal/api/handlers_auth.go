@@ -152,11 +152,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.renderAuth(w, r, http.StatusBadRequest, loginPage("", "", "bad form"))
 		return
 	}
-	if !s.checkCSRF(w, r) {
-		return
-	}
 	email := r.PostForm.Get("email")
 	next := r.URL.Query().Get("next")
+	if !s.checkFormCSRF(w, r, func(msg string) authPage { return loginPage(next, email, msg) }) {
+		return
+	}
 	log.Debug("login attempt", "email", strings.ToLower(strings.TrimSpace(email)), "next", next)
 	dev, err := s.auth.Login(r.Context(), email, r.PostForm.Get("password"))
 	if err != nil {
@@ -185,10 +185,10 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		s.renderAuth(w, r, http.StatusBadRequest, signupPage("", "bad form"))
 		return
 	}
-	if !s.checkCSRF(w, r) {
+	email := r.PostForm.Get("email")
+	if !s.checkFormCSRF(w, r, func(msg string) authPage { return signupPage(email, msg) }) {
 		return
 	}
-	email := r.PostForm.Get("email")
 	digest := logx.Digest(strings.ToLower(strings.TrimSpace(email)))
 	log.Debug("signup attempt", "email_digest", digest)
 	dev, err := s.auth.Signup(r.Context(), email, r.PostForm.Get("password"), r.PostForm.Get("name"))
@@ -223,8 +223,9 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, dev model.
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// Logging someone out is state-changing and forgeable from any page, so
-	// it needs the same token as the sign-in forms.
-	if !s.checkCSRF(w, r) {
+	// it needs the same token as the sign-in forms. A refusal renders the
+	// sign-in page: whoever is here was on their way out anyway.
+	if !s.checkFormCSRF(w, r, func(msg string) authPage { return loginPage("", "", msg) }) {
 		return
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
