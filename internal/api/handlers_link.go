@@ -34,8 +34,8 @@ import (
 const linkTTL = 3 * time.Minute
 
 // cookieLinkName names the cookie that binds one browser to one connect
-// state. handleConnectRedirect mints it — only when the browser does not
-// already have one — the moment a Linker provider's landing page is shown;
+// state. handleConnectRedirect mints it — or re-issues the one the browser
+// already has — the moment a Linker provider's landing page is shown;
 // handleConsent and handleLinkQR both require it and bind a state's pairing
 // attempt to whichever value they see first. A /connect/{state} URL that
 // leaks after the flow has already started — forwarded, logged, pasted
@@ -44,22 +44,41 @@ const linkTTL = 3 * time.Minute
 const cookieLinkName = "um_link"
 
 // ensureLinkCookie mints cookieLinkName the first time a browser reaches a
-// Linker provider's landing page for any state. A browser that already has
-// one keeps it, so opening a second connect link in the same browser still
-// binds consistently, and reloading the same link never mints a new one out
-// from under an in-progress pairing attempt.
-func (s *Server) ensureLinkCookie(w http.ResponseWriter, r *http.Request) {
-	if _, err := r.Cookie(cookieLinkName); err == nil {
-		return
+// Linker provider's landing page for any state, and re-issues whatever value
+// the browser already has on every later render. A browser that already has
+// one keeps that value, so opening a second connect link in the same browser
+// still binds consistently, and reloading the same link never mints a new one
+// out from under an in-progress pairing attempt.
+//
+// expiresAt is the connect state's own expiry, and the cookie's lifetime
+// follows it rather than linkTTL. Those are different clocks: linkTTL bounds
+// one QR pairing attempt (3 minutes), while the state lives as long as
+// hosted-auth asked for (30 minutes by default). A cookie that died with the
+// pairing window left the user holding a live link no browser could drive —
+// every /qr poll past the third minute answered 403, and reloading minted a
+// value the state's persisted claim then refused. Re-issuing on each render
+// is what makes that lifetime slide instead of counting down from the first
+// page load.
+func (s *Server) ensureLinkCookie(w http.ResponseWriter, r *http.Request, expiresAt time.Time) {
+	value := logx.RandomToken(32)
+	if c, err := r.Cookie(cookieLinkName); err == nil && c.Value != "" {
+		value = c.Value
+	}
+	// At least a second: a state on the edge of expiry still gets a cookie
+	// the browser keeps for this request's own round trip, and MaxAge 0 would
+	// mean "session cookie" while a negative one would delete it outright.
+	maxAge := int(time.Until(expiresAt).Seconds())
+	if maxAge < 1 {
+		maxAge = 1
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieLinkName,
-		Value:    logx.RandomToken(32),
+		Value:    value,
 		Path:     "/connect/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Secure:   s.requestIsHTTPS(r),
-		MaxAge:   int(linkTTL.Seconds()),
+		MaxAge:   maxAge,
 	})
 }
 

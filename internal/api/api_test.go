@@ -1475,6 +1475,83 @@ func TestHostedAuthRedirectIgnoresSpoofedHostHeader(t *testing.T) {
 	}
 }
 
+// I-1: um_link's lifetime is the connect state's, not a fixed 180 s.
+//
+// The cookie used to expire after linkTTL (3 minutes) while the state it
+// binds lives 30, and ensureLinkCookie returned early whenever one existed,
+// so it never slid either. A user who read the disclosure, consented, and
+// then took more than about two minutes to scan lost the cookie mid-flow:
+// every /qr poll from then on answered 403 link_browser_mismatch, and
+// reloading minted a second value the persisted claim refuses — killing the
+// link for its remaining 27 minutes.
+func TestLinkCookieLifetimeFollowsTheConnectState(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT","expires_in_minutes":30}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hosted-auth: %d %s", rec.Code, rec.Body.String())
+	}
+	var minted hostedAuthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatal(err)
+	}
+
+	linkCookie := func(rec *httptest.ResponseRecorder) *http.Cookie {
+		t.Helper()
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == cookieLinkName {
+				return c
+			}
+		}
+		return nil
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+minted.State, nil))
+	first := linkCookie(rec)
+	if first == nil {
+		t.Fatalf("connect landing page did not set %s: %v", cookieLinkName, rec.Header().Values("Set-Cookie"))
+	}
+	// Whole minutes of slack for the round trip, but nowhere near the old 180.
+	if first.MaxAge < 29*60 || first.MaxAge > 30*60 {
+		t.Fatalf("%s Max-Age = %d, want ≈ the state's remaining 30 minutes", cookieLinkName, first.MaxAge)
+	}
+
+	// A second render of the same page must re-issue the value the browser
+	// already has (sliding it), never skip the Set-Cookie and never mint a
+	// new value out from under an in-progress pairing attempt.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+minted.State, first))
+	again := linkCookie(rec)
+	if again == nil {
+		t.Fatalf("re-render did not re-issue %s: %v", cookieLinkName, rec.Header().Values("Set-Cookie"))
+	}
+	if again.Value != first.Value {
+		t.Fatalf("re-render minted a new %s value; the in-progress claim would be lost", cookieLinkName)
+	}
+	if again.MaxAge < 29*60 || again.MaxAge > 30*60 {
+		t.Fatalf("re-issued %s Max-Age = %d, want ≈ the state's remaining 30 minutes", cookieLinkName, again.MaxAge)
+	}
+
+	// And the flow still works with that cookie, which is the point.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodPost, "/connect/"+minted.State+"/consent", first))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("consent: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+minted.State+"/qr", first))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("qr: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 // The integration guide is public: integrators read it before they have an
 // account, and it carries nothing secret. It must name every registered API
 // route so it cannot drift from what the server actually serves.
