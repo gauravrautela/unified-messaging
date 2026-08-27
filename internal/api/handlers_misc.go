@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -598,7 +599,7 @@ func (s *Server) handleProviderNotification(w http.ResponseWriter, r *http.Reque
 	// their own long-lived goroutine at once, falling back to handling the
 	// rest inline (on a much shorter budget) rather than dropping any of
 	// them.
-	dispatchNotification(func(ctx context.Context) {
+	dispatchNotification(s.log, name, func(ctx context.Context) {
 		if err := s.syncer.HandleNotifications(ctx, name, raw); err != nil {
 			s.log.Warn("handling push notification", "provider", name, "err", err)
 		}
@@ -619,11 +620,23 @@ var notifySem = make(chan struct{}, 32)
 // every slot is taken, fn instead runs inline, on this goroutine, on a much
 // shorter (10 second) budget — slower, but never dropped, and it adds no new
 // goroutine to the pile.
-func dispatchNotification(fn func(ctx context.Context)) {
+//
+// The background branch recovers a panic from fn: this route is
+// unauthenticated by necessity (providers cannot send our API key), so a
+// malformed or malicious payload reaching deep enough to panic must not be
+// able to crash the whole process. The inline branch needs no equivalent
+// guard — it runs on the request's own goroutine, which net/http already
+// recovers.
+func dispatchNotification(log *slog.Logger, providerName string, fn func(ctx context.Context)) {
 	select {
 	case notifySem <- struct{}{}:
 		go func() {
 			defer func() { <-notifySem }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error("push handler panicked", "provider", providerName, "panic", fmt.Sprint(r))
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 			fn(ctx)

@@ -584,13 +584,20 @@ const missCacheTTL = 60 * time.Second
 // server fielding a steady trickle of distinct misses.
 const missSweepEvery = 1000
 
+// missCacheMaxEntries caps how many distinct keys the negative cache may
+// hold at once (spec §8), so a caller probing a wide spread of message ids
+// that will never resolve cannot grow this map without bound between the
+// periodic sweeps above.
+const missCacheMaxEntries = 10000
+
 // missCache is a negative cache: it only ever remembers "this key was a
 // miss", never a hit, so a real message becoming available is picked up
 // immediately (there is nothing to invalidate) while a genuine miss stops
 // being expensive to repeat.
 type missCache struct {
-	m sync.Map // key (string) -> expiry (time.Time)
-	n atomic.Int64
+	m     sync.Map // key (string) -> expiry (time.Time)
+	n     atomic.Int64
+	count atomic.Int64 // live entries currently in m
 }
 
 // hit reports whether key is a currently-unexpired remembered miss. A stale
@@ -602,18 +609,40 @@ func (c *missCache) hit(key string) bool {
 	}
 	expiry := v.(time.Time)
 	if time.Now().After(expiry) {
-		c.m.Delete(key)
+		c.delete(key)
 		return false
 	}
 	return true
 }
 
 // remember records key as a miss for missCacheTTL, sweeping expired entries
-// out of the map every missSweepEvery calls.
+// out of the map every missSweepEvery calls, and enforces missCacheMaxEntries
+// immediately after any insert that pushes the live count over it.
 func (c *missCache) remember(key string) {
-	c.m.Store(key, time.Now().Add(missCacheTTL))
+	_, hadKey := c.m.Swap(key, time.Now().Add(missCacheTTL))
+	if !hadKey {
+		c.count.Add(1)
+	}
 	if c.n.Add(1)%missSweepEvery == 0 {
 		c.sweep()
+	}
+	if c.count.Load() > missCacheMaxEntries {
+		// A sweep first, since the excess is very often just entries that
+		// have already expired and were merely waiting for the periodic
+		// sweep above to catch up to them.
+		c.sweep()
+		if c.count.Load() > missCacheMaxEntries {
+			c.evictExcess()
+		}
+	}
+}
+
+// delete removes key if present, keeping count in sync. Safe to call
+// concurrently with itself and with sweep/evictExcess on the same key: only
+// whichever call actually removes the entry decrements the count.
+func (c *missCache) delete(key any) {
+	if _, deleted := c.m.LoadAndDelete(key); deleted {
+		c.count.Add(-1)
 	}
 }
 
@@ -623,8 +652,25 @@ func (c *missCache) sweep() {
 	now := time.Now()
 	c.m.Range(func(k, v any) bool {
 		if now.After(v.(time.Time)) {
-			c.m.Delete(k)
+			c.delete(k)
 		}
+		return true
+	})
+}
+
+// evictExcess drops entries, in whatever order sync.Map's Range happens to
+// visit them, until the live count is back at or below missCacheMaxEntries.
+// Only reached when a fresh sweep of expired entries was not enough — e.g. a
+// burst of many distinct misses that are all still within their TTL — so
+// which particular unexpired entries get dropped is not load-bearing: they
+// are still just a negative cache, and the next lookup for a dropped key
+// simply falls through to the provider again.
+func (c *missCache) evictExcess() {
+	c.m.Range(func(k, v any) bool {
+		if c.count.Load() <= missCacheMaxEntries {
+			return false
+		}
+		c.delete(k)
 		return true
 	})
 }

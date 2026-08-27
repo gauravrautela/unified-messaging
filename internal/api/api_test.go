@@ -3465,3 +3465,59 @@ func TestQRLinkIsBoundToTheBrowserThatOpenedIt(t *testing.T) {
 		t.Fatalf("qr with the right cookie: %d %+v", rec.Code, q)
 	}
 }
+
+// ---- Task 6 fix round 1: missCache cap, chat body 413, push-handler recover ----
+
+// TestMissCacheEntryCapEnforced is a direct unit test of missCache, not an
+// HTTP-level one: it inserts more distinct keys than missCacheMaxEntries,
+// all with the far-future expiry remember() always uses (60s, far beyond
+// this test's runtime), so the only thing that can bring the live count
+// back down is the entry cap itself — not the TTL-expiry sweep path, which
+// TestMirrorMissIsNegativelyCached already covers.
+func TestMissCacheEntryCapEnforced(t *testing.T) {
+	var mc missCache
+	const n = missCacheMaxEntries + 500
+	for i := 0; i < n; i++ {
+		mc.remember("key-" + strconv.Itoa(i))
+	}
+	if got := mc.count.Load(); got > missCacheMaxEntries {
+		t.Fatalf("count = %d, want <= %d", got, missCacheMaxEntries)
+	}
+}
+
+func TestChatSendRejectsLargeBody(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acctID := seedChat(t, s, db, dev.ID)
+
+	big := strings.Repeat("a", 70<<10) // over readRawBody's 64 KB limit
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chats/c1/messages?account_id="+acctID, strings.NewReader(big))
+	s.Routes().ServeHTTP(rec, withKey(req, key))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+	}
+	var e apiError
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Error.Code != "body_too_large" {
+		t.Fatalf("code = %q, want body_too_large", e.Error.Code)
+	}
+}
+
+// TestPushHandlerRecoversFromPanic drives dispatchNotification's background
+// (goroutine) branch directly with a payload handler that panics, and checks
+// the panic is contained: it is logged rather than crashing the test
+// process, and the semaphore slot it held is still released afterward so a
+// panicking handler cannot leak capacity.
+func TestPushHandlerRecoversFromPanic(t *testing.T) {
+	log, recs := logx.Capture()
+
+	before := len(notifySem)
+	dispatchNotification(log, "TESTPANIC", func(ctx context.Context) {
+		panic("boom")
+	})
+	waitFor(t, func() bool { return recs.Contains("push handler panicked") })
+	waitFor(t, func() bool { return len(notifySem) == before })
+}
