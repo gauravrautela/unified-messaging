@@ -249,4 +249,12 @@ var migrations = []string{
 	`ALTER TABLE webhooks ADD COLUMN config TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE developers ADD COLUMN redirect_domains_json TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE oauth_states ADD COLUMN browser_hash TEXT NOT NULL DEFAULT ''`,
+	// Sessions are now keyed by sha256 of the token — 64 hex characters. Rows
+	// written before that cut-over hold the raw token as the primary key (43
+	// characters: 32 bytes of unpadded base64url). They are inert, since every
+	// lookup hashes first, but they are precisely the "a DB read yields every
+	// live session" artefact the hashing removed, and they sit in every backup
+	// taken before the upgrade. Keyed on length rather than a blanket DELETE so
+	// an upgrade does not sign out every developer who is currently signed in.
+	`DELETE FROM sessions WHERE length(id) <> 64`,
 }

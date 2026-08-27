@@ -1425,3 +1425,56 @@ func TestSearchEscapesLikeWildcards(t *testing.T) {
 		t.Fatalf("ListEmails(q=\"foo_bar\") = %+v, want only m3", got)
 	}
 }
+
+// M-9: the browser_hash migration added a column but left the sessions table
+// alone, so rows written before sessions were hashed still held the token
+// itself as the primary key — inert (a lookup hashes first, and
+// sha256(tok) != tok) but exactly the "a DB read yields every live session"
+// artefact the hashing was meant to remove, sitting in every backup taken
+// before the cut-over. The one-off delete is keyed on length rather than
+// truncating the table, so live hashed sessions survive the upgrade.
+func TestMigrationDropsPreHashSessionRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateDeveloper(model.Developer{ID: "dev_1", Email: "a@x.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Add(time.Hour)
+	// A hashed id is 64 hex characters; a raw token is 43 (32 bytes of
+	// unpadded base64url), which is what the pre-hash rows hold.
+	const hashed = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const plaintext = "0123456789012345678901234567890123456789012"
+	for _, id := range []string{hashed, plaintext} {
+		if err := s.CreateSession(id, "dev_1", exp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	var got []string
+	rows, err := s.DB().Query(`SELECT id FROM sessions ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if len(got) != 1 || got[0] != hashed {
+		t.Fatalf("sessions after reopen = %v, want only the hashed row", got)
+	}
+}
