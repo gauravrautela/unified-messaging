@@ -1472,6 +1472,11 @@ func TestDocsPageIsPublicAndCoversEveryRoute(t *testing.T) {
 			t.Errorf("docs page missing %q", want)
 		}
 	}
+	for _, want := range []string{"redirect-domains", "body_too_large", "me/password"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("docs page missing %q", want)
+		}
+	}
 }
 
 func TestDashboardAndMailLinkToDocs(t *testing.T) {
@@ -1518,6 +1523,11 @@ func TestLLMsTxtIsPublicMarkdownCoveringEveryRoute(t *testing.T) {
 		}
 	}
 	for _, want := range []string{"kind", "discord.com/api/webhooks", "bot_token", "@BotFather"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("llms.txt missing %q", want)
+		}
+	}
+	for _, want := range []string{"redirect-domains", "body_too_large", "me/password"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("llms.txt missing %q", want)
 		}

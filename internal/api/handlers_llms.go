@@ -48,8 +48,10 @@ Spec version: v1
 ## Authentication
 
 - Developers sign up at ` + "`/signup`" + ` and create keys on ` + "`/dashboard`" + `. Keys are shown once.
-- ` + "`GET /api/v1/me`" + ` -> ` + "`{id, email, name, created_at, auth: \"api_key\"|\"session\"}`" + `
+- ` + "`GET /api/v1/me`" + ` -> ` + "`{id, email, name, created_at, redirect_domains: [...], auth: \"api_key\"|\"session\"}`" + `
 - Key management (` + "`POST`" + `/` + "`DELETE /api/v1/api-keys`" + `) is session-only: an API key gets ` + "`403 session_required`" + `.
+- ` + "`POST /api/v1/me/password`" + ` (session-only) body ` + "`{current_password, new_password}`" + ` -> 204; changes the password and signs out every other session. ` + "`400 invalid_credentials`" + ` on a wrong current password, ` + "`400 invalid_body`" + ` if the new one is under 10 characters.
+- ` + "`PUT /api/v1/me/redirect-domains`" + ` (session-only) body ` + "`{domains: [\"app.example.com\", \"*.example.com\"]}`" + ` (max 20, ` + "`*.`" + ` covers subdomains) -> ` + "`{redirect_domains: [...]}`" + `. ` + "`success_redirect_url`" + `/` + "`failure_redirect_url`" + ` on ` + "`hosted-auth`" + ` must be this server's own origin or on this list, else ` + "`400 invalid_url`" + `.
 
 ## Objects
 
@@ -119,6 +121,7 @@ Error:
 3. On completion ` + "`notify_url`" + ` receives ` + "`{status: \"CREATED\", account_id, email, provider}`" + ` or ` + "`{status: \"FAILED\", error, message}`" + `; the browser is redirected to ` + "`success_redirect_url?account_id=…`" + ` or ` + "`failure_redirect_url?error=…`" + `.
 4. Backfill (30 days) runs in the background; ` + "`GET /api/v1/accounts/{id}.last_synced_at`" + ` is set when done.
 5. Reconnecting the same mailbox keeps the same ` + "`account_id`" + `.
+6. ` + "`success_redirect_url`" + `/` + "`failure_redirect_url`" + ` must be this server's own origin or a host on your redirect-domain allowlist (see ` + "`PUT /api/v1/me/redirect-domains`" + ` above) — otherwise step 1 answers ` + "`400 invalid_url`" + `.
 
 ### Read mail
 - ` + "`GET /api/v1/emails?account_id&folder_role=inbox|sentitems|drafts|deleteditems|junkemail|archive&folder_id&thread_id&unread=true&q=<substring>&limit<=200&offset`" + ` -> ` + "`{items: [Email without body], limit, offset}`" + `, newest first.
@@ -138,9 +141,9 @@ Error:
 - Per account: ` + "`POST /api/v1/accounts/{id}/webhooks`" + ` body ` + "`{kind?: \"webhook\"|\"discord\"|\"telegram\", url?, secret?, bot_token?, chat_id?, name?, events?}`" + ` (events default ` + "`[\"mail_received\"]`" + ` for a mailbox, ` + "`[\"chat_received\"]`" + ` for a chat account) -> 201 Webhook incl. secret once. ` + "`kind`" + ` defaults to ` + "`webhook`" + `; see the per-kind bodies below.
 - Developer-wide: ` + "`POST /api/v1/webhooks`" + ` same body; empty ` + "`events`" + ` means all. ` + "`\"*\"`" + ` also means all.
 - List/delete: ` + "`GET /api/v1/webhooks`" + `, ` + "`DELETE /api/v1/webhooks/{id}`" + `, ` + "`GET /api/v1/accounts/{id}/webhooks`" + `, ` + "`DELETE /api/v1/accounts/{id}/webhooks/{wid}`" + ` (there is no single-hook GET).
-- URLs must be public http(s); localhost, loopback, link-local and private IPs are rejected (400 invalid_url / invalid_webhook).
-- Delivery: POST JSON Event with headers ` + "`X-Outlook-Event`" + ` (type), ` + "`X-Outlook-Delivery`" + ` (attempt number), ` + "`X-Outlook-Signature: sha256=<hex HMAC-SHA256 of raw body with secret>`" + `. Respond 2xx within 15 s.
-- Retries after a non-2xx: 30s, 2m, 10m, 30m, 2h, 6h, 12h; then marked dead. ` + "`GET /api/v1/webhooks/{id}/deliveries`" + ` -> ` + "`{items: [{id, webhook_id, account_id, event_type, attempts, next_attempt_at, last_error, dead, created_at}]}`" + `.
+- URLs must be public http(s); localhost, loopback, link-local and private IPs are rejected as written (400 invalid_url / invalid_webhook); the actual delivery additionally re-checks the resolved address at dial time and never follows a redirect.
+- Delivery: POST JSON Event with headers ` + "`X-Outlook-Event`" + ` (type), ` + "`X-Outlook-Delivery`" + ` (attempt number), ` + "`X-Outlook-Signature: sha256=<hex HMAC-SHA256 of raw body with secret>`" + `. Respond 2xx within 15 s — a 3xx (never followed) or any other non-2xx is a failure, ` + "`last_error`" + ` reads ` + "`status <code>`" + `.
+- Retries after a non-2xx: 30s, 2m, 10m, 30m, 2h, 6h, 12h; then marked dead and kept ` + "`DELIVERY_RETENTION_DAYS`" + ` (default 7) before an hourly purge. ` + "`GET /api/v1/webhooks/{id}/deliveries?limit&offset`" + ` (limit default 50, clamps at 200) -> ` + "`{items: [{id, webhook_id, account_id, event_type, attempts, next_attempt_at, last_error, dead, created_at}], limit, offset}`" + `.
 - kind=discord: body ` + "`{kind:\"discord\", url:\"https://discord.com/api/webhooks/…\", name?, events?}`" + `; receives a formatted text message, no signature. The URL must be a plain ` + "`discord.com`" + `/` + "`discordapp.com`" + ` host with no port and no userinfo.
 - kind=telegram: body ` + "`{kind:\"telegram\", bot_token, chat_id, name?, events?}`" + ` (create the bot with ` + "`@BotFather`" + `, then ` + "`getUpdates`" + ` to find ` + "`chat_id`" + `); bot_token is never returned; a Telegram rejection at creation is 400 invalid_webhook, Telegram unreachable is 502 provider_error.
 - Notifications: one message per event, mail snippet ≤200 chars, chat ≤300, phones masked. The whole message is capped at the transport's limit — 2,000 runes for Discord, 4,096 for Telegram — and cut with an ellipsis. Same retry schedule and deliveries log as kind=webhook; a Discord 429 (rate limit) is an ordinary retryable failure, not a permanent one.
@@ -173,12 +176,13 @@ Error:
 
 | status | code |
 |---|---|
-| 400 | invalid_body, missing_account_id, missing_recipients, invalid_webhook, invalid_url, unknown_folder_role, missing_name, unknown_provider ("provider is required"), unsupported_for_kind, missing_text, missing_recipient, missing_emoji, empty_patch |
+| 400 | invalid_body, missing_account_id, missing_recipients, invalid_webhook, invalid_url, unknown_folder_role, missing_name, unknown_provider ("provider is required"), unsupported_for_kind, missing_text, missing_recipient, missing_emoji, empty_patch, attachment_too_large (attachments exceed 3 MB decoded, in total), invalid_credentials (wrong current password on ` + "`POST /api/v1/me/password`" + `) |
 | 401 | unauthorized |
-| 403 | session_required, not_own_message (editing/deleting/reacting to a chat message you did not send) |
+| 403 | session_required (key management and account-settings changes — password, redirect domains — need the dashboard session), not_own_message (editing/deleting/reacting to a chat message you did not send), link_browser_mismatch (a WhatsApp consent/` + "`/qr`" + ` call from a different browser than the one that started it) |
 | 404 | account_not_found, not_found (also for resources owned by another developer) |
 | 409 | account_not_ok, reconnect_required (dead grant, or a chat account with no live socket right now — e.g. connection state "backoff"), consent_required (WhatsApp ` + "`/qr`" + ` polled before consent), idempotency_conflict (` + "`Idempotency-Key`" + ` reused with a different request) |
 | 410 | expired (connect link, or the ~3-minute WhatsApp pairing window) |
+| 413 | body_too_large (request body over this route's limit — 64 KB default, 8 MB on send/reply/forward/drafts) |
 | 415 | json_required (dashboard-session writes only) |
 | 502 | provider_error (message carries the provider's code; also: Telegram unreachable when creating a telegram hook) |
 | 503 | capacity (chat runtime at ` + "`WHATSAPP_MAX_ACCOUNTS`" + `, or disabled) |
@@ -190,10 +194,14 @@ Error:
 
 - Providers: Outlook / Microsoft 365 (mail) and WhatsApp (chat, linked-device model — not the official Business API). No calendar or contacts on either.
 - Backfill window 30 days; older messages fetched on demand by id. (Mail only — WhatsApp has no history sync; a newly linked device only sees messages sent after pairing.)
+- Request bodies are capped per route: 64 KB by default, 8 MB on the mail-send family (emails, reply, forward, drafts) since those carry base64 attachment bytes. Over the cap is 413 body_too_large.
+- Inline attachments are additionally capped at 3 MB total, decoded, by this service — over that is 400 attachment_too_large.
+- Hosted-auth redirect URLs must be this server's own origin or on the developer's redirect-domain allowlist (` + "`PUT /api/v1/me/redirect-domains`" + `, max 20 entries) — otherwise 400 invalid_url.
 - Offset paging on mail; items may shift while a mailbox changes. Chat message paging is cursor-based (` + "`before`" + `/` + "`next_before`" + `) and stable.
-- First webhook attempt is in-memory; a crash before the first POST loses that event (the mirror re-converges on next sync).
+- First webhook attempt is in-memory; a crash before the first POST loses that event (the mirror re-converges on next sync). A dead delivery (retries exhausted) is kept ` + "`DELIVERY_RETENTION_DAYS`" + ` (default 7) before an hourly purge removes it.
 - The event queue is bounded: a subscriber slow enough to fill it pushes back on the producer for 5 s, and only then is an event dropped. Drops are counted and reported as ` + "`dropped_events`" + ` on ` + "`GET /healthz`" + `; a dropped event is never persisted and cannot be replayed.
-- Webhook URL check is literal-IP only; hostnames are not resolved.
+- Webhook/notify_url/redirect URL checks are literal-IP only at registration; hostnames are not resolved there. Delivery, notify and OAuth-redirect fetches all re-check the resolved address at dial time on every connection attempt (so a hostname resolving to a private/loopback/link-local address still fails, just later — last_error reads "not a public address") and never follow a redirect.
+- This service does not rate-limit callers or cap how many keys/webhooks/connect links one developer can create; that is a gateway responsibility (see the README's "Security" section).
 - WhatsApp: text only — media arrives as ` + "`kind: \"unsupported\"`" + ` and cannot be sent. QR linking only, no phone-number pairing codes. One socket per account, capped process-wide at ` + "`WHATSAPP_MAX_ACCOUNTS`" + ` (default 200). Reconnect backoff up to 5 minutes; 30 consecutive failures -> ` + "`CREDENTIALS`" + ` (unreachable).
 - Discord/Telegram targets are one-way and text-only.
 `

@@ -508,6 +508,115 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
 
 ---
 
+## Security
+
+**What this service enforces itself:**
+
+- **Outbound requests it makes on an attacker's behalf** — webhook/Discord/Telegram
+  deliveries, `notify_url` callbacks — go through one `internal/safehttp` client:
+  it never follows a redirect (`CheckRedirect` returns `http.ErrUseLastResponse`,
+  so a 3xx is reported back as a failed delivery, not chased), and its dialer
+  rejects loopback, link-local, private (RFC 1918), CGNAT and multicast
+  addresses **at connect time, after DNS resolution** — so a hostname that
+  resolves to an internal address is still blocked, not just a literal IP.
+  `publicHTTPURL` (in `internal/api/urlcheck.go`) additionally rejects the
+  literal/obvious cases up front, at registration time, as a fast early
+  refusal before a webhook or connect link is even minted.
+- **Sessions and API keys are stored hashed** (SHA-256 via `auth.HashKey`), so a
+  stolen database export does not hand out live credentials. Dashboard
+  sessions slide on use (`SESSION_TTL_DAYS`) but always die by
+  `SESSION_MAX_AGE_DAYS` regardless of activity, so a stolen cookie cannot be
+  kept alive forever.
+- **CSRF on every HTML form** (`/login`, `/signup`, `/logout`): a double-submit
+  token in a `SameSite=Strict` cookie, checked against the posted field with a
+  constant-time compare, plus an `Origin`/`Referer` check. `POST /api/v1/*`
+  writes ridden on the session cookie instead of an API key additionally
+  require `Content-Type: application/json`, which a plain HTML form cannot
+  send.
+- **Security headers on every response**: `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and a
+  `Content-Security-Policy` with `frame-ancestors 'none'`. Tenant- or
+  credential-bearing paths (`/api/*`, `/dashboard`, `/mail`, `/chat`,
+  `/connect/*`, `/login`, `/signup`, …) additionally get
+  `Cache-Control: no-store`; `/docs` and `/llms.txt` deliberately do not,
+  since they carry nothing secret and are meant to be fetched by an
+  AI assistant. `Strict-Transport-Security` is only sent once the request is
+  known to be HTTPS.
+- **`TRUST_PROXY`** governs whether `X-Forwarded-Proto: https` is trusted to
+  mean "this connection was HTTPS" for HSTS and the `Secure` cookie flag. Only
+  set it behind a proxy that itself strips any client-supplied
+  `X-Forwarded-Proto` before setting its own — otherwise a client can spoof
+  "https" and downgrade both protections. Set `PUBLIC_BASE_URL` to the
+  externally reachable `https://` origin alongside it; the code falls back to
+  `r.Host` (an ordinary HTTP request's own idea of its own origin) only when
+  `PUBLIC_BASE_URL` is empty.
+- **A self-service password change and a per-developer redirect allowlist**:
+  `POST /api/v1/me/password` rotates the password and signs out every other
+  session in one call; `PUT /api/v1/me/redirect-domains` (both session-only)
+  is what confines `hosted-auth`'s `success_redirect_url`/`failure_redirect_url`
+  to hosts the developer actually controls, so a compromised or careless API
+  caller cannot make a genuine Microsoft/WhatsApp consent bounce an end
+  user's browser to an arbitrary third-party domain.
+- **A uniform signup error** — a taken email and a malformed one answer
+  identically, in status and wording, so the signup form cannot be used to
+  enumerate registered addresses.
+- **Per-route body limits** (64 KB by default, 8 MB on the send/reply/forward/
+  draft family, `413 body_too_large` over that) and a **3 MB cap on decoded
+  attachment content** (`400 attachment_too_large`) bound how much of a
+  request the server will ever read into memory.
+- **A bounded delivery worker pool and a bounded, dead-lettered retry queue**:
+  webhook delivery runs on a fixed pool rather than one goroutine per event,
+  and a delivery that exhausts its retry schedule is marked `dead` and kept
+  for `DELIVERY_RETENTION_DAYS` (default 7) before an hourly purge deletes it
+  — it still carries the full payload it failed to send until then, so the
+  retention window bounds how long that content sits in the database.
+- **Bounded, negative-cached, defensively-parsed inbound push**: a burst of
+  provider push notifications is capped in how many run in their own
+  goroutine at once (excess is handled inline, on a shorter budget, rather
+  than spawning unboundedly); a mailbox miss is negatively cached so a caller
+  probing nonexistent message ids cannot turn into one upstream call per
+  retry; Microsoft Graph's per-subscription `clientState` is checked with a
+  constant-time compare; and a duplicate subscription (`409` from Graph) is
+  adopted rather than treated as a dial failure.
+- **QR pairing links are bound to the browser that started them**
+  (`um_link` cookie): a `/connect/{state}` URL for a WhatsApp pairing that
+  leaks after the flow has started cannot be used from a second browser to
+  hijack it — both consent and `/qr` answer `403 link_browser_mismatch`
+  otherwise.
+- **`LIKE` search terms are escaped** before being embedded in a query, and
+  the SQLite database file is created (and, if pre-existing, tightened) to
+  mode `0600` so an unrelated local user cannot read sealed tokens or webhook
+  secrets off disk.
+- **Logs never carry a secret.** DEBUG-level request-body logging runs
+  through a key-based redactor and then a value-based scrubber (catches a
+  Discord/Telegram token embedded in a URL, not just under a suspicious key);
+  emails, phone numbers and chat text are one-way digested or size-only, never
+  logged verbatim. See "Logging" above for the full account of what is and
+  isn't retained.
+
+**What this service does not do — and expects the front door (a gateway like
+Kong, or an equivalent reverse proxy) to provide:**
+
+- **Rate limiting and brute-force lockout.** Nothing here throttles repeated
+  bad logins, signups, or API calls; see "Known gaps" below.
+- **Per-developer caps** on how many API keys, webhooks, or connect links one
+  developer can create — an open-signup developer today can create an
+  unbounded number of each.
+- **Send-rate limits** on the mail/chat send routes, so one compromised or
+  careless API key cannot itself become a mail/message bomb.
+- **TLS termination**, setting `X-Forwarded-Proto` (and stripping any
+  client-supplied value first) so the origin can trust it — the origin itself
+  runs with `TRUST_PROXY=true` and `PUBLIC_BASE_URL` set to make use of that.
+
+**Storage.** The single-connection SQLite file (`internal/store`) is a
+development/POC store, sized for one process and one disk — see "Pre-tenancy
+databases are refused" below for its own migration gap. A public deployment
+is expected to move to Postgres; that migration has not shipped yet, and
+until it does this service should not be exposed to untrusted traffic without
+the gateway protections above in front of it.
+
+---
+
 ## Known gaps
 
 - **WhatsApp device keys are stored unsealed** in whatsmeow's own SQLite

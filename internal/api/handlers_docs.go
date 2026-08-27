@@ -126,6 +126,7 @@ footer{margin-top:3rem;color:var(--muted);font-size:.85rem}
 <pre><code>curl -s {{.Base}}/api/v1/me -H "Authorization: Bearer $API_KEY"
 # {"id":"dev_…","email":"you@example.com","name":"…","created_at":"…","auth":"api_key"}</code></pre>
 <div class="note warn">Creating and revoking keys is <b>session-only</b> (dashboard). Calling <code>POST /api/v1/api-keys</code> with an API key returns <code>403 session_required</code>, so a leaked key cannot mint more keys.</div>
+<div class="note">Compromised or just want to rotate your dashboard password? <code>POST /api/v1/me/password</code> (session-only) with <code>{"current_password","new_password"}</code> changes it and signs out every other browser session in the same call &mdash; a wrong current password answers <code>400 invalid_credentials</code>, a new password under 10 characters <code>400 invalid_body</code>.</div>
 
 <h2 id="connect">3. Connect a mailbox</h2>
 <p>You never handle your users&rsquo; provider credentials. You mint a single-use <b>connect link</b>, hand it to the user, and we run the OAuth consent flow. When it completes, the account exists under your developer and syncing starts immediately.</p>
@@ -149,6 +150,7 @@ footer{margin-top:3rem;color:var(--muted);font-size:.85rem}
 <tr><td><code>provider</code></td><td>Only needed when several providers are configured; see <code>GET /api/v1/providers</code>.</td></tr>
 <tr><td><code>force_consent</code></td><td>Re-prompt consent even if the provider would sign in silently (e.g. after a scope change).</td></tr>
 </table>
+<div class="note warn"><code>success_redirect_url</code> and <code>failure_redirect_url</code> must resolve to this server&rsquo;s own origin or a host on your redirect-domain allowlist &mdash; otherwise <code>400 invalid_url</code>, &ldquo;redirect host is not on your allowlist &mdash; add it under Settings &rarr; Redirect domains&rdquo;. Manage the allowlist with <code>PUT /api/v1/me/redirect-domains</code> (session-only), body <code>{"domains": ["app.example.com", "*.example.com"]}</code> &mdash; a leading <code>*.</code> covers every subdomain, up to 20 entries. <code>GET /api/v1/me</code> reports the current list as <code>redirect_domains</code>.</div>
 <h3>3.2 Send the user there</h3>
 <p>Open <code>url</code> in the user&rsquo;s browser (redirect, new tab, or an email link). They see a branded confirmation page, then the provider&rsquo;s own sign-in and consent screens. The link is single-use and expires.</p>
 <h3>3.3 Learn the result</h3>
@@ -265,10 +267,10 @@ const want = "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).dig
 const ok = crypto.timingSafeEqual(Buffer.from(want), Buffer.from(req.get("X-Outlook-Signature")));</code></pre>
 <h3>6.3 Delivery guarantees</h3>
 <ul>
-<li>Respond with any <b>2xx</b> within 15&nbsp;s. Anything else &mdash; or a timeout &mdash; is a failure.</li>
-<li>Failures are retried on a fixed schedule after the immediate first attempt: <b>30s, 2m, 10m, 30m, 2h, 6h, 12h</b>. After the last retry the delivery is marked <code>dead</code> and kept.</li>
+<li>Respond with any <b>2xx</b> within 15&nbsp;s. Anything else &mdash; including a <b>3xx redirect, which is never followed</b> &mdash; or a timeout is a failure; <code>last_error</code> on the delivery reads <code>status &lt;code&gt;</code>.</li>
+<li>Failures are retried on a fixed schedule after the immediate first attempt: <b>30s, 2m, 10m, 30m, 2h, 6h, 12h</b>. After the last retry the delivery is marked <code>dead</code> and kept for <code>DELIVERY_RETENTION_DAYS</code> (default 7) before an hourly purge deletes it.</li>
 <li>Delivery is <b>at-least-once</b>. Dedupe on <code>(type, email.id)</code>; the <code>X-Outlook-Delivery</code> attempt number tells you a redelivery from a first attempt.</li>
-<li>Inspect the queue for a hook: <code>GET /api/v1/webhooks/{id}/deliveries</code> lists pending and dead deliveries with <code>attempts</code>, <code>next_attempt_at</code> and <code>last_error</code>.</li>
+<li>Inspect the queue for a hook: <code>GET /api/v1/webhooks/{id}/deliveries?limit=&amp;offset=</code> lists pending and dead deliveries as <code>{"items","limit","offset"}</code> with <code>attempts</code>, <code>next_attempt_at</code> and <code>last_error</code> per item. <code>limit</code> defaults to 50 and clamps at 200 (never rejected for being too large).</li>
 </ul>
 <h3 id="targets">6.4 Delivery targets: Discord and Telegram</h3>
 <p>A hook has a <code>kind</code>. <code>webhook</code> (the default) receives the JSON event above. <code>discord</code> and <code>telegram</code> receive a short human-readable notification instead &mdash; no signature header, no JSON &mdash; using the same event filter, retry schedule and <code>deliveries</code> log.</p>
@@ -369,12 +371,13 @@ curl -s -X POST "{{.Base}}/api/v1/chats?account_id=$ACC" \
 <pre><code>{"error":{"code":"account_not_found","message":"no such account: acc_…"}}</code></pre>
 <table>
 <tr><th>Status</th><th>Codes</th></tr>
-<tr><td>400</td><td><code>invalid_body</code>, <code>missing_account_id</code>, <code>missing_recipients</code>, <code>invalid_webhook</code>, <code>invalid_url</code>, <code>unknown_folder_role</code>, <code>missing_name</code>, <code>unknown_provider</code> (also "provider is required"), <code>unsupported_for_kind</code> (a mail route on a chat account or vice versa), <code>missing_text</code>, <code>missing_recipient</code>, <code>missing_emoji</code>, <code>empty_patch</code></td></tr>
+<tr><td>400</td><td><code>invalid_body</code>, <code>missing_account_id</code>, <code>missing_recipients</code>, <code>invalid_webhook</code>, <code>invalid_url</code>, <code>unknown_folder_role</code>, <code>missing_name</code>, <code>unknown_provider</code> (also "provider is required"), <code>unsupported_for_kind</code> (a mail route on a chat account or vice versa), <code>missing_text</code>, <code>missing_recipient</code>, <code>missing_emoji</code>, <code>empty_patch</code>, <code>attachment_too_large</code> (attachments exceed 3&nbsp;MB decoded, in total), <code>invalid_credentials</code> (wrong current password on <code>POST /api/v1/me/password</code>)</td></tr>
 <tr><td>401</td><td><code>unauthorized</code> &mdash; missing, invalid or revoked key</td></tr>
-<tr><td>403</td><td><code>session_required</code> &mdash; key management needs the dashboard session; <code>not_own_message</code> &mdash; editing, deleting or the like on a chat message you did not send</td></tr>
+<tr><td>403</td><td><code>session_required</code> &mdash; key management and account-settings changes (password, redirect domains) need the dashboard session; <code>not_own_message</code> &mdash; editing, deleting or the like on a chat message you did not send; <code>link_browser_mismatch</code> &mdash; a WhatsApp <code>/connect/{state}</code> consent or <code>/qr</code> poll from a different browser than the one that started it</td></tr>
 <tr><td>404</td><td><code>account_not_found</code>, <code>not_found</code> &mdash; including anything owned by another developer</td></tr>
 <tr><td>409</td><td><code>account_not_ok</code>, <code>reconnect_required</code> (the grant is dead, or a chat account has no live socket right now &mdash; e.g. its connection is in <code>backoff</code>), <code>consent_required</code> (WhatsApp <code>/qr</code> polled before consent), <code>idempotency_conflict</code> (an <code>Idempotency-Key</code> reused with a different request)</td></tr>
 <tr><td>410</td><td><code>expired</code> &mdash; the connect link (or its ~3-minute WhatsApp pairing window) elapsed</td></tr>
+<tr><td>413</td><td><code>body_too_large</code> &mdash; the request body exceeded this route's size limit (64&nbsp;KB by default, 8&nbsp;MB on send/reply/forward/drafts)</td></tr>
 <tr><td>415</td><td><code>json_required</code> &mdash; dashboard-session writes must send <code>Content-Type: application/json</code></td></tr>
 <tr><td>502</td><td><code>provider_error</code> &mdash; the mail or chat provider failed; the message carries its error code</td></tr>
 <tr><td>503</td><td><code>capacity</code> &mdash; the chat runtime is at <code>WHATSAPP_MAX_ACCOUNTS</code> live connections, or disabled</td></tr>
@@ -419,11 +422,14 @@ curl -s -X POST "$BASE/api/v1/emails/$MSG/reply?account_id=$ACC" -H "Authorizati
 <ul>
 <li>Outlook / Microsoft 365 and WhatsApp are the only providers today. Calendar and contacts are not exposed for either.</li>
 <li>Backfill is bounded (30 days by default); older mail is fetched on demand by <code>GET /api/v1/emails/{id}</code>.</li>
-<li>Inline attachment uploads are capped by the provider (~3&nbsp;MB).</li>
-<li>Webhook delivery is at-least-once; the very first attempt is in-memory, so a crash between an event and its first POST can lose it &mdash; the next sync re-converges the mirror but does not replay the event.</li>
+<li>Request bodies are capped per route: <b>64&nbsp;KB</b> by default, <b>8&nbsp;MB</b> on the mail-send family (<code>emails</code>, <code>reply</code>, <code>forward</code>, <code>drafts</code>) since those carry base64 attachment bytes. Over the cap is <code>413 body_too_large</code>.</li>
+<li>Inline attachment uploads are additionally capped at <b>3&nbsp;MB</b> total, decoded, by this service (on top of whatever the provider itself enforces) &mdash; over that is <code>400 attachment_too_large</code>.</li>
+<li>Hosted-auth <code>success_redirect_url</code>/<code>failure_redirect_url</code> must be this server's own origin or on the developer's redirect-domain allowlist (<code>PUT /api/v1/me/redirect-domains</code>, up to 20 entries) &mdash; otherwise <code>400 invalid_url</code>.</li>
+<li>Webhook delivery is at-least-once; the very first attempt is in-memory, so a crash between an event and its first POST can lose it &mdash; the next sync re-converges the mirror but does not replay the event. A dead delivery (retries exhausted) is kept for <code>DELIVERY_RETENTION_DAYS</code> (default 7) before an hourly purge removes it.</li>
 <li>The event queue is bounded. A subscriber slow enough to fill it pushes back on the producer for 5&nbsp;s and only then is an event dropped; drops are counted and reported as <code>dropped_events</code> on <code>GET /healthz</code>. A dropped event is never persisted and cannot be replayed.</li>
 <li>Paging is offset-based; a mailbox that changes during pagination can shift items between pages.</li>
-<li>Webhook URLs are checked for literal private/loopback addresses only; hostnames are not resolved.</li>
+<li>Webhook, <code>notify_url</code> and redirect URLs are checked for literal private/loopback/link-local addresses only at registration; a hostname is not resolved at that point. The actual delivery, notify and OAuth-redirect fetches all go through a dial-time guard that rejects a resolved private/loopback/link-local address on every connection attempt (so a hostname that resolves to one still fails, just later &mdash; the delivery's <code>last_error</code> reads "not a public address"), and never follow a redirect.</li>
+<li>This service does not rate-limit or throttle callers, or cap how many API keys, webhooks or connect links one developer can create &mdash; a gateway/reverse proxy in front of it is expected to (see the README's "Security" section).</li>
 <li><b>WhatsApp: text only.</b> Media messages arrive as <code>kind: "unsupported"</code>; there is no way to send an attachment.</li>
 <li><b>WhatsApp: no history sync.</b> Linking a device only sees messages sent after pairing, the same as WhatsApp Web/Desktop.</li>
 <li><b>WhatsApp: QR linking only.</b> Phone-number pairing codes are not implemented.</li>
