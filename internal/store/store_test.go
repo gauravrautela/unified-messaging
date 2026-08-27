@@ -1355,6 +1355,8 @@ func TestSearchEscapesLikeWildcards(t *testing.T) {
 	for _, e := range []model.Email{
 		{AccountID: acct, ID: "m1", Subject: "50% off", Date: now},
 		{AccountID: acct, ID: "m2", Subject: "500 off", Date: now},
+		{AccountID: acct, ID: "m3", Subject: "foo_bar", Date: now},
+		{AccountID: acct, ID: "m4", Subject: "fooxbar", Date: now},
 	} {
 		if err := s.UpsertEmail(e); err != nil {
 			t.Fatal(err)
@@ -1366,5 +1368,16 @@ func TestSearchEscapesLikeWildcards(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != "m1" {
 		t.Fatalf("ListEmails(q=\"50%%\") = %+v, want only m1", got)
+	}
+
+	// "_" is LIKE's single-character wildcard; escaped, it must match only
+	// the literal underscore, not "fooxbar" (where "_" would otherwise match
+	// the "x").
+	got, err = s.ListEmails(EmailQuery{AccountID: acct, Search: "foo_bar"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "m3" {
+		t.Fatalf("ListEmails(q=\"foo_bar\") = %+v, want only m3", got)
 	}
 }

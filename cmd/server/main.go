@@ -73,8 +73,12 @@ func run(log *slog.Logger) error {
 	// process accumulated expired rows for its whole life; dead deliveries
 	// carry a full message payload each and were never purged at all. An
 	// hourly sweep bounds both, stopped by the same signal context that stops
-	// everything else.
+	// everything else. purgeDone is closed once the loop actually exits, so
+	// shutdown can wait for it rather than let db.Close() (deferred above)
+	// race a purge query still in flight against the same connection.
+	purgeDone := make(chan struct{})
 	go func() {
+		defer close(purgeDone)
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
 		for {
@@ -204,6 +208,11 @@ func run(log *slog.Logger) error {
 	if n := dispatcher.Dropped(); n > 0 {
 		log.Warn("events dropped during this process's lifetime", "dropped_total", n)
 	}
+	// ctx (the signal context) is already cancelled by this point, so the
+	// purge loop has already seen <-ctx.Done() and is on its way out; this
+	// just makes sure it has actually finished before the deferred db.Close()
+	// runs, the same way dispatcher.Wait() bounds the dispatcher above.
+	<-purgeDone
 	return nil
 }
 

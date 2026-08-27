@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -531,5 +532,69 @@ func TestSlowHookDoesNotBlockOtherHooks(t *testing.T) {
 	waitFor(t, func() bool { return fast.count() == 1 })
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("fast hook waited behind the slow one")
+	}
+}
+
+// deliver's fan-out must not return before every hook goroutine it spawned
+// has finished: an early return partway through the loop (the encoding-
+// failure branch used to do this) would let the caller — the delivery loop,
+// or drain on shutdown — move on while a send was still in flight.
+func TestDeliverWaitsForSpawnedHookBeforeReturning(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	safehttp.AllowLoopbackForTests(t)
+	var hit atomic.Bool
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		hit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(slow.Close)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_slow", DeveloperID: "dev_1", AccountID: "acc_1", URL: slow.URL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(db, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Calling deliver directly (same package) rather than through Start/Emit
+	// isolates exactly what is under test: this call's own duration. sem is
+	// normally built by Start; build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+
+	start := time.Now()
+	d.deliver(context.Background(), model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "x"}})
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("deliver returned after %v, want >= 200ms (it must wait for the hook it spawned)", elapsed)
+	}
+	if !hit.Load() {
+		t.Fatal("the slow hook was never actually invoked")
+	}
+}
+
+// A payload that fails to encode (a Timestamp outside the range
+// time.Time.MarshalJSON accepts) must not derail the rest of the dispatcher:
+// the failing hook is skipped, not the whole fan-out, and the very next
+// event still delivers normally.
+func TestDeliverSkipsOnlyTheHookThatFailsToEncode(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	rcv := newReceiver(t, http.StatusOK)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(db, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	// time.Time.MarshalJSON rejects a year outside [0, 9999], so this event
+	// fails to encode for every hook it reaches.
+	bad := model.Event{Type: model.EventMailReceived, AccountID: "acc_1",
+		Timestamp: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC), Email: &model.Email{Subject: "bad"}}
+	d.Emit(bad)
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "good"}})
+
+	waitFor(t, func() bool { return rcv.count() == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if rcv.count() != 1 {
+		t.Fatalf("hits = %d, want exactly 1 (the bad event must not double-fire or hang the queue)", rcv.count())
 	}
 }

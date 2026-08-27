@@ -218,6 +218,11 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 	}
 	d.log.Debug("dispatching", "event", ev.Type, "account_id", ev.AccountID, "hooks", len(hooks))
 	var wg sync.WaitGroup
+	// Deferred so a mid-loop failure (the encoding error below) still waits
+	// for whatever hooks were already spawned before it: an early return that
+	// skipped this would let the next event start, or let drain's Wait()
+	// return, while those goroutines were still in flight.
+	defer wg.Wait()
 	for _, h := range hooks {
 		if !subscribes(h, ev.Type) {
 			d.log.Debug("hook skipped", "webhook_id", h.ID, "account_id", ev.AccountID,
@@ -232,7 +237,9 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 		payload, err := json.Marshal(evForHook)
 		if err != nil {
 			d.log.Error("encoding event", "err", err)
-			return
+			// Skip only this hook, not the rest of the fan-out: another
+			// subscriber's payload may still encode fine.
+			continue
 		}
 		dl := store.Delivery{
 			WebhookID: h.ID, AccountID: ev.AccountID, EventType: ev.Type,
@@ -257,7 +264,6 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 				"decision", "delivered", "attempts", 1)
 		}()
 	}
-	wg.Wait()
 }
 
 // enqueue parks a delivery after its first failure.
