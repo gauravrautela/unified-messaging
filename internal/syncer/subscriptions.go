@@ -125,10 +125,10 @@ func (s *Syncer) EnsureSubscription(ctx context.Context, accountID string) error
 	}
 
 	log.Debug("subscription decision", "decision", "create", "existing", len(existing))
-	return s.createSubscription(ctx, accountID, acct.Provider, pusher)
+	return s.createSubscription(ctx, accountID, acct.Provider, pusher, false)
 }
 
-func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName string, pusher provider.Pusher) error {
+func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName string, pusher provider.Pusher, retried bool) error {
 	// clientState is the shared secret authenticating inbound notifications.
 	// Providers generally cannot send custom headers, so this value is the only
 	// thing proving a POST to our notification endpoint is genuine.
@@ -144,12 +144,22 @@ func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName
 	})
 	if err != nil {
 		if errors.Is(err, provider.ErrSubscriptionExists) {
+			if retried {
+				// We already deleted everything the provider listed and tried
+				// again once; a second "duplicate" means either Delete silently
+				// failed to take effect or the provider is lying to us. Either
+				// way, looping forever is worse than surfacing it.
+				logx.From(ctx).With("component", "syncer").Error(
+					"provider still reports an existing subscription after replacing it",
+					"account_id", accountID)
+				return errors.New("syncer: provider still reports an existing subscription after replacing it")
+			}
 			// A subscription we lost track of is still alive upstream. Its
 			// clientState is one we never knew, so notifications for it could
 			// only ever be checked by subscription ID — not good enough to
 			// trust, since anyone who learns that ID could force a sync.
 			// Replace it with one we mint ourselves instead of adopting it blind.
-			return s.adoptExisting(ctx, accountID, providerName, pusher)
+			return s.adoptExisting(ctx, accountID, providerName, pusher, true)
 		}
 		return err
 	}
@@ -169,7 +179,7 @@ func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName
 // learned or guessed the ID could force a sync with no secret at all. Deleting
 // and recreating costs one extra round trip but ensures every stored
 // subscription carries a clientState only we ever knew.
-func (s *Syncer) adoptExisting(ctx context.Context, accountID, providerName string, pusher provider.Pusher) error {
+func (s *Syncer) adoptExisting(ctx context.Context, accountID, providerName string, pusher provider.Pusher, retried bool) error {
 	remote, err := pusher.List(ctx, accountID)
 	if err != nil {
 		return err
@@ -185,7 +195,7 @@ func (s *Syncer) adoptExisting(ctx context.Context, accountID, providerName stri
 		}
 	}
 	log.Info("replaced pre-existing subscription", "account_id", accountID, "count", len(remote))
-	return s.createSubscription(ctx, accountID, providerName, pusher)
+	return s.createSubscription(ctx, accountID, providerName, pusher, retried)
 }
 
 // HandleNotifications processes an inbound push payload from a named provider.

@@ -366,6 +366,10 @@ type OAuthState struct {
 	// consent_required. Mail providers never set this; consent there is
 	// Microsoft's own screen.
 	ConsentedAt *time.Time
+	// BrowserHash is the sha256 of the um_link cookie belonging to whichever
+	// browser first claimed this state via ClaimOAuthStateBrowser. Empty
+	// means unclaimed.
+	BrowserHash string
 }
 
 // PendingWebhook is a webhook requested at connect time, before the account
@@ -480,9 +484,9 @@ func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 	var wh string
 	var consented sql.NullInt64
 	err := s.db.QueryRow(`
-		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at
+		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at, browser_hash
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented)
+		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented, &o.BrowserHash)
 	o.Webhook = s.decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
@@ -517,9 +521,9 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 	var wh string
 	var consented sql.NullInt64
 	err := s.db.QueryRow(`
-		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at
+		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at, browser_hash
 		FROM oauth_states WHERE state = ?`, state).
-		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented)
+		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented, &o.BrowserHash)
 	o.Webhook = s.decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
@@ -530,4 +534,26 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 	}
 	o.ExpiresAt = time.Unix(exp, 0).UTC()
 	return o, err
+}
+
+// ClaimOAuthStateBrowser binds state to hash the first time anything claims
+// it, and confirms the match on every call after: the UPDATE only touches a
+// row whose browser_hash is still empty or already equals hash, so exactly
+// one browser hash ever "wins" a given state. Reports true when the row now
+// carries hash (this call claimed it, or a previous call already had) and
+// false on a genuine mismatch or an unknown state — the caller cannot tell
+// those apart from the return value alone, which is fine: both mean refuse.
+func (s *Store) ClaimOAuthStateBrowser(state, hash string) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE oauth_states SET browser_hash = ?
+		WHERE state = ? AND (browser_hash = '' OR browser_hash = ?)`,
+		hash, state, hash)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }

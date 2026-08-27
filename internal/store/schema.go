@@ -148,7 +148,11 @@ CREATE TABLE IF NOT EXISTS oauth_states (
   webhook_json   TEXT NOT NULL DEFAULT '',
   created_at     INTEGER NOT NULL,
   expires_at     INTEGER NOT NULL,
-  consented_at   INTEGER
+  consented_at   INTEGER,
+  -- browser_hash is the sha256 of the um_link cookie belonging to whichever
+  -- browser first claimed this connect state (consent, normally, or a /qr
+  -- retry after a previous pairing attempt failed). Empty means unclaimed.
+  browser_hash   TEXT NOT NULL DEFAULT ''
 );
 
 -- Failed webhook deliveries waiting for a retry. A row is removed on success,
@@ -244,4 +248,5 @@ var migrations = []string{
 	`ALTER TABLE webhooks ADD COLUMN kind TEXT NOT NULL DEFAULT 'webhook'`,
 	`ALTER TABLE webhooks ADD COLUMN config TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE developers ADD COLUMN redirect_domains_json TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE oauth_states ADD COLUMN browser_hash TEXT NOT NULL DEFAULT ''`,
 }

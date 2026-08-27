@@ -41,9 +41,19 @@ type FakeMail struct {
 	DuplicateOnce bool
 	dupUsed       atomic.Bool
 
+	// AlwaysDuplicate makes every Create call report
+	// provider.ErrSubscriptionExists, simulating a provider that keeps
+	// reporting a duplicate even after every subscription it listed has been
+	// deleted — the pathological case the retried-bool recursion guard exists
+	// for.
+	AlwaysDuplicate bool
+
 	// ListSubs is what List reports for every account; nil means "none",
 	// matching a provider that genuinely has nothing registered.
 	ListSubs []provider.Subscription
+
+	createCalls atomic.Int64
+	listCalls   atomic.Int64
 
 	mu            sync.Mutex
 	deleted       []string
@@ -121,11 +131,18 @@ func (f *FakeMail) SendDraft(ctx context.Context, accountID, draftID string) err
 // push-capable one without further wiring.
 
 func (f *FakeMail) Create(ctx context.Context, accountID string, cfg provider.PushConfig) (provider.Subscription, error) {
+	f.createCalls.Add(1)
+	if f.AlwaysDuplicate {
+		return provider.Subscription{}, provider.ErrSubscriptionExists
+	}
 	if f.DuplicateOnce && !f.dupUsed.Swap(true) {
 		return provider.Subscription{}, provider.ErrSubscriptionExists
 	}
 	return provider.Subscription{ID: "FAKESUB1", ExpiresAt: time.Now().Add(48 * time.Hour)}, nil
 }
+
+// CreateCalls reports how many times Create has been invoked.
+func (f *FakeMail) CreateCalls() int64 { return f.createCalls.Load() }
 
 func (f *FakeMail) Renew(ctx context.Context, accountID, subscriptionID string) (provider.Subscription, error) {
 	return provider.Subscription{ID: subscriptionID}, nil
@@ -146,8 +163,12 @@ func (f *FakeMail) Deleted() []string {
 }
 
 func (f *FakeMail) List(ctx context.Context, accountID string) ([]provider.Subscription, error) {
+	f.listCalls.Add(1)
 	return f.ListSubs, nil
 }
+
+// ListCalls reports how many times List has been invoked.
+func (f *FakeMail) ListCalls() int64 { return f.listCalls.Load() }
 
 func (f *FakeMail) RenewBefore() time.Duration { return 10 * time.Minute }
 

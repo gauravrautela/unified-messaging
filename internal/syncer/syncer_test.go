@@ -483,6 +483,66 @@ func TestAdoptedSubscriptionIsReplacedNotTrusted(t *testing.T) {
 	}
 }
 
+// A provider that keeps reporting a duplicate even after every subscription
+// it listed has been deleted — Delete silently failing to take effect
+// upstream, or the provider simply lying — must not send EnsureSubscription
+// into unbounded recursion. One retry (delete-everything-then-create-again)
+// is allowed; a second ErrSubscriptionExists after that must be a hard error,
+// not another adopt attempt.
+func TestCreateSubscriptionStopsRetryingAfterOneAdopt(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "alwaysdup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAccount(model.Account{
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "FAKEMAIL", Email: "me@example.com", Status: model.AccountOK,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	fm.AlwaysDuplicate = true
+	fm.ListSubs = []provider.Subscription{
+		{ID: "REMOTE1", Resource: "me/mailFolders/inbox/messages", ExpiresAt: time.Now().Add(24 * time.Hour)},
+	}
+
+	log, recs := logx.Capture()
+	s := New(db, provider.NewRegistry(fm), nil, events.NewDispatcher(db, nil, log), log,
+		Options{PollInterval: time.Hour, PublicBaseURL: "https://example.com"})
+
+	ctx := logx.With(context.Background(), log)
+	err = s.EnsureSubscription(ctx, "acc_1")
+	if err == nil {
+		t.Fatal("EnsureSubscription = nil error, want the provider-still-duplicate error")
+	}
+	if !strings.Contains(err.Error(), "still reports an existing subscription after replacing it") {
+		t.Fatalf("err = %v, want the bounded-retry error", err)
+	}
+
+	// Exactly one retry: Create ran twice (the original attempt plus the one
+	// retry after adopting), List and Delete ran exactly once each (one
+	// adopt attempt, not one per Create).
+	if n := fm.CreateCalls(); n != 2 {
+		t.Fatalf("Create calls = %d, want 2 (original + one retry)", n)
+	}
+	if n := fm.ListCalls(); n != 1 {
+		t.Fatalf("List calls = %d, want 1 (exactly one adopt attempt)", n)
+	}
+	if got := fm.Deleted(); len(got) != 1 || got[0] != "REMOTE1" {
+		t.Fatalf("Delete calls = %v, want exactly [REMOTE1]", got)
+	}
+	if !recs.Contains("provider still reports an existing subscription after replacing it") {
+		t.Errorf("missing bounded-retry error log: %v", recs.All())
+	}
+	if subs, _ := db.SubscriptionsForAccount("acc_1"); len(subs) != 0 {
+		t.Fatalf("a subscription was stored despite the hard failure: %+v", subs)
+	}
+}
+
 // HandleNotifications must reject anything but an exact clientState match: an
 // empty one (the shape an adopted-and-trusted subscription used to have), and
 // a near-miss that only differs by case, must both be treated as forged.

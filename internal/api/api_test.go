@@ -3521,3 +3521,59 @@ func TestPushHandlerRecoversFromPanic(t *testing.T) {
 	waitFor(t, func() bool { return recs.Contains("push handler panicked") })
 	waitFor(t, func() bool { return len(notifySem) == before })
 }
+
+// ---- Task 7 fix round 1: persisted QR link browser claim ----
+
+// After a StartLink attempt fails, dropFailed removes the in-memory link
+// entry entirely — but the state's browser claim must still be enforced from
+// the persisted oauth_states row, or any browser could slip into the gap and
+// retry the pairing attempt the original browser started.
+func TestQRRetryAfterFailedStartLinkStillEnforcesTheOriginalBrowserClaim(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	cookieA := openLink(t, h, r.State)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookieA))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("consent: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The first /qr poll's StartLink attempt fails outright; dropFailed
+	// removes the in-memory entry, leaving only the persisted claim behind.
+	s.fake().StartLinkErr = errors.New("dial failed")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookieA))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("first qr (forced failure): %d %s", rec.Code, rec.Body.String())
+	}
+	s.fake().StartLinkErr = nil
+
+	// A different browser, with no in-memory entry left to check against,
+	// must still be refused — by the persisted claim on oauth_states.
+	cookieB := &http.Cookie{Name: cookieLinkName, Value: "a-different-browser"}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookieB))
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "link_browser_mismatch") {
+		t.Fatalf("retry from a different browser: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The original browser can still retry and start a fresh attempt.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookieA))
+	var q struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &q)
+	if rec.Code != http.StatusOK || q.Status != "waiting" {
+		t.Fatalf("retry from the original browser: %d %+v", rec.Code, q)
+	}
+}

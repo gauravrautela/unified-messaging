@@ -201,6 +201,50 @@ func TestOAuthStateIsSingleUse(t *testing.T) {
 	}
 }
 
+// ClaimOAuthStateBrowser is what closes the post-failure re-claim window: the
+// first caller to name a state wins it for its hash, and every later caller —
+// including a retry after an in-memory pairing attempt was dropped — must
+// present the same one.
+func TestClaimOAuthStateBrowserBindsFirstCallerAndRejectsOthers(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.SaveOAuthState(OAuthState{
+		State: "st1", DeveloperID: "dev_1", Verifier: "v", ExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := s.ClaimOAuthStateBrowser("st1", "hash-a")
+	if err != nil || !ok {
+		t.Fatalf("first claim = %v, %v, want true, nil", ok, err)
+	}
+	got, err := s.PeekOAuthState("st1")
+	if err != nil || got.BrowserHash != "hash-a" {
+		t.Fatalf("PeekOAuthState after claim = %+v, %v", got, err)
+	}
+
+	// The same browser re-claiming (e.g. a second /qr poll) still succeeds.
+	if ok, err := s.ClaimOAuthStateBrowser("st1", "hash-a"); err != nil || !ok {
+		t.Fatalf("repeat claim by the same browser = %v, %v, want true, nil", ok, err)
+	}
+
+	// A different browser is refused outright.
+	if ok, err := s.ClaimOAuthStateBrowser("st1", "hash-b"); err != nil || ok {
+		t.Fatalf("claim by a different browser = %v, %v, want false, nil", ok, err)
+	}
+	got, err = s.PeekOAuthState("st1")
+	if err != nil || got.BrowserHash != "hash-a" {
+		t.Fatalf("browser_hash changed after a rejected claim: %+v, %v", got, err)
+	}
+
+	// An unknown state is refused the same way, without an error a caller
+	// could use to distinguish "unknown" from "someone else already claimed
+	// it" — this endpoint is browser-facing.
+	if ok, err := s.ClaimOAuthStateBrowser("nope", "hash-a"); err != nil || ok {
+		t.Fatalf("claim on unknown state = %v, %v, want false, nil", ok, err)
+	}
+}
+
 func TestExpiredOAuthStateRejected(t *testing.T) {
 	s := newTestStore(t)
 	seedDeveloper(t, s, "dev_1", "a@x.com")

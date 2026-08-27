@@ -315,6 +315,19 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 		linkBrowserMismatch(w)
 		return
 	}
+	// The persisted claim is checked first: it is what survives an in-memory
+	// entry being dropped (a failed StartLink attempt) and a process restart,
+	// and it is what a second browser's consent call — arriving after the
+	// first browser already claimed this state — must be measured against.
+	// The in-memory claim right after it is the fast path for every request
+	// from here on.
+	if ok, err := s.store.ClaimOAuthStateBrowser(state, hash); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	} else if !ok {
+		linkBrowserMismatch(w)
+		return
+	}
 	if _, ok := s.links.claim(state, hash, pending.SuccessURL); !ok {
 		linkBrowserMismatch(w)
 		return
@@ -389,6 +402,21 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 		// premature guess lock a legitimate user's own consent call out.
 		hash, hasCookie := linkBrowserHash(r)
 		if !hasCookie {
+			linkBrowserMismatch(w)
+			return
+		}
+		// The persisted claim is what closes the window a dropped in-memory
+		// entry would otherwise leave open: if a previous StartLink attempt
+		// for this state failed, dropFailed removed the in-memory link
+		// entirely, and without this check whichever browser's /qr call
+		// happens to land here next would silently re-claim the state. The
+		// row-level claim was already set (by consent, in the normal flow)
+		// and outlives that in-memory drop, so this is what a second
+		// browser's retry attempt is actually measured against.
+		if ok, err := s.store.ClaimOAuthStateBrowser(state, hash); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", err.Error())
+			return
+		} else if !ok {
 			linkBrowserMismatch(w)
 			return
 		}
