@@ -29,9 +29,16 @@ const csrfCookie = "um_csrf"
 //
 // The length gate is hygiene, not a defence: an attacker who can *write* this
 // cookie can write one of the right length and echo it in their own form
-// (cookie tossing). What defeats that is SameSite=Strict — a cookie a
-// same-site-only attacker cannot set for this host — together with the Origin
-// check in checkFormCSRF.
+// (cookie tossing). What defeats that is the pair of properties on the cookie
+// itself — SameSite=Strict, so an off-site page's request never carries it,
+// and the __Host- name prefix over HTTPS (see hostCookiePrefix), so a sibling
+// subdomain cannot set one for this host in the first place. The Origin check
+// in csrfFailure is *not* part of that: this service sends
+// Referrer-Policy: no-referrer, under which every genuine browser form post
+// arrives with `Origin: null` and no `Referer`, so the check is skipped on
+// real traffic — and an attacker's page can produce exactly the same `null`
+// by declaring the same policy. It stays as a cheap catch for a
+// non-browser-shaped cross-origin post, nothing more.
 const csrfTokenLen = 43
 
 // The two ways a form post is refused. They are constants because the tests
@@ -62,9 +69,9 @@ func (s *Server) csrfToken(w http.ResponseWriter, r *http.Request) string {
 }
 
 // csrfFailure reports why a form post must be refused, or "" when it passes.
-// Double-submit token plus an Origin check: the token defeats cross-site form
-// posts, the Origin check defeats a token obtained through any future
-// subdomain or XSS foothold.
+// The double-submit token is the control; the Origin check below it is a
+// bonus that browser traffic never reaches (see csrfTokenLen's comment for
+// why), so nothing should be read into its presence.
 func (s *Server) csrfFailure(r *http.Request) string {
 	log := logx.From(r.Context())
 	c, err := readCookie(r, csrfCookie)

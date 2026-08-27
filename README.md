@@ -510,7 +510,7 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
 | Delta **replays** items and returns unrelated read/unread churn | Every write is idempotent |
 | Delta tokens can be evicted (`syncStateNotFound`, `410 Gone`) | Mapped to `ErrCursorExpired`; the core resyncs the scope |
 | Outlook subscriptions last ≤ 10,080 min (~7 days) | Renewed hourly, well before expiry |
-| Duplicate `(changeType, resource)` subscriptions → `409` | Mapped to `ErrSubscriptionExists`; the existing one is adopted |
+| Duplicate `(changeType, resource)` subscriptions → `409` | Mapped to `ErrSubscriptionExists`; every remote subscription is deleted and one is recreated with a `clientState` we minted |
 | Graph cannot send custom headers | Notification auth is the per-subscription `clientState` |
 | Personal accounts: delegated permissions only, no shared mailboxes | One mailbox per connection |
 | `$search` cannot combine with `$filter`, and is unavailable in delta | Search runs against the local mirror |
@@ -538,7 +538,15 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   kept alive forever.
 - **CSRF on every HTML form** (`/login`, `/signup`, `/logout`): a double-submit
   token in a `SameSite=Strict` cookie, checked against the posted field with a
-  constant-time compare, plus an `Origin`/`Referer` check. `POST /api/v1/*`
+  constant-time compare. That token is the control: this service sends
+  `Referrer-Policy: no-referrer`, under which the Fetch spec gives every
+  genuine non-GET navigation `Origin: null` and no `Referer`, so the
+  `Origin`/`Referer` check the same handler runs never actually fires on
+  browser traffic and stops nothing an attacker's page would send. What
+  keeps the token out of an attacker's reach is the `SameSite=Strict`
+  cookie carrying it, plus the `__Host-` name prefix over HTTPS, which stops
+  a sibling subdomain setting a cookie pair of its own choosing for this
+  host. `POST /api/v1/*`
   writes ridden on the session cookie instead of an API key additionally
   require `Content-Type: application/json`, which a plain HTML form cannot
   send.
@@ -584,8 +592,12 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   than spawning unboundedly); a mailbox miss is negatively cached so a caller
   probing nonexistent message ids cannot turn into one upstream call per
   retry; Microsoft Graph's per-subscription `clientState` is checked with a
-  constant-time compare; and a duplicate subscription (`409` from Graph) is
-  adopted rather than treated as a dial failure.
+  constant-time compare, and a stored `clientState` that is empty is
+  rejected outright rather than falling back to the subscription ID; and a
+  duplicate subscription (`409` from Graph) is handled by deleting every
+  subscription Graph reports for that account and creating a fresh one with a
+  `clientState` only we know, rather than adopting an existing one blind or
+  treating the `409` as a dial failure.
 - **QR pairing links are bound to the browser that started them**
   (`um_link` cookie): a `/connect/{state}` URL for a WhatsApp pairing that
   leaks after the flow has started cannot be used from a second browser to
@@ -643,8 +655,6 @@ the gateway protections above in front of it.
 - **Search** is SQL `LIKE` over locally synced mail, not server-side search.
 - **`/sendMail` returns no ID**, so a plain Outlook send has no message ID until
   the next sync surfaces it in Sent Items. Replies and forwards do return one.
-- **Adopted subscriptions** (after a `409`) have no known `clientState`, so
-  their notifications are verified by subscription ID alone.
 - **First delivery attempt is in-memory.** A crash between an event being
   emitted and its first POST loses it; once it has failed once it is in SQLite
   and survives restarts. The poll re-converges the data but those events are

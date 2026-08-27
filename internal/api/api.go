@@ -641,9 +641,11 @@ const missSweepEvery = 1000
 const missCacheMaxEntries = 10000
 
 // missCache is a negative cache: it only ever remembers "this key was a
-// miss", never a hit, so a real message becoming available is picked up
-// immediately (there is nothing to invalidate) while a genuine miss stops
-// being expensive to repeat.
+// miss", never a hit, so there is no stale copy of a message to invalidate
+// and a genuine miss stops being expensive to repeat. The cost is on the
+// other side: a remembered miss suppresses the provider call for up to
+// missCacheTTL (60 s), so a message that lands inside that window keeps 404ing
+// until the entry expires.
 type missCache struct {
 	m     sync.Map // key (string) -> expiry (time.Time)
 	n     atomic.Int64
