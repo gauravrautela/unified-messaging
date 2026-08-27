@@ -7,9 +7,11 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,11 +56,12 @@ func run(log *slog.Logger) error {
 	// across restarts and deployments but say nothing to anyone else.
 	logx.SetDigestKey(cfg.TokenKey)
 
-	db, err := store.Open(cfg.DBPath)
+	db, err := store.Open(cfg.DBDriver, cfg.DBDSN)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(cfg.DBMaxOpenConns)
 	// The same key that seals OAuth tokens seals a telegram hook's bot token;
 	// a hook can't be saved without it.
 	db.SetSealKey(cfg.TokenKey)
@@ -164,24 +167,26 @@ func run(log *slog.Logger) error {
 		MaxHeaderBytes:    64 << 10,
 	}
 
+	fields := []any{"addr", cfg.ListenAddr}
+	fields = append(fields, dbLogFields(cfg)...)
+	fields = append(fields,
+		"providers", registry.Names(),
+		"push_notifications", cfg.PushEnabled(),
+		"public_base_url", cfg.PublicBaseURL,
+		"tenant", cfg.Tenant,
+		"redirect_uri", cfg.RedirectURI,
+		"scopes", cfg.Scopes,
+		"client_secret_set", cfg.ClientSecret != "",
+		"session_ttl", cfg.SessionTTL,
+		"session_max_age", cfg.SessionMaxAge,
+		"backfill", opts.BackfillWindow,
+		"poll_every", opts.PollInterval,
+		"whatsapp", cfg.WhatsAppEnabled,
+		"max_chat_accounts", cfg.WhatsAppMaxAccounts,
+		"debug", os.Getenv("DEBUG") != "")
+
 	go func() {
-		log.Info("listening",
-			"addr", cfg.ListenAddr,
-			"db", cfg.DBPath,
-			"providers", registry.Names(),
-			"push_notifications", cfg.PushEnabled(),
-			"public_base_url", cfg.PublicBaseURL,
-			"tenant", cfg.Tenant,
-			"redirect_uri", cfg.RedirectURI,
-			"scopes", cfg.Scopes,
-			"client_secret_set", cfg.ClientSecret != "",
-			"session_ttl", cfg.SessionTTL,
-			"session_max_age", cfg.SessionMaxAge,
-			"backfill", opts.BackfillWindow,
-			"poll_every", opts.PollInterval,
-			"whatsapp", cfg.WhatsAppEnabled,
-			"max_chat_accounts", cfg.WhatsAppMaxAccounts,
-			"debug", os.Getenv("DEBUG") != "")
+		log.Info("listening", fields...)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server stopped", "err", err)
 			stop()
@@ -251,4 +256,19 @@ func envDuration(key string, def, unit time.Duration) time.Duration {
 		return def
 	}
 	return time.Duration(n) * unit
+}
+
+// dbLogFields describes the database at startup without ever logging the DSN:
+// a postgres URL carries the password, so only the host and database name are
+// reported. On sqlite the file path is not a secret and is logged as before.
+func dbLogFields(cfg *config.Config) []any {
+	f := []any{"db_driver", cfg.DBDriver}
+	if cfg.DBDriver != "postgres" {
+		return append(f, "db", cfg.DBPath)
+	}
+	u, err := url.Parse(cfg.DBDSN)
+	if err != nil {
+		return append(f, "db_host", "unparseable")
+	}
+	return append(f, "db_host", u.Hostname(), "db_name", strings.TrimPrefix(u.Path, "/"))
 }

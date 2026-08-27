@@ -16,12 +16,7 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
+	return OpenForTest(t)
 }
 
 // seedDeveloper is idempotent: several seed helpers (seedAccount,
@@ -517,7 +512,7 @@ func TestScanEmailDerivesBodyPlain(t *testing.T) {
 // must always leave it 0600 regardless of the umask that created it.
 func TestOpenSetsDatabaseFilePermsTo0600(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "perms.db")
-	s, err := Open(path)
+	s, err := Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +537,7 @@ func TestOpenTightensExistingLoosePerms(t *testing.T) {
 	}
 	f.Close()
 
-	s, err := Open(path)
+	s, err := Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +563,7 @@ func TestOpenRefusesPreTenancyDatabase(t *testing.T) {
 	}
 	db.Close()
 
-	_, err = Open(path)
+	_, err = Open("sqlite", path)
 	if err == nil {
 		t.Fatal("pre-tenancy database was opened")
 	}
@@ -1031,7 +1026,7 @@ func TestAccountsKindMigrationOnTenancyDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	s, err := Open(path)
+	s, err := Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1435,7 +1430,7 @@ func TestSearchEscapesLikeWildcards(t *testing.T) {
 // truncating the table, so live hashed sessions survive the upgrade.
 func TestMigrationDropsPreHashSessionRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.db")
-	s, err := Open(path)
+	s, err := Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1456,7 +1451,7 @@ func TestMigrationDropsPreHashSessionRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err = Open(path)
+	s, err = Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}

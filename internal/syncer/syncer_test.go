@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -187,11 +186,7 @@ func TestSyncAccountBackfillThenIncremental(t *testing.T) {
 	outlook.BaseURL = srv.URL
 	defer func() { outlook.BaseURL = prev }()
 
-	db, err := store.Open(filepath.Join(t.TempDir(), "sync.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
@@ -354,11 +349,7 @@ func lineWith(recs *logx.Records, sub string) string {
 
 // The poll loop must not try to delta-sync a chat account: it has no Mailbox.
 func TestPollSkipsChatAccounts(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "sync.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 	_ = db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash")
 	_ = db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "+91", Status: model.AccountOK})
 	fake := providertest.NewFakeChat("FAKECHAT")
@@ -376,11 +367,7 @@ func TestPollSkipsChatAccounts(t *testing.T) {
 // A second wakeup while a sync is running must collapse into one follow-up run
 // rather than piling up duplicate work.
 func TestWakeCollapsesWhileInflight(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "wake.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := New(db, provider.NewRegistry(), nil, events.NewDispatcher(db, nil, log), log, Options{})
@@ -407,11 +394,7 @@ func TestWakeCollapsesWhileInflight(t *testing.T) {
 // a stray Wake against a chat account, say — must fail cleanly rather than
 // dereference the nil Mailbox and panic the worker goroutine.
 func TestSyncAccountOnChatAccountReturnsError(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "chat.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 	_ = db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash")
 	_ = db.UpsertAccount(model.Account{ID: "acc_wa", DeveloperID: "dev_1", Provider: "FAKECHAT", Kind: model.AccountKindChat, Email: "+91", Status: model.AccountOK})
 	fake := providertest.NewFakeChat("FAKECHAT")
@@ -430,11 +413,7 @@ func TestSyncAccountOnChatAccountReturnsError(t *testing.T) {
 // to force a sync. EnsureSubscription must delete the pre-existing
 // subscription and create a fresh one of its own instead.
 func TestAdoptedSubscriptionIsReplacedNotTrusted(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "adopt.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
 	}
@@ -490,11 +469,7 @@ func TestAdoptedSubscriptionIsReplacedNotTrusted(t *testing.T) {
 // is allowed; a second ErrSubscriptionExists after that must be a hard error,
 // not another adopt attempt.
 func TestCreateSubscriptionStopsRetryingAfterOneAdopt(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "alwaysdup.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +490,7 @@ func TestCreateSubscriptionStopsRetryingAfterOneAdopt(t *testing.T) {
 		Options{PollInterval: time.Hour, PublicBaseURL: "https://example.com"})
 
 	ctx := logx.With(context.Background(), log)
-	err = s.EnsureSubscription(ctx, "acc_1")
+	err := s.EnsureSubscription(ctx, "acc_1")
 	if err == nil {
 		t.Fatal("EnsureSubscription = nil error, want the provider-still-duplicate error")
 	}
@@ -547,11 +522,7 @@ func TestCreateSubscriptionStopsRetryingAfterOneAdopt(t *testing.T) {
 // empty one (the shape an adopted-and-trusted subscription used to have), and
 // a near-miss that only differs by case, must both be treated as forged.
 func TestNotificationWithoutMatchingClientStateIsRejected(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "cstate.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
 	}

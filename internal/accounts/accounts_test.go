@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"testing"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -15,11 +14,7 @@ import (
 
 func newMgr(t *testing.T) (*Manager, *store.Store, *providertest.FakeChat) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "acc.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "d@x.com"}, "h"); err != nil {
 		t.Fatal(err)
 	}

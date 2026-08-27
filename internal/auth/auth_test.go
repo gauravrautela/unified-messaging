@@ -4,7 +4,6 @@ package auth
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,11 +14,7 @@ import (
 
 func newService(t *testing.T) (*Service, *store.Store, *logx.Records) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "auth.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	log, recs := logx.Capture()
 	return New(db, log, 30*24*time.Hour, 90*24*time.Hour), db, recs
 }

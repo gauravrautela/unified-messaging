@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	// database/sql drivers: "sqlite" (modernc, cgo-free) and "pgx" (Postgres).
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -23,6 +26,9 @@ var ErrPreTenancy = errors.New("database predates multi-tenancy")
 
 type Store struct {
 	db *sql.DB
+	// d is the SQL flavour this store speaks: it renders the schema, supplies
+	// the migration list, and rebinds ? placeholders for the engine in use.
+	d *dialect
 	// log is nil until SetLogger is called. Tests never set it, so the store
 	// stays silent unless a process wires one in.
 	log *slog.Logger
@@ -58,53 +64,116 @@ func (s *Store) trace(op string, start time.Time, kv ...any) {
 	s.log.Debug("query", append([]any{"op", op, "dur", time.Since(start).Round(time.Microsecond)}, kv...)...)
 }
 
-func Open(path string) (*Store, error) {
-	// The file holds sealed OAuth tokens and webhook secrets. Create it 0600
-	// up front so no window exists where the umask's default mode is on disk,
-	// then tighten an existing file that predates this (or was created under
-	// a laxer umask) rather than trusting whatever is already there.
+// Open connects the store to driver ("sqlite" — the default — or "postgres")
+// at dsn: a file path for SQLite, a postgres:// URL for Postgres. The schema
+// and the additive migrations are applied on the way in, for both engines.
+func Open(driver, dsn string) (*Store, error) {
+	var (
+		d   *dialect
+		db  *sql.DB
+		err error
+	)
+	switch driver {
+	case "sqlite", "":
+		d = sqliteDialect()
+		if err := ensureSQLiteFile(dsn); err != nil {
+			return nil, err
+		}
+		// foreign_keys is per-connection state, so it belongs in the DSN rather
+		// than in a one-off PRAGMA: a PRAGMA in the migration only covers whichever
+		// connection ran it, which today is every connection solely because the
+		// pool is capped at one. In the DSN it holds for any connection the pool
+		// ever opens, whatever that cap becomes.
+		db, err = sql.Open("sqlite", dsn+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+		if err != nil {
+			return nil, err
+		}
+		// modernc's driver serializes fine, but a single writer avoids SQLITE_BUSY
+		// churn between the sync loop and API handlers.
+		db.SetMaxOpenConns(1)
+
+		// Refuse a database from before tenancy rather than failing on the first
+		// query. We never delete on the operator's behalf. Only SQLite can hold
+		// one: Postgres support arrived after tenancy did.
+		if old, err := preTenancy(db); err != nil {
+			db.Close()
+			return nil, err
+		} else if old {
+			db.Close()
+			return nil, &preTenancyError{path: dsn}
+		}
+	case "postgres":
+		d = postgresDialect()
+		db, err = sql.Open("pgx", dsn)
+		if err != nil {
+			return nil, err
+		}
+		// A managed Postgres (Supabase's pooler included) caps connections well
+		// below what an unbounded pool will open. These are conservative
+		// defaults; the process overrides the cap via SetMaxOpenConns.
+		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(2)
+		db.SetConnMaxLifetime(30 * time.Minute)
+	default:
+		return nil, fmt.Errorf("store: unknown driver %q (want \"sqlite\" or \"postgres\")", driver)
+	}
+
+	// One statement at a time: Postgres' extended protocol refuses a
+	// multi-statement Exec, and SQLite does not mind either way.
+	for _, stmt := range splitStatements(d.schema) {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+	for _, m := range d.migrate {
+		if _, err := db.Exec(m); err != nil && !(d.name == "sqlite" && strings.Contains(err.Error(), "duplicate column")) {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+	return &Store{db: db, d: d}, nil
+}
+
+// ensureSQLiteFile creates the database file 0600 before the driver can, and
+// tightens one that already exists. The file holds sealed OAuth tokens and
+// webhook secrets: creating it up front leaves no window where the umask's
+// default mode is on disk, and an existing file that predates this hardening
+// (or was created under a laxer umask) is not trusted as it stands.
+func ensureSQLiteFile(path string) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	f.Close()
 	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
 		_ = os.Chmod(path, 0o600)
 	}
-
-	// foreign_keys is per-connection state, so it belongs in the DSN rather
-	// than in a one-off PRAGMA: a PRAGMA in the migration only covers whichever
-	// connection ran it, which today is every connection solely because the
-	// pool is capped at one. In the DSN it holds for any connection the pool
-	// ever opens, whatever that cap becomes.
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
-	if err != nil {
-		return nil, err
-	}
-	// modernc's driver serializes fine, but a single writer avoids SQLITE_BUSY
-	// churn between the sync loop and API handlers.
-	db.SetMaxOpenConns(1)
-
-	// Refuse a database from before tenancy rather than failing on the first
-	// query. We never delete on the operator's behalf.
-	if old, err := preTenancy(db); err != nil {
-		db.Close()
-		return nil, err
-	} else if old {
-		db.Close()
-		return nil, &preTenancyError{path: path}
-	}
-
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	for _, m := range migrations {
-		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-			return nil, fmt.Errorf("migrate: %w", err)
-		}
-	}
-	return &Store{db: db}, nil
+	return nil
 }
+
+// q renders a query written with ? placeholders for the engine in use: an
+// identity on SQLite, $1…$n on Postgres.
+func (s *Store) q(query string) string { return s.d.rebind(query) }
+
+// Dialect is the engine's name as whatsmeow's sqlstore spells it, for a
+// provider keeping its own tables in this database.
+func (s *Store) Dialect() string { return s.d.wmName }
+
+// DriverName is "sqlite" or "postgres" — the value Open was given.
+func (s *Store) DriverName() string { return s.d.name }
+
+// SetMaxOpenConns caps the connection pool. It is ignored on SQLite, which is
+// deliberately pinned to a single writer.
+func (s *Store) SetMaxOpenConns(n int) {
+	if s.d.name == "postgres" && n > 0 {
+		s.db.SetMaxOpenConns(n)
+	}
+}
+
+// Ping checks the database is reachable. On SQLite that is nearly free; on
+// Postgres it is the first thing worth knowing at startup.
+func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 // preTenancyError carries the operator-facing message while still matching
 // ErrPreTenancy under errors.Is.

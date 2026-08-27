@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,11 +40,7 @@ func newHarness(t *testing.T) *harness {
 	// whose dial guard refuses loopback by default; h.hook below is an
 	// httptest server (loopback).
 	safehttp.AllowLoopbackForTests(t)
-	db, err := store.Open(filepath.Join(t.TempDir(), "cs.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	_ = db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "d@x.com"}, "h")
 	h := &harness{db: db, fake: providertest.NewFakeChat("FAKECHAT")}
 	h.hook = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

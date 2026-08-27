@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -64,11 +63,7 @@ func TestSoak(t *testing.T) {
 	// server (loopback).
 	safehttp.AllowLoopbackForTests(t)
 
-	db, err := store.Open(filepath.Join(t.TempDir(), "soak.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "soak@x.com"}, "h"); err != nil {
 		t.Fatal(err)
 	}

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,11 +43,7 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 	// loopback by default; every httptest receiver these tests point at is
 	// loopback.
 	safehttp.AllowLoopbackForTests(t)
-	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
@@ -115,11 +110,7 @@ func newTestServerWithChatCapacity(t *testing.T, maxChatAccounts int) (*Server, 
 func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*Server, *store.Store) {
 	t.Helper()
 	safehttp.AllowLoopbackForTests(t)
-	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
@@ -144,11 +135,7 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 func newTestServerWithProvidersAndLog(t *testing.T, providers ...provider.Provider) (*Server, *store.Store, *logx.Records) {
 	t.Helper()
 	safehttp.AllowLoopbackForTests(t)
-	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := store.OpenForTest(t)
 	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",

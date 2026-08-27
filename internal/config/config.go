@@ -13,6 +13,18 @@ type Config struct {
 	ListenAddr string
 	DBPath     string
 
+	// DBDriver is the persistence engine: "sqlite" (the default, a local
+	// file) or "postgres" (a managed database such as Supabase).
+	DBDriver string
+	// DBDSN is what Open connects with: the DB_PATH file for sqlite, the
+	// DATABASE_URL connection string for postgres. It is never logged — a
+	// postgres URL carries the password.
+	DBDSN string
+	// DBMaxOpenConns caps the connection pool. Ignored on sqlite, which is
+	// deliberately pinned to a single writer; on postgres it must stay under
+	// whatever the provider allows (Supabase's pooler included).
+	DBMaxOpenConns int
+
 	// PublicBaseURL is this deployment's own origin. It is required.
 	//
 	// Two things depend on it. Providers POST change notifications to it, and
@@ -79,15 +91,18 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr:    env("LISTEN_ADDR", ":8080"),
-		DBPath:        env("DB_PATH", "./unified-messaging.db"),
-		PublicBaseURL: strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
-		ClientID:      os.Getenv("MS_CLIENT_ID"),
-		ClientSecret:  os.Getenv("MS_CLIENT_SECRET"),
-		Tenant:        env("MS_TENANT", "consumers"),
-		RedirectURI:   env("MS_REDIRECT_URI", "http://localhost:8080/oauth/callback"),
-		SessionTTL:    time.Duration(envInt("SESSION_TTL_DAYS", 30)) * 24 * time.Hour,
-		SessionMaxAge: time.Duration(envInt("SESSION_MAX_AGE_DAYS", 90)) * 24 * time.Hour,
+		ListenAddr: env("LISTEN_ADDR", ":8080"),
+		DBPath:     env("DB_PATH", "./unified-messaging.db"),
+		DBDriver:   env("DB_DRIVER", "sqlite"),
+
+		DBMaxOpenConns: envInt("DB_MAX_OPEN_CONNS", 10),
+		PublicBaseURL:  strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		ClientID:       os.Getenv("MS_CLIENT_ID"),
+		ClientSecret:   os.Getenv("MS_CLIENT_SECRET"),
+		Tenant:         env("MS_TENANT", "consumers"),
+		RedirectURI:    env("MS_REDIRECT_URI", "http://localhost:8080/oauth/callback"),
+		SessionTTL:     time.Duration(envInt("SESSION_TTL_DAYS", 30)) * 24 * time.Hour,
+		SessionMaxAge:  time.Duration(envInt("SESSION_MAX_AGE_DAYS", 90)) * 24 * time.Hour,
 
 		WhatsAppEnabled:     envBool("WHATSAPP_ENABLED", false),
 		WhatsAppMaxAccounts: envInt("WHATSAPP_MAX_ACCOUNTS", 200),
@@ -102,6 +117,21 @@ func Load() (*Config, error) {
 	// integration dies the moment the first access token expires.
 	c.Scopes = strings.Fields(env("MS_SCOPES",
 		"offline_access openid profile User.Read Mail.Read Mail.ReadWrite Mail.Send"))
+
+	// The DSN follows from the driver: a file path for sqlite, DATABASE_URL
+	// for postgres. An unset DATABASE_URL is refused rather than silently
+	// falling back to a local file the operator did not ask for.
+	switch c.DBDriver {
+	case "sqlite":
+		c.DBDSN = c.DBPath
+	case "postgres":
+		c.DBDSN = os.Getenv("DATABASE_URL")
+		if c.DBDSN == "" {
+			return nil, fmt.Errorf("DATABASE_URL is required when DB_DRIVER=postgres")
+		}
+	default:
+		return nil, fmt.Errorf("DB_DRIVER must be \"sqlite\" or \"postgres\", got %q", c.DBDriver)
+	}
 
 	if c.ClientID == "" {
 		return nil, fmt.Errorf("MS_CLIENT_ID is required (see README for app registration steps)")

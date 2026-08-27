@@ -14,12 +14,8 @@ var testKey = []byte("0123456789abcdef0123456789abcdef")
 
 func openWithKey(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "w.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := store.OpenForTest(t)
 	s.SetSealKey(testKey)
-	t.Cleanup(func() { s.Close() })
 	if err := s.CreateDeveloper(model.Developer{ID: "dev_1", Email: "d@x.com"}, "h"); err != nil {
 		t.Fatal(err)
 	}
@@ -68,13 +64,9 @@ func TestWebhookDefaultsToKindWebhookForLegacyRows(t *testing.T) {
 }
 
 func TestSaveTelegramWebhookWithoutSealKeyFails(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "w.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := store.OpenForTest(t)
 	_ = s.CreateDeveloper(model.Developer{ID: "dev_1", Email: "d@x.com"}, "h")
-	err = s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Kind: model.WebhookKindTelegram,
+	err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Kind: model.WebhookKindTelegram,
 		Telegram: &model.TelegramTarget{ChatID: "1", BotToken: "t"}, CreatedAt: time.Now()})
 	if err == nil {
 		t.Fatal("expected an error without a seal key")
@@ -97,9 +89,11 @@ func TestSaveTelegramWebhookWithoutTargetFails(t *testing.T) {
 // database without that key, and must log exactly one warning that never
 // carries the token.
 func TestWebhookConfigUnreadableWarnsWithoutSealKey(t *testing.T) {
+	// Pinned to sqlite: this test needs a second store over the same data,
+	// which OpenForTest cannot give (each call gets its own database).
 	dbPath := filepath.Join(t.TempDir(), "w.db")
 
-	s1, err := store.Open(dbPath)
+	s1, err := store.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +110,7 @@ func TestWebhookConfigUnreadableWarnsWithoutSealKey(t *testing.T) {
 	}
 
 	// A second store on the same file, deliberately never given the key.
-	s2, err := store.Open(dbPath)
+	s2, err := store.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +159,9 @@ func TestWebhookConfigUnreadableWarnsWithoutSealKey(t *testing.T) {
 // silence: the account gets created and the hook the developer asked for is
 // never bound, and that has to be visible in the log (without the token).
 func TestPendingWebhookUnreadableWarns(t *testing.T) {
+	// Pinned to sqlite for the same reason as the test above.
 	dbPath := filepath.Join(t.TempDir(), "w.db")
-	s1, err := store.Open(dbPath)
+	s1, err := store.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +187,7 @@ func TestPendingWebhookUnreadableWarns(t *testing.T) {
 		{"the wrong key", []byte("ffffffffffffffff0123456789abcdef"), "open failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s2, err := store.Open(dbPath)
+			s2, err := store.Open("sqlite", dbPath)
 			if err != nil {
 				t.Fatal(err)
 			}

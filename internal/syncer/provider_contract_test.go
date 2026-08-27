@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -89,11 +88,7 @@ func (p *simpleProvider) Push() provider.Pusher { return nil }
 var _ provider.Provider = (*simpleProvider)(nil)
 
 func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "simple.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
@@ -171,11 +166,7 @@ func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
 
 // A provider that cannot push must not break subscription reconciliation.
 func TestEnsureSubscriptionIsNoOpWithoutPush(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "nopush.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := store.OpenForTest(t)
 
 	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)

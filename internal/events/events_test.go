@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,11 +28,7 @@ func newTestStore(t *testing.T) *store.Store {
 	// dial guard refuses loopback by default; httptest servers are always
 	// loopback.
 	safehttp.AllowLoopbackForTests(t)
-	s, err := store.Open(filepath.Join(t.TempDir(), "events.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { s.Close() })
+	s := store.OpenForTest(t)
 	s.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	return s
 }
