@@ -44,6 +44,14 @@ type Config struct {
 	// WhatsAppDeviceName is what the end user sees in WhatsApp's own "Linked
 	// devices" list after pairing.
 	WhatsAppDeviceName string
+
+	// TrustProxy tells the server it sits behind a TLS-terminating reverse
+	// proxy, so X-Forwarded-Proto may be trusted to decide whether the
+	// original request was HTTPS (for HSTS and the Secure cookie flag).
+	// Only set this behind a proxy that strips any client-supplied
+	// X-Forwarded-Proto before setting its own — otherwise a client can
+	// spoof "https" and downgrade those protections.
+	TrustProxy bool
 }
 
 func Load() (*Config, error) {
@@ -60,6 +68,8 @@ func Load() (*Config, error) {
 		WhatsAppEnabled:     envBool("WHATSAPP_ENABLED", false),
 		WhatsAppMaxAccounts: envInt("WHATSAPP_MAX_ACCOUNTS", 200),
 		WhatsAppDeviceName:  env("WHATSAPP_DEVICE_NAME", "Unified Messaging"),
+
+		TrustProxy: envBool("TRUST_PROXY", false),
 	}
 
 	// offline_access is what earns us a refresh token; without it the

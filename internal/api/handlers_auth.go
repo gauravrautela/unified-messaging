@@ -17,7 +17,7 @@ import (
 // ---- cookies ----
 
 func (s *Server) secureCookies(r *http.Request) bool {
-	return r.TLS != nil || strings.HasPrefix(s.cfg.PublicBaseURL, "https://")
+	return s.requestIsHTTPS(r)
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {

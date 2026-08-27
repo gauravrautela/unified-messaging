@@ -226,7 +226,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.Handle("/api/v1/", s.withDeveloper(api))
 
-	return s.withRequestID(mux)
+	return s.secureHeaders(s.withRequestID(mux))
 }
 
 // withRequestID gives every request an id, a request-scoped logger, and the
@@ -234,7 +234,7 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
-		if id == "" || len(id) > 64 {
+		if !requestIDRe.MatchString(id) {
 			id = logx.NewRequestID()
 		}
 		log := s.log.With("component", "api", "request_id", id)
