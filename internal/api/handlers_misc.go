@@ -347,7 +347,7 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	var req webhookRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	req.normalise()
@@ -438,7 +438,7 @@ func (s *Server) handleCreateAccountWebhook(w http.ResponseWriter, r *http.Reque
 	}
 	var req webhookRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	req.normalise()
@@ -592,13 +592,45 @@ func (s *Server) handleProviderNotification(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
-	w.WriteHeader(http.StatusAccepted)
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
+	// A burst of inbound notifications must never spawn an unbounded number
+	// of background goroutines: dispatchNotification caps how many run in
+	// their own long-lived goroutine at once, falling back to handling the
+	// rest inline (on a much shorter budget) rather than dropping any of
+	// them.
+	dispatchNotification(func(ctx context.Context) {
 		if err := s.syncer.HandleNotifications(ctx, name, raw); err != nil {
 			s.log.Warn("handling push notification", "provider", name, "err", err)
 		}
-	}()
+	})
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// notifySem bounds how many push-notification batches are processed in their
+// own dedicated goroutine at once. This is the fix for a route that is,
+// necessarily, unauthenticated (see the comment on its route registration):
+// nothing stops a burst of inbound requests from spawning one goroutine per
+// request, each alive for up to two minutes, without it.
+var notifySem = make(chan struct{}, 32)
+
+// dispatchNotification runs fn respecting notifySem. When a slot is free, fn
+// runs in its own goroutine on a generous (2 minute) budget and this returns
+// immediately, exactly as every request did before this cap existed. When
+// every slot is taken, fn instead runs inline, on this goroutine, on a much
+// shorter (10 second) budget — slower, but never dropped, and it adds no new
+// goroutine to the pile.
+func dispatchNotification(fn func(ctx context.Context)) {
+	select {
+	case notifySem <- struct{}{}:
+		go func() {
+			defer func() { <-notifySem }()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			fn(ctx)
+		}()
+	default:
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		fn(ctx)
+	}
 }

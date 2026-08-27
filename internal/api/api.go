@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
@@ -37,6 +39,11 @@ type Server struct {
 	dispatcher *events.Dispatcher
 	senders    *notify.Registry
 	log        *slog.Logger
+
+	// mirrorMiss negatively caches a mailbox miss (provider.ErrNotFound on
+	// GetMessage) so a caller hammering a nonexistent or not-yet-synced
+	// message id does not turn into one unbounded upstream call per request.
+	mirrorMiss missCache
 
 	// links tracks in-flight QR pairing attempts, keyed by connect state.
 	links *linkRegistry
@@ -521,10 +528,105 @@ func providerError(err error) (int, any) {
 	}
 }
 
+// smallBodyBytes bounds the ordinary JSON routes: patches, flag toggles,
+// webhook registrations and the like never legitimately need more than a
+// fraction of this.
+const smallBodyBytes = 64 << 10
+
+// largeBodyBytes bounds the mail-send family (send/reply/forward/draft),
+// whose bodies carry base64 attachment content and so run larger than any
+// other route — but still nowhere near the old blanket 32 MB.
+const largeBodyBytes = 8 << 20
+
+// errBodyTooLarge is returned by readRawBody when the request body exceeds
+// its limit. It plays the same role there that *http.MaxBytesError plays for
+// decodeJSON/decodeJSONLarge: writeDecodeError maps either to 413.
+var errBodyTooLarge = errors.New("api: request body too large")
+
 func decodeJSON(r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 32<<20))
+	return decodeJSONLimit(r, v, smallBodyBytes)
+}
+
+// decodeJSONLarge is decodeJSON with the send-family's larger limit. Use it
+// only for handlers whose payload legitimately carries attachment bytes.
+func decodeJSONLarge(r *http.Request, v any) error {
+	return decodeJSONLimit(r, v, largeBodyBytes)
+}
+
+func decodeJSONLimit(r *http.Request, v any, limit int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, limit))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
+}
+
+// writeDecodeError answers a decodeJSON/decodeJSONLarge/readRawBody failure:
+// 413 body_too_large when the body exceeded its limit, 400 invalid_body for
+// any other decode failure (malformed JSON, unknown field, wrong type).
+// Every call site that used to hand-roll a 400 for these errors goes through
+// this instead, so the two cases can never be conflated again.
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) || errors.Is(err, errBodyTooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "request body exceeds the size limit for this endpoint")
+		return
+	}
+	writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+}
+
+// missCacheTTL is how long a mirror miss (the message was not in our local
+// store and the provider itself reported it does not exist) is remembered,
+// so a caller retrying against a message id that will never resolve does not
+// turn into one Microsoft Graph call per retry.
+const missCacheTTL = 60 * time.Second
+
+// missSweepEvery bounds how often remember() walks the whole map pruning
+// expired entries, so the cache cannot grow unboundedly from a long-running
+// server fielding a steady trickle of distinct misses.
+const missSweepEvery = 1000
+
+// missCache is a negative cache: it only ever remembers "this key was a
+// miss", never a hit, so a real message becoming available is picked up
+// immediately (there is nothing to invalidate) while a genuine miss stops
+// being expensive to repeat.
+type missCache struct {
+	m sync.Map // key (string) -> expiry (time.Time)
+	n atomic.Int64
+}
+
+// hit reports whether key is a currently-unexpired remembered miss. A stale
+// entry is treated as absent and dropped in passing.
+func (c *missCache) hit(key string) bool {
+	v, ok := c.m.Load(key)
+	if !ok {
+		return false
+	}
+	expiry := v.(time.Time)
+	if time.Now().After(expiry) {
+		c.m.Delete(key)
+		return false
+	}
+	return true
+}
+
+// remember records key as a miss for missCacheTTL, sweeping expired entries
+// out of the map every missSweepEvery calls.
+func (c *missCache) remember(key string) {
+	c.m.Store(key, time.Now().Add(missCacheTTL))
+	if c.n.Add(1)%missSweepEvery == 0 {
+		c.sweep()
+	}
+}
+
+// sweep removes every expired entry. Called periodically from remember
+// rather than on a timer, so an idle server does no background work.
+func (c *missCache) sweep() {
+	now := time.Now()
+	c.m.Range(func(k, v any) bool {
+		if now.After(v.(time.Time)) {
+			c.m.Delete(k)
+		}
+		return true
+	})
 }
 
 func ctxOf(r *http.Request) context.Context { return r.Context() }

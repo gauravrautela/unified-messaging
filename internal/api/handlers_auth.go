@@ -285,7 +285,7 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	var req createKeyRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	full, k, err := s.auth.NewAPIKey(r.Context(), dev.ID, req.Name)
@@ -336,7 +336,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	dev, _ := developerFrom(r.Context())
 	var req changePasswordRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	err := s.auth.ChangePassword(r.Context(), dev.ID, req.CurrentPassword, req.NewPassword)
@@ -431,7 +431,7 @@ func (s *Server) handleSetRedirectDomains(w http.ResponseWriter, r *http.Request
 	dev, _ := developerFrom(r.Context())
 	var req setRedirectDomainsRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	domains, err := normaliseRedirectDomains(req.Domains)

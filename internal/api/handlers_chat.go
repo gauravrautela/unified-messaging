@@ -71,13 +71,23 @@ func apiErr(code, msg string) any {
 
 type rawBodyCtxKey struct{}
 
+// rawBodyLimit bounds a chat send: text messages have no legitimate reason
+// to approach even this, let alone the old 32 MB ceiling.
+const rawBodyLimit = 64 << 10
+
 func readRawBody(r *http.Request) (*http.Request, []byte, error) {
 	if r.Body == nil {
 		return r, nil, nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	// Read one byte past the limit so an over-size body is detected here
+	// rather than silently truncated: exactly limit+1 bytes back means the
+	// body was larger than allowed.
+	raw, err := io.ReadAll(io.LimitReader(r.Body, rawBodyLimit+1))
 	if err != nil {
 		return r, nil, err
+	}
+	if len(raw) > rawBodyLimit {
+		return r, nil, errBodyTooLarge
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	return r.WithContext(context.WithValue(r.Context(), rawBodyCtxKey{}, raw)), raw, nil
@@ -238,7 +248,7 @@ type startChatRequest struct {
 func (s *Server) handleStartChat(w http.ResponseWriter, r *http.Request) {
 	r, raw, err := readRawBody(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	var req startChatRequest
@@ -350,7 +360,7 @@ func (s *Server) handlePatchChat(w http.ResponseWriter, r *http.Request) {
 	chatID := r.PathValue("id")
 	var req patchChatRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	if req.Read == nil && req.Archived == nil && req.Muted == nil {
@@ -496,7 +506,7 @@ func (s *Server) handleSendChatMessage(w http.ResponseWriter, r *http.Request) {
 
 	r, raw, err := readRawBody(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	var req struct {
@@ -582,7 +592,7 @@ func (s *Server) handlePatchChatMessage(w http.ResponseWriter, r *http.Request) 
 		Text string `json:"text"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	if strings.TrimSpace(req.Text) == "" {
@@ -655,7 +665,7 @@ func (s *Server) handleReactToMessage(w http.ResponseWriter, r *http.Request) {
 		Emoji *string `json:"emoji"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	if req.Emoji == nil {

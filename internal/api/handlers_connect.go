@@ -62,7 +62,7 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 	var req hostedAuthRequest
 	if r.ContentLength > 0 {
 		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+			writeDecodeError(w, err)
 			return
 		}
 	}

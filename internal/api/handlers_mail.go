@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strconv"
@@ -12,6 +13,24 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
+
+// maxAttachmentBytes bounds the total decoded size of every attachment on a
+// single send/reply/forward/draft. Enforced server-side, in addition to
+// decodeJSONLarge's 8 MB wire-size cap, because a caller could otherwise pack
+// several base64 blobs that individually pass but together are enormous.
+const maxAttachmentBytes = 3 << 20
+
+// attachmentsTooLarge reports whether the decoded size of every attachment,
+// summed, exceeds maxAttachmentBytes. It uses DecodedLen rather than
+// actually decoding, so an oversized payload is rejected without spending the
+// work of base64-decoding it first.
+func attachmentsTooLarge(atts []model.SendAttachment) bool {
+	var total int
+	for _, a := range atts {
+		total += base64.StdEncoding.DecodedLen(len(a.Content))
+	}
+	return total > maxAttachmentBytes
+}
 
 // resolve validates the ?account_id= every mail route requires and returns the
 // mailbox implementation that owns it.
@@ -190,8 +209,21 @@ func (s *Server) handleGetEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A message neither in our mirror nor at the provider is going to keep
+	// answering that way until sync (or the message) catches up, so a repeat
+	// lookup within the TTL is answered from the negative cache instead of
+	// making another upstream call.
+	missKey := acct.ID + "\x00" + id
+	if s.mirrorMiss.hit(missKey) {
+		writeProviderError(w, provider.ErrNotFound)
+		return
+	}
+
 	email, perr := mailbox.GetMessage(r.Context(), acct.ID, id)
 	if perr != nil {
+		if errors.Is(perr, provider.ErrNotFound) {
+			s.mirrorMiss.remember(missKey)
+		}
 		writeProviderError(w, perr)
 		return
 	}
@@ -240,7 +272,7 @@ func (s *Server) handlePatchEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	var req patchEmailRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	if req.Read == nil && req.Flagged == nil {
@@ -279,8 +311,12 @@ type sendPayload struct {
 
 func (s *Server) handleSendEmail(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
 		return
 	}
 	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
@@ -316,8 +352,12 @@ func (s *Server) handleSendEmail(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
 		return
 	}
 	acct, mailbox, ok := s.resolveID(w, r, accountID(r, p.AccountID))
@@ -335,8 +375,12 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
 		return
 	}
 	acct, mailbox, ok := s.resolveID(w, r, accountID(r, p.AccountID))
@@ -358,8 +402,12 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
 		return
 	}
 	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"html"
@@ -3167,5 +3169,184 @@ func TestListWebhookDeliveriesIsPaginated(t *testing.T) {
 	}
 	if list.Limit != 200 {
 		t.Fatalf("limit = %d, want clamped to 200", list.Limit)
+	}
+}
+
+// ---- Task 6: per-route body limits, attachment cap, negative cache, bounded push ----
+
+// seedFakeMailAccount registers a developer and a FAKEMAIL-provider account,
+// for tests that need a real Mailbox/Pusher with no network dependency.
+func seedFakeMailAccount(t *testing.T, s *Server, db *store.Store) (model.Developer, string, string) {
+	t.Helper()
+	dev, key := seedDev(t, s, "a@x.com")
+	acctID := "acc_1"
+	if err := db.UpsertAccount(model.Account{
+		ID: acctID, DeveloperID: dev.ID, Provider: "FAKEMAIL", Email: "u@x.com", Status: model.AccountOK,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return dev, key, acctID
+}
+
+func TestSmallRoutesRejectLargeBodies(t *testing.T) {
+	s, db := newTestServerWithProviders(t, providertest.NewFakeMail("FAKEMAIL"))
+	_, key, acctID := seedFakeMailAccount(t, s, db)
+
+	// A small route (decodeJSON, 64 KB) must reject a 100 KB body with 413,
+	// not fall through to a 400 for whatever else might be wrong with it.
+	pad := strings.Repeat(" ", 100<<10)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/emails/M1?account_id="+acctID,
+		strings.NewReader(pad+`{"read":true}`))
+	s.Routes().ServeHTTP(rec, withKey(req, key))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("100 KB body on a small route: status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+	}
+	var e apiError
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Error.Code != "body_too_large" {
+		t.Fatalf("code = %q, want body_too_large", e.Error.Code)
+	}
+
+	// A large route (decodeJSONLarge, 8 MB) must accept a 1 MB body.
+	payload, err := json.Marshal(sendPayload{
+		AccountID: acctID,
+		SendRequest: model.SendRequest{
+			To:      []model.Recipient{{Email: "x@y.com"}},
+			Subject: "hi",
+			Body:    "hello",
+			Attachments: []model.SendAttachment{{
+				Name: "a.txt", MimeType: "text/plain",
+				Content: base64.StdEncoding.EncodeToString([]byte("small content")),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := append([]byte(strings.Repeat(" ", 1<<20)), payload...)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/emails", bytes.NewReader(padded))
+	s.Routes().ServeHTTP(rec, withKey(req, key))
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("1 MB body on a large route was rejected: %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("1 MB body on a large route: status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAttachmentsAreCappedServerSide(t *testing.T) {
+	s, db := newTestServerWithProviders(t, providertest.NewFakeMail("FAKEMAIL"))
+	_, key, acctID := seedFakeMailAccount(t, s, db)
+
+	send := func(decodedSize int) *httptest.ResponseRecorder {
+		content := base64.StdEncoding.EncodeToString(make([]byte, decodedSize))
+		body, err := json.Marshal(sendPayload{
+			AccountID: acctID,
+			SendRequest: model.SendRequest{
+				To:      []model.Recipient{{Email: "x@y.com"}},
+				Subject: "hi",
+				Body:    "hello",
+				Attachments: []model.SendAttachment{{
+					Name: "a.bin", MimeType: "application/octet-stream", Content: content,
+				}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/emails", bytes.NewReader(body)), key))
+		return rec
+	}
+
+	// 4 MB decoded exceeds the 3 MB cap.
+	rec := send(4 << 20)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("4 MB attachment: status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	var e apiError
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Error.Code != "attachment_too_large" {
+		t.Fatalf("code = %q, want attachment_too_large", e.Error.Code)
+	}
+
+	// 2 MB decoded is under the cap and reaches the (fake) mailbox.
+	rec = send(2 << 20)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("2 MB attachment: status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMirrorMissIsNegativelyCached(t *testing.T) {
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	s, db := newTestServerWithProviders(t, fm)
+	_, key, acctID := seedFakeMailAccount(t, s, db)
+
+	get := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+			"/api/v1/emails/M1?account_id="+acctID, nil), key))
+		return rec
+	}
+
+	if rec := get(); rec.Code != http.StatusNotFound {
+		t.Fatalf("first get: status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := get(); rec.Code != http.StatusNotFound {
+		t.Fatalf("second get: status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	if n := fm.GetMessageCalls(); n != 1 {
+		t.Fatalf("GetMessage calls = %d, want 1 (the second get should have hit the negative cache)", n)
+	}
+}
+
+// TestNotificationHandlingIsBounded fires 100 concurrent notifications whose
+// ParseNotifications call blocks, and checks that at most 32 of them are
+// ever running inside the dedicated goroutine dispatchNotification spawns
+// (notifySem's occupancy) — the rest run inline, on the requesting
+// goroutine, and are never dropped, so every one of the 100 still answers
+// 202 once released.
+func TestNotificationHandlingIsBounded(t *testing.T) {
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	block := make(chan struct{})
+	fm.SetParseBlock(block)
+	s, _ := newTestServerWithProviders(t, fm)
+
+	const n = 100
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/notifications/FAKEMAIL", strings.NewReader(`{}`))
+			s.Routes().ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+
+	// Wait for every request to have entered ParseNotifications and started
+	// blocking, so the semaphore occupancy below is a stable snapshot rather
+	// than a race against requests still arriving.
+	waitFor(t, func() bool { return fm.InFlight() == n })
+
+	if occ := len(notifySem); occ != cap(notifySem) {
+		t.Fatalf("notifySem occupancy = %d, want %d (32 requests should have won a background slot)", occ, cap(notifySem))
+	}
+
+	close(block) // release every blocked ParseNotifications call
+	wg.Wait()
+
+	for i, code := range codes {
+		if code != http.StatusAccepted {
+			t.Fatalf("request %d: status = %d, want 202", i, code)
+		}
 	}
 }
