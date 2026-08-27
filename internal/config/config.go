@@ -13,10 +13,20 @@ type Config struct {
 	ListenAddr string
 	DBPath     string
 
-	// PublicBaseURL is the externally reachable origin providers POST change
-	// notifications to. During local development this is an ngrok or cloudflared
-	// tunnel. Providers generally refuse to create a subscription unless they can
-	// complete a validation handshake against this host, so localhost is unusable.
+	// PublicBaseURL is this deployment's own origin. It is required.
+	//
+	// Two things depend on it. Providers POST change notifications to it, and
+	// generally refuse to create a subscription unless they can complete a
+	// validation handshake against the host — so for push to work at all it has
+	// to be an externally reachable https origin (an ngrok or cloudflared tunnel
+	// during local development; PushEnabled reports whether it qualifies).
+	// Separately, and regardless of push, it is the origin the hosted-auth
+	// redirect allowlist exempts: a redirect target on this host is accepted
+	// without a developer allowlist entry, because the dashboard's own Connect
+	// button points there. That exemption must never be derived from the
+	// request's Host header, which any caller can set to anything, so a
+	// deployment with no configured origin is refused at startup rather than
+	// run with a forgeable allowlist.
 	PublicBaseURL string
 
 	ClientID     string
@@ -95,6 +105,13 @@ func Load() (*Config, error) {
 
 	if c.ClientID == "" {
 		return nil, fmt.Errorf("MS_CLIENT_ID is required (see README for app registration steps)")
+	}
+
+	// See the PublicBaseURL field comment: the hosted-auth redirect allowlist
+	// exempts this origin, and there is no safe fallback for it.
+	if c.PublicBaseURL == "" {
+		return nil, fmt.Errorf("PUBLIC_BASE_URL is required: set it to this deployment's own origin " +
+			"(http://localhost:8080 for a local run, or the https tunnel origin when you want push notifications)")
 	}
 
 	key, err := decodeKey(os.Getenv("TOKEN_ENCRYPTION_KEY"))

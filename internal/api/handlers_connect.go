@@ -79,7 +79,7 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ownHost := s.ownRedirectHost(r)
+	ownHost := s.ownRedirectHost()
 	for _, u := range []string{req.SuccessRedirectURL, req.FailureRedirectURL} {
 		if u == "" {
 			continue
@@ -93,7 +93,13 @@ func (s *Server) handleHostedAuth(w http.ResponseWriter, r *http.Request) {
 		// end user's browser to a domain this developer does not control: the
 		// redirect host has to be this server's own origin (the dashboard's
 		// own Connect button) or on the developer's allowlist.
+		// An authority with no host at all ("http://:8080/x") must not match an
+		// empty ownHost and slip through as "our own origin".
 		host := strings.ToLower(parsed.Hostname())
+		if host == "" {
+			writeError(w, http.StatusBadRequest, "invalid_url", "redirect urls must be absolute http(s) URLs")
+			return
+		}
 		if !strings.EqualFold(host, ownHost) && !hostAllowed(host, dev.RedirectDomains) {
 			writeError(w, http.StatusBadRequest, "invalid_url",
 				"redirect host is not on your allowlist — add it under Settings → Redirect domains")
@@ -433,12 +439,21 @@ func (s *Server) baseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-// ownRedirectHost is the hostname (no port) of this server's own origin, per
-// baseURL — always allowed as a hosted-auth redirect target regardless of a
+// ownRedirectHost is the hostname (no port) of this server's own configured
+// origin — always allowed as a hosted-auth redirect target regardless of a
 // developer's allowlist, since the dashboard's own Connect button redirects
 // here.
-func (s *Server) ownRedirectHost(r *http.Request) string {
-	u, err := url.Parse(s.baseURL(r))
+//
+// It reads PUBLIC_BASE_URL and nothing else. baseURL's Host-header fallback is
+// fine for building a link back to ourselves (a caller who lies about Host
+// only misleads themselves), but it must never decide who is exempt from the
+// allowlist: r.Host is set by the caller, so a fallback here would let any
+// developer declare their own domain to be our origin and mint a connect link
+// that bounces the end user's browser to it. config.Load requires
+// PUBLIC_BASE_URL precisely so this can be unconditional; an empty value here
+// exempts nobody rather than exempting everybody.
+func (s *Server) ownRedirectHost() string {
+	u, err := url.Parse(s.cfg.PublicBaseURL)
 	if err != nil {
 		return ""
 	}

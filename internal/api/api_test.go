@@ -53,8 +53,12 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
 		RedirectURI: "http://localhost:8080/oauth/callback",
-		Scopes:      []string{"offline_access", "Mail.Read"},
-		SessionTTL:  30 * 24 * time.Hour,
+		// httptest.NewRequest's default Host, so this is the origin every
+		// test request genuinely arrives on. Required in production (see
+		// config.Load), and it is what the redirect allowlist exempts.
+		PublicBaseURL: "http://example.com",
+		Scopes:        []string{"offline_access", "Mail.Read"},
+		SessionTTL:    30 * 24 * time.Hour,
 		// The absolute session lifetime the production default uses; without
 		// it every session in these tests would be born already too old.
 		SessionMaxAge: 90 * 24 * time.Hour,
@@ -120,6 +124,7 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
 		RedirectURI:   "http://localhost:8080/oauth/callback",
+		PublicBaseURL: "http://example.com",
 		Scopes:        []string{"offline_access"},
 		SessionTTL:    30 * 24 * time.Hour,
 		SessionMaxAge: 90 * 24 * time.Hour,
@@ -148,6 +153,7 @@ func newTestServerWithProvidersAndLog(t *testing.T, providers ...provider.Provid
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
 		RedirectURI:   "http://localhost:8080/oauth/callback",
+		PublicBaseURL: "http://example.com",
 		Scopes:        []string{"offline_access"},
 		SessionTTL:    30 * 24 * time.Hour,
 		SessionMaxAge: 90 * 24 * time.Hour,
@@ -1435,6 +1441,37 @@ func TestHostedAuthRedirectMustBeAllowlisted(t *testing.T) {
 	h.ServeHTTP(rec, withKey(httptest.NewRequest("GET", "/api/v1/me", nil), key))
 	if !strings.Contains(rec.Body.String(), `"redirect_domains":["*.customer.com","exact.example.org"]`) {
 		t.Fatalf("me: %s", rec.Body.String())
+	}
+}
+
+// The own-origin exemption from the redirect allowlist must come from the
+// configured PUBLIC_BASE_URL alone. Deriving it from the request's Host
+// header let any caller name their own domain as "our own origin" and mint a
+// connect link that bounces the end user's browser anywhere they liked —
+// audit finding I2, reopened through a header the client fully controls.
+func TestHostedAuthRedirectIgnoresSpoofedHostHeader(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"success_redirect_url":"https://evil.example/landing"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = "evil.example"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("spoofed Host: status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+	}
+	// The configured origin still is exempt, spoofed Host or not.
+	req = withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"success_redirect_url":"http://example.com/dashboard"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = "evil.example"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("configured origin: status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 	}
 }
 

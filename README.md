@@ -95,6 +95,14 @@ openssl rand -base64 32   # paste into TOKEN_ENCRYPTION_KEY
 $EDITOR .env
 ```
 
+Three values are required and the server refuses to start without them:
+`MS_CLIENT_ID`, `TOKEN_ENCRYPTION_KEY`, and `PUBLIC_BASE_URL` — this
+deployment's own origin, `http://localhost:8080` for a local run (already set
+that way in `.env.example`). `PUBLIC_BASE_URL` is not only the push-notification
+endpoint: it is the origin the hosted-auth redirect allowlist exempts, and that
+exemption has no safe fallback, since the request's `Host` header is set by
+whoever is calling. Step 5 below points it at an HTTPS tunnel to turn push on.
+
 ### 3. Run
 
 ```bash
@@ -134,7 +142,8 @@ the service still works, falling back to incremental polling every
 cloudflared tunnel --url http://localhost:8080     # or: ngrok http 8080
 ```
 
-Then set `PUBLIC_BASE_URL` to the HTTPS origin it prints, **add
+Then point `PUBLIC_BASE_URL` at the HTTPS origin it prints (replacing the
+`http://localhost:8080` from step 2), **add
 `https://<that-origin>/oauth/callback` as a second Redirect URI** on the app
 registration, point `MS_REDIRECT_URI` at it, and restart. Startup logs
 `push_notifications=true` when subscriptions are active.
@@ -547,9 +556,8 @@ These are Outlook-specific and confined to `internal/provider/outlook`.
   set it behind a proxy that itself strips any client-supplied
   `X-Forwarded-Proto` before setting its own — otherwise a client can spoof
   "https" and downgrade both protections. Set `PUBLIC_BASE_URL` to the
-  externally reachable `https://` origin alongside it; the code falls back to
-  `r.Host` (an ordinary HTTP request's own idea of its own origin) only when
-  `PUBLIC_BASE_URL` is empty.
+  externally reachable `https://` origin alongside it — an `https://` origin
+  there is itself enough to mark requests secure, with no header involved.
 - **A self-service password change and a per-developer redirect allowlist**:
   `POST /api/v1/me/password` rotates the password and signs out every other
   session in one call; `PUT /api/v1/me/redirect-domains` (both session-only)
