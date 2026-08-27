@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -27,6 +28,13 @@ var (
 	ErrInvalidInput       = errors.New("invalid email or password format")
 	ErrEmailTaken         = errors.New("could not create account")
 	ErrInvalidCredentials = errors.New("invalid email or password")
+	ErrWeakPassword       = errors.New("password must be at least 10 characters")
+
+	// ErrNoSession is what a cookie that resolves to nothing usable returns:
+	// unknown, expired, or past the absolute lifetime. It wraps
+	// ErrInvalidCredentials so every existing caller — all of which turn a
+	// bad session into "sign in again" — keeps working unchanged.
+	ErrNoSession = fmt.Errorf("no live session: %w", ErrInvalidCredentials)
 )
 
 const (
@@ -38,6 +46,12 @@ const (
 	prefixLen   = 12
 	touchEvery  = time.Minute
 	slideAfter  = 24 * time.Hour
+
+	// defaultSessionMaxAge backstops a caller that passes a non-positive
+	// absolute lifetime. Failing open (no cap at all) would be a silent
+	// security downgrade, and failing closed would log everyone out on a
+	// zero-value config, so New clamps to the same 90 days config defaults to.
+	defaultSessionMaxAge = 90 * 24 * time.Hour
 )
 
 // dummyHash is compared when the email is unknown so both login failure
@@ -48,13 +62,21 @@ type Service struct {
 	store      *store.Store
 	log        *slog.Logger
 	sessionTTL time.Duration
+	maxAge     time.Duration
 
 	mu          sync.Mutex
 	lastTouched map[string]time.Time // key id -> last last_used_at write
 }
 
-func New(s *store.Store, log *slog.Logger, sessionTTL time.Duration) *Service {
-	return &Service{store: s, log: log.With("component", "auth"), sessionTTL: sessionTTL, lastTouched: map[string]time.Time{}}
+// New builds the service. sessionTTL is the idle window a session slides
+// within; maxAge is the absolute lifetime past which it dies however active
+// it has been, so a stolen cookie cannot be renewed forever.
+func New(s *store.Store, log *slog.Logger, sessionTTL, maxAge time.Duration) *Service {
+	if maxAge <= 0 {
+		maxAge = defaultSessionMaxAge
+	}
+	return &Service{store: s, log: log.With("component", "auth"), sessionTTL: sessionTTL,
+		maxAge: maxAge, lastTouched: map[string]time.Time{}}
 }
 
 // logger prefers a per-request logger attached to ctx (via logx.With), but
@@ -135,7 +157,9 @@ func (a *Service) NewSession(ctx context.Context, developerID string) (string, t
 	}
 	tok := base64.RawURLEncoding.EncodeToString(b)
 	exp := time.Now().UTC().Add(a.sessionTTL)
-	if err := a.store.CreateSession(tok, developerID, exp); err != nil {
+	// Only the hash is stored: the sessions table then holds nothing that can
+	// be replayed as a cookie by whoever reads it.
+	if err := a.store.CreateSession(HashKey(tok), developerID, exp); err != nil {
 		return "", time.Time{}, err
 	}
 	a.logger(ctx).Info("session created", "developer_id", developerID, "expires_at", exp)
@@ -153,20 +177,32 @@ func (a *Service) NewSession(ctx context.Context, developerID string) (string, t
 func (a *Service) SessionDeveloper(ctx context.Context, token string) (model.Developer, time.Time, error) {
 	log := a.logger(ctx)
 	if token == "" {
-		return model.Developer{}, time.Time{}, ErrInvalidCredentials
+		return model.Developer{}, time.Time{}, ErrNoSession
 	}
 	now := time.Now().UTC()
-	d, exp, err := a.store.SessionDeveloper(token, now)
+	hash := HashKey(token)
+	d, exp, created, err := a.store.SessionDeveloper(hash, now)
 	if errors.Is(err, store.ErrNotFound) {
 		log.Debug("session lookup", "result", "miss or expired")
-		return model.Developer{}, time.Time{}, ErrInvalidCredentials
+		return model.Developer{}, time.Time{}, ErrNoSession
 	}
 	if err != nil {
 		return model.Developer{}, time.Time{}, err
 	}
+	// The absolute lifetime is measured from creation, which sliding cannot
+	// move: without it an attacker who takes a cookie keeps it alive forever
+	// simply by using it.
+	if now.Sub(created) > a.maxAge {
+		log.Info("session rejected", "reason", "past absolute max age",
+			"developer_id", d.ID, "age", now.Sub(created).Round(time.Hour), "max_age", a.maxAge)
+		if err := a.store.DeleteSession(hash); err != nil {
+			log.Warn("deleting over-age session", "developer_id", d.ID, "err", err)
+		}
+		return model.Developer{}, time.Time{}, ErrNoSession
+	}
 	if exp.Sub(now) < a.sessionTTL-slideAfter {
 		newExp := now.Add(a.sessionTTL)
-		if err := a.store.ExtendSession(token, newExp); err != nil {
+		if err := a.store.ExtendSession(hash, newExp); err != nil {
 			log.Warn("extending session", "developer_id", d.ID, "err", err)
 		} else {
 			exp = newExp
@@ -179,7 +215,46 @@ func (a *Service) SessionDeveloper(ctx context.Context, token string) (model.Dev
 
 func (a *Service) DeleteSession(ctx context.Context, token string) error {
 	a.logger(ctx).Info("session deleted")
-	return a.store.DeleteSession(token)
+	return a.store.DeleteSession(HashKey(token))
+}
+
+// DeleteOtherSessions signs a developer out of every browser but the one
+// holding keepToken. It is the "and everywhere else" half of a password
+// change: without it, whoever knew the old password keeps their cookie.
+func (a *Service) DeleteOtherSessions(ctx context.Context, developerID, keepToken string) error {
+	if err := a.store.DeleteSessionsExcept(developerID, HashKey(keepToken)); err != nil {
+		return err
+	}
+	a.logger(ctx).Info("other sessions signed out", "developer_id", developerID)
+	return nil
+}
+
+// ChangePassword re-hashes after verifying the current password. It does not
+// touch sessions: the caller decides which one to keep (see
+// DeleteOtherSessions), because only the caller knows which browser is asking.
+func (a *Service) ChangePassword(ctx context.Context, developerID, current, next string) error {
+	log := a.logger(ctx)
+	if len(next) < minPassword {
+		log.Debug("password change rejected", "reason", "too short", "developer_id", developerID, "len", len(next))
+		return ErrWeakPassword
+	}
+	hash, err := a.store.DeveloperPasswordHash(developerID)
+	if err != nil {
+		return err
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(current)) != nil {
+		log.Debug("password change rejected", "reason", "wrong current password", "developer_id", developerID)
+		return ErrInvalidCredentials
+	}
+	newHash, err := bcrypt.GenerateFromPassword([]byte(next), bcryptCost)
+	if err != nil {
+		return err
+	}
+	if err := a.store.UpdatePassword(developerID, string(newHash)); err != nil {
+		return err
+	}
+	log.Info("password changed", "developer_id", developerID)
+	return nil
 }
 
 // ---- API keys ----

@@ -21,7 +21,7 @@ func newService(t *testing.T) (*Service, *store.Store, *logx.Records) {
 	}
 	t.Cleanup(func() { db.Close() })
 	log, recs := logx.Capture()
-	return New(db, log, 30*24*time.Hour), db, recs
+	return New(db, log, 30*24*time.Hour, 90*24*time.Hour), db, recs
 }
 
 func TestSignupThenLogin(t *testing.T) {
@@ -98,7 +98,7 @@ func TestSessionsResolveExpireAndSlide(t *testing.T) {
 	// Age the session by two days; the next use must push expiry forward, and
 	// must report the new expiry so the caller can re-issue the cookie.
 	aged := exp.Add(-2 * 24 * time.Hour)
-	if err := db.ExtendSession(tok, aged); err != nil {
+	if err := db.ExtendSession(HashKey(tok), aged); err != nil {
 		t.Fatal(err)
 	}
 	_, slidExp, err := svc.SessionDeveloper(ctx, tok)
@@ -108,7 +108,7 @@ func TestSessionsResolveExpireAndSlide(t *testing.T) {
 	if !slidExp.After(aged) {
 		t.Fatalf("returned expiry %v did not move forward from %v", slidExp, aged)
 	}
-	if _, newExp, _ := db.SessionDeveloper(tok, time.Now()); !newExp.After(exp.Add(-24 * time.Hour)) {
+	if _, newExp, _, _ := db.SessionDeveloper(HashKey(tok), time.Now()); !newExp.After(exp.Add(-24 * time.Hour)) {
 		t.Fatalf("expiry not slid: %v", newExp)
 	} else if !slidExp.Truncate(time.Second).Equal(newExp) {
 		t.Fatalf("returned expiry %v does not match the stored %v", slidExp, newExp)
@@ -148,7 +148,13 @@ func TestAPIKeysLifecycle(t *testing.T) {
 	if err != nil || got.ID != d.ID || gk.ID != k.ID {
 		t.Fatalf("KeyDeveloper = %+v %+v %v", got, gk, err)
 	}
-	if _, _, err := svc.KeyDeveloper(ctx, full[:42]+"X"); !errors.Is(err, ErrInvalidCredentials) {
+	// Flip the last character to something it is not, so the "tampered" key is
+	// never accidentally the real one.
+	tampered := full[:42] + "X"
+	if strings.HasSuffix(full, "X") {
+		tampered = full[:42] + "Y"
+	}
+	if _, _, err := svc.KeyDeveloper(ctx, tampered); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("tampered key err = %v", err)
 	}
 	keys, _ := db.ListAPIKeys(d.ID)
@@ -163,5 +169,90 @@ func TestAPIKeysLifecycle(t *testing.T) {
 	}
 	if err := svc.RevokeKey(ctx, "dev_other", k.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("cross-developer revoke err = %v", err)
+	}
+}
+
+// A session token is a bearer credential: the sessions table must hold only
+// its hash, so a database read cannot be replayed as a login.
+func TestSessionTokenIsStoredHashed(t *testing.T) {
+	svc, db, _ := newService(t)
+	ctx := context.Background()
+	d, _ := svc.Signup(ctx, "a@x.com", "longenoughpassword", "")
+	tok, _, err := svc.NewSession(ctx, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := db.SessionDeveloper(tok, time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("the raw token resolves in the store: it is not hashed at rest")
+	}
+	if _, _, _, err := db.SessionDeveloper(HashKey(tok), time.Now()); err != nil {
+		t.Fatalf("hashed row missing: %v", err)
+	}
+	if _, _, err := svc.SessionDeveloper(ctx, tok); err != nil {
+		t.Fatalf("the token itself must still resolve: %v", err)
+	}
+}
+
+// Sliding expiry alone lets a stolen cookie live forever, so a session also
+// dies a fixed time after it was created, however active it has been.
+func TestSessionAbsoluteMaxAge(t *testing.T) {
+	svc, db, _ := newService(t)
+	ctx := context.Background()
+	d, _ := svc.Signup(ctx, "a@x.com", "longenoughpassword", "")
+	tok, _, _ := svc.NewSession(ctx, d.ID)
+	// Age the row past the absolute limit while keeping it unexpired by the
+	// sliding rule.
+	if _, err := db.DB().Exec(`UPDATE sessions SET created_at = ? WHERE id = ?`,
+		time.Now().Add(-91*24*time.Hour).Unix(), HashKey(tok)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.SessionDeveloper(ctx, tok); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("session older than the max age must be rejected, got %v", err)
+	}
+	// And it is gone, not merely refused.
+	if _, _, _, err := db.SessionDeveloper(HashKey(tok), time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the over-age row was not deleted: %v", err)
+	}
+}
+
+func TestChangePassword(t *testing.T) {
+	svc, _, recs := newService(t)
+	ctx := context.Background()
+	d, _ := svc.Signup(ctx, "a@x.com", "longenoughpassword", "")
+
+	if err := svc.ChangePassword(ctx, d.ID, "longenoughpassword", "short"); !errors.Is(err, ErrWeakPassword) {
+		t.Fatalf("weak new password err = %v", err)
+	}
+	if err := svc.ChangePassword(ctx, d.ID, "not the password", "another strong one"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("wrong current password err = %v", err)
+	}
+	if err := svc.ChangePassword(ctx, d.ID, "longenoughpassword", "another strong one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Login(ctx, "a@x.com", "another strong one"); err != nil {
+		t.Fatalf("new password does not work: %v", err)
+	}
+	if _, err := svc.Login(ctx, "a@x.com", "longenoughpassword"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatal("the old password still works")
+	}
+	if recs.Contains("longenoughpassword") || recs.Contains("another strong one") {
+		t.Fatal("a password appeared in logs")
+	}
+}
+
+func TestDeleteOtherSessionsKeepsTheCurrentOne(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := context.Background()
+	d, _ := svc.Signup(ctx, "a@x.com", "longenoughpassword", "")
+	keep, _, _ := svc.NewSession(ctx, d.ID)
+	gone, _, _ := svc.NewSession(ctx, d.ID)
+	if err := svc.DeleteOtherSessions(ctx, d.ID, keep); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.SessionDeveloper(ctx, gone); err == nil {
+		t.Fatal("the other session survived")
+	}
+	if _, _, err := svc.SessionDeveloper(ctx, keep); err != nil {
+		t.Fatalf("the current session was signed out too: %v", err)
 	}
 }

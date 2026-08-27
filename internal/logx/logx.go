@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"log/slog"
 	"strconv"
@@ -35,6 +36,18 @@ func NewRequestID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "req_" + hex.EncodeToString(b)
+}
+
+// RandomToken returns nBytes of crypto/rand entropy, base64url-encoded
+// without padding — so 32 bytes become 43 URL- and cookie-safe characters.
+// It panics if the system has no entropy: every caller is minting a
+// credential, and a predictable one is worse than a crash.
+func RandomToken(nBytes int) string {
+	b := make([]byte, nBytes)
+	if _, err := rand.Read(b); err != nil {
+		panic("logx: no entropy for a random token: " + err.Error())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // digestKey keys Digest. It defaults to a value generated once per process, so

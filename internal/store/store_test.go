@@ -561,23 +561,23 @@ func TestSessionsExpireAndExtend(t *testing.T) {
 	if err := s.CreateSession("sess1", "dev_1", now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	d, exp, err := s.SessionDeveloper("sess1", now)
+	d, exp, _, err := s.SessionDeveloper("sess1", now)
 	if err != nil || d.ID != "dev_1" || !exp.Equal(now.Add(time.Hour)) {
 		t.Fatalf("SessionDeveloper = %+v %v %v", d, exp, err)
 	}
-	if _, _, err := s.SessionDeveloper("sess1", now.Add(2*time.Hour)); !errors.Is(err, ErrNotFound) {
+	if _, _, _, err := s.SessionDeveloper("sess1", now.Add(2*time.Hour)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expired session err = %v", err)
 	}
 	if err := s.ExtendSession("sess1", now.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.SessionDeveloper("sess1", now.Add(2*time.Hour)); err != nil {
+	if _, _, _, err := s.SessionDeveloper("sess1", now.Add(2*time.Hour)); err != nil {
 		t.Fatalf("extended session rejected: %v", err)
 	}
 	if err := s.DeleteSession("sess1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.SessionDeveloper("sess1", now); !errors.Is(err, ErrNotFound) {
+	if _, _, _, err := s.SessionDeveloper("sess1", now); !errors.Is(err, ErrNotFound) {
 		t.Fatal("deleted session still resolves")
 	}
 }
@@ -1158,5 +1158,69 @@ func TestChatMessageSenderResolvesToAnAttendee(t *testing.T) {
 		if m.ID == "m1" && m.Sender.Name != "Ada" {
 			t.Fatalf("ListChatMessages sender = %+v", m.Sender)
 		}
+	}
+}
+
+func TestDeleteSessionsExceptKeepsOnlyTheGivenHash(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	seedDeveloper(t, s, "dev_2", "b@x.com")
+	exp := time.Now().Add(time.Hour)
+	for _, id := range []string{"keep", "drop1", "drop2"} {
+		if err := s.CreateSession(id, "dev_1", exp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CreateSession("other_dev", "dev_2", exp); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSessionsExcept("dev_1", "keep"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"drop1", "drop2"} {
+		if _, _, _, err := s.SessionDeveloper(id, time.Now()); !errors.Is(err, ErrNotFound) {
+			t.Errorf("session %q survived: %v", id, err)
+		}
+	}
+	if _, _, _, err := s.SessionDeveloper("keep", time.Now()); err != nil {
+		t.Errorf("kept session was deleted: %v", err)
+	}
+	// Another developer's sessions are untouched.
+	if _, _, _, err := s.SessionDeveloper("other_dev", time.Now()); err != nil {
+		t.Errorf("another developer's session was deleted: %v", err)
+	}
+}
+
+func TestSessionDeveloperReportsCreatedAt(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	before := time.Now().Add(-time.Second)
+	if err := s.CreateSession("sess1", "dev_1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, created, err := s.SessionDeveloper("sess1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Before(before) || created.After(time.Now().Add(time.Second)) {
+		t.Fatalf("created_at = %v, want ~now", created)
+	}
+}
+
+func TestUpdatePasswordAndDeveloperPasswordHash(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	hash, err := s.DeveloperPasswordHash("dev_1")
+	if err != nil || hash != "$2a$12$hash" {
+		t.Fatalf("DeveloperPasswordHash = %q %v", hash, err)
+	}
+	if err := s.UpdatePassword("dev_1", "$2a$12$newhash"); err != nil {
+		t.Fatal(err)
+	}
+	if hash, _ := s.DeveloperPasswordHash("dev_1"); hash != "$2a$12$newhash" {
+		t.Fatalf("hash after update = %q", hash)
+	}
+	if _, err := s.DeveloperPasswordHash("dev_nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown developer err = %v", err)
 	}
 }

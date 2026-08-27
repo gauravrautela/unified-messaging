@@ -28,7 +28,7 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 // routeGroup buckets a path for the endpoint table.
 func routeGroup(path string) string {
 	switch {
-	case strings.HasPrefix(path, "/api/v1/api-keys"), path == "/api/v1/me":
+	case strings.HasPrefix(path, "/api/v1/api-keys"), strings.HasPrefix(path, "/api/v1/me"):
 		return "Developer & keys"
 	case path == "/api/v1/hosted-auth", path == "/api/v1/providers":
 		return "Connecting mailboxes"

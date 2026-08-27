@@ -70,9 +70,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}
+	// The token has to be minted before anything is written, and the logout
+	// form below carries it as a hidden field.
+	csrf := s.csrfToken(w, r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_ = dashboardTmpl.Execute(w, struct{ Email string }{dev.Email})
+	_ = dashboardTmpl.Execute(w, struct{ Email, CSRF string }{dev.Email, csrf})
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(dashboardHTML))
@@ -139,7 +142,7 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
         <select id="provider" class="hidden"></select>
         <button id="connect-btn" class="primary">+ Connect account</button>
         <a class="btn" href="/docs">API docs</a>
-        <form id="logout-form" method="post" action="/logout" style="margin:0"><button class="signout" type="submit">Log out</button></form>
+        <form id="logout-form" method="post" action="/logout" style="margin:0"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="signout" type="submit">Log out</button></form>
       </div>
     </header>
     <p id="banner" class="err hidden" style="color:var(--ok);background:color-mix(in srgb, var(--ok) 12%, transparent)"></p>
@@ -160,6 +163,17 @@ input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-rad
         <button class="primary" data-action="create-key" type="submit">Create key</button>
       </form>
       <div id="keys"></div>
+    </div>
+
+    <h2 style="font-size:1.05rem;margin:2rem 0 .5rem">Password</h2>
+    <p class="sub" style="margin-bottom:.75rem">Changing your password signs you out of every other browser.</p>
+    <div class="card">
+      <form id="password-form" style="display:flex;flex-direction:column;gap:.5rem;max-width:22rem">
+        <input id="current-password" type="password" autocomplete="current-password" placeholder="Current password" required>
+        <input id="new-password" type="password" autocomplete="new-password" minlength="10" placeholder="New password (10+ characters)" required>
+        <button class="primary" type="submit" style="align-self:flex-start">Change password</button>
+      </form>
+      <p id="password-msg" class="sub hidden" style="margin-top:.75rem"></p>
     </div>
   </div>
 
@@ -489,6 +503,28 @@ $("keys").addEventListener("click", async (e) => {
   btn.disabled = true;
   try { await api("/api/v1/api-keys/" + btn.closest(".row").dataset.kid, { method: "DELETE" }); loadKeys(); }
   catch (err) { alert("Could not revoke: " + err.message); btn.disabled = false; }
+});
+
+$("password-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const msg = $("password-msg");
+  msg.classList.remove("hidden");
+  msg.style.color = "var(--muted)";
+  msg.textContent = "Changing…";
+  try {
+    await api("/api/v1/me/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: $("current-password").value, new_password: $("new-password").value }),
+    });
+    $("current-password").value = "";
+    $("new-password").value = "";
+    msg.style.color = "var(--ok)";
+    msg.textContent = "Password changed. Every other browser has been signed out.";
+  } catch (err) {
+    msg.style.color = "var(--danger)";
+    msg.textContent = "Could not change the password: " + err.message;
+  }
 });
 
 (async function init() {

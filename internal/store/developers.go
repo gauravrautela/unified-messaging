@@ -61,42 +61,78 @@ func (s *Store) GetDeveloper(id string) (model.Developer, error) {
 	return d, nil
 }
 
-// ---------- sessions ----------
+// DeveloperPasswordHash returns the stored bcrypt hash. Like
+// DeveloperByEmail, the hash leaves the store only to internal/auth.
+func (s *Store) DeveloperPasswordHash(developerID string) (string, error) {
+	var hash string
+	err := s.db.QueryRow(`SELECT password_hash FROM developers WHERE id = ?`, developerID).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return hash, err
+}
 
-func (s *Store) CreateSession(id, developerID string, expiresAt time.Time) error {
+// UpdatePassword replaces the stored hash. Callers are responsible for
+// invalidating sessions afterwards; see DeleteSessionsExcept.
+func (s *Store) UpdatePassword(developerID, hash string) error {
+	_, err := s.db.Exec(`UPDATE developers SET password_hash = ? WHERE id = ?`, hash, developerID)
+	return err
+}
+
+// ---------- sessions ----------
+//
+// Every function here is keyed by a *hash* of the cookie value, never the
+// cookie value itself: the sessions table holds no credential that could be
+// replayed by anyone who reads it. internal/auth owns the hashing, so the id
+// column is opaque to this package — but the parameter is named hash to keep
+// the contract visible at every call site.
+
+func (s *Store) CreateSession(hash, developerID string, expiresAt time.Time) error {
 	_, err := s.db.Exec(`
 		INSERT INTO sessions (id, developer_id, created_at, expires_at) VALUES (?,?,?,?)`,
-		id, developerID, time.Now().Unix(), expiresAt.Unix())
+		hash, developerID, time.Now().Unix(), expiresAt.Unix())
 	return err
 }
 
-// SessionDeveloper resolves a live session. Expired sessions read as
-// ErrNotFound; they are not deleted here so a slow clock skew is recoverable.
-func (s *Store) SessionDeveloper(id string, now time.Time) (model.Developer, time.Time, error) {
+// SessionDeveloper resolves a live session, reporting both when it expires
+// and when it was created — the second is what an absolute-lifetime rule is
+// measured against, and sliding expiry cannot forge it.
+//
+// Expired sessions read as ErrNotFound; they are not deleted here so a slow
+// clock skew is recoverable.
+func (s *Store) SessionDeveloper(hash string, now time.Time) (model.Developer, time.Time, time.Time, error) {
 	var d model.Developer
-	var created, exp int64
+	var devCreated, sessCreated, exp int64
 	err := s.db.QueryRow(`
-		SELECT d.id, d.email, d.name, d.created_at, s.expires_at
+		SELECT d.id, d.email, d.name, d.created_at, s.expires_at, s.created_at
 		FROM sessions s JOIN developers d ON d.id = s.developer_id
-		WHERE s.id = ? AND s.expires_at > ?`, id, now.Unix()).
-		Scan(&d.ID, &d.Email, &d.Name, &created, &exp)
+		WHERE s.id = ? AND s.expires_at > ?`, hash, now.Unix()).
+		Scan(&d.ID, &d.Email, &d.Name, &devCreated, &exp, &sessCreated)
 	if errors.Is(err, sql.ErrNoRows) {
-		return d, time.Time{}, ErrNotFound
+		return d, time.Time{}, time.Time{}, ErrNotFound
 	}
 	if err != nil {
-		return d, time.Time{}, err
+		return d, time.Time{}, time.Time{}, err
 	}
-	d.CreatedAt = time.Unix(created, 0).UTC()
-	return d, time.Unix(exp, 0).UTC(), nil
+	d.CreatedAt = time.Unix(devCreated, 0).UTC()
+	return d, time.Unix(exp, 0).UTC(), time.Unix(sessCreated, 0).UTC(), nil
 }
 
-func (s *Store) ExtendSession(id string, expiresAt time.Time) error {
-	_, err := s.db.Exec(`UPDATE sessions SET expires_at = ? WHERE id = ?`, expiresAt.Unix(), id)
+func (s *Store) ExtendSession(hash string, expiresAt time.Time) error {
+	_, err := s.db.Exec(`UPDATE sessions SET expires_at = ? WHERE id = ?`, expiresAt.Unix(), hash)
 	return err
 }
 
-func (s *Store) DeleteSession(id string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+func (s *Store) DeleteSession(hash string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, hash)
+	return err
+}
+
+// DeleteSessionsExcept is "sign out everywhere else": it drops every session
+// this developer holds but the one identified by keepHash. Passing a hash
+// that matches nothing (or "") signs them out everywhere, full stop.
+func (s *Store) DeleteSessionsExcept(developerID, keepHash string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE developer_id = ? AND id <> ?`, developerID, keepHash)
 	return err
 }
 

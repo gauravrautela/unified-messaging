@@ -52,6 +52,9 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 		RedirectURI: "http://localhost:8080/oauth/callback",
 		Scopes:      []string{"offline_access", "Mail.Read"},
 		SessionTTL:  30 * 24 * time.Hour,
+		// The absolute session lifetime the production default uses; without
+		// it every session in these tests would be born already too old.
+		SessionMaxAge: 90 * 24 * time.Hour,
 	}
 	log, recs := logx.Capture()
 	a := outlook.NewAuth(cfg.ClientID, "", cfg.Tenant, cfg.RedirectURI, cfg.Scopes)
@@ -61,7 +64,7 @@ func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store
 	acctMgr.SetRegistry(registry)
 	disp := events.NewDispatcher(db, nil, log)
 	sync := syncer.New(db, registry, acctMgr, disp, log, syncer.Options{PollInterval: time.Hour})
-	authSvc := auth.New(db, log, cfg.SessionTTL)
+	authSvc := auth.New(db, log, cfg.SessionTTL, cfg.SessionMaxAge)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -113,15 +116,16 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
 	cfg := &config.Config{
 		ClientID: "client-123", Tenant: "consumers",
-		RedirectURI: "http://localhost:8080/oauth/callback",
-		Scopes:      []string{"offline_access"},
-		SessionTTL:  30 * 24 * time.Hour,
+		RedirectURI:   "http://localhost:8080/oauth/callback",
+		Scopes:        []string{"offline_access"},
+		SessionTTL:    30 * 24 * time.Hour,
+		SessionMaxAge: 90 * 24 * time.Hour,
 	}
 	log, _ := logx.Capture()
 	registry := provider.NewRegistry(providers...)
 	disp := events.NewDispatcher(db, nil, log)
 	sync := syncer.New(db, registry, nil, disp, log, syncer.Options{PollInterval: time.Hour})
-	authSvc := auth.New(db, log, cfg.SessionTTL)
+	authSvc := auth.New(db, log, cfg.SessionTTL, cfg.SessionMaxAge)
 	return NewServer(cfg, db, registry, nil, sync, authSvc, nil, disp, nil, log), db
 }
 
@@ -830,17 +834,44 @@ func TestGetEmailIsComplete(t *testing.T) {
 	}
 }
 
-func postForm(h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+// newCSRF fetches the sign-in page the way a browser would and returns the
+// um_csrf cookie it sets, which is half of the double-submit pair every form
+// post now has to carry.
+func newCSRF(t *testing.T, h http.Handler) *http.Cookie {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/login", nil))
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == csrfCookie {
+			return c
+		}
+	}
+	t.Fatal("no csrf cookie on the sign-in page")
+	return nil
+}
+
+// postFormCSRF posts a form the way the rendered page does: the um_csrf
+// cookie plus the matching hidden field.
+func postFormCSRF(t *testing.T, h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	c := newCSRF(t, h)
+	form.Set("csrf", c.Value)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
 }
 
+func loginForm(t *testing.T, h http.Handler, email, password string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postFormCSRF(t, h, "/login", url.Values{"email": {email}, "password": {password}})
+}
+
 func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
 	s, db, recs := newTestServerWithLog(t)
-	rec := postForm(s.Routes(), "/signup", url.Values{
+	rec := postFormCSRF(t, s.Routes(), "/signup", url.Values{
 		"email": {"new@x.com"}, "password": {"longenoughpassword"}, "name": {"New"},
 	})
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dashboard" {
@@ -855,7 +886,7 @@ func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
 	if cookie == nil || cookie.Value == "" || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" {
 		t.Fatalf("session cookie = %+v", cookie)
 	}
-	if _, _, err := db.SessionDeveloper(cookie.Value, time.Now()); err != nil {
+	if _, _, _, err := db.SessionDeveloper(auth.HashKey(cookie.Value), time.Now()); err != nil {
 		t.Fatalf("cookie does not resolve to a session: %v", err)
 	}
 	if _, _, err := db.DeveloperByEmail("new@x.com"); err != nil {
@@ -872,16 +903,16 @@ func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
 func TestSignupAndLoginRejectBadInputInline(t *testing.T) {
 	s, _ := newTestServer(t)
 	h := s.Routes()
-	rec := postForm(h, "/signup", url.Values{"email": {"bad"}, "password": {"short"}})
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid email or password") {
+	rec := postFormCSRF(t, h, "/signup", url.Values{"email": {"bad"}, "password": {"short"}})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), uniformSignupError) {
 		t.Fatalf("signup bad input: %d %s", rec.Code, rec.Body.String())
 	}
 	seedDev(t, s, "a@x.com")
-	rec = postForm(h, "/login", url.Values{"email": {"a@x.com"}, "password": {"wrongpassword!"}})
+	rec = loginForm(t, h, "a@x.com", "wrongpassword!")
 	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "invalid email or password") {
 		t.Fatalf("login wrong password: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = postForm(h, "/login", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+	rec = loginForm(t, h, "a@x.com", "longenoughpassword")
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("login ok: %d", rec.Code)
 	}
@@ -890,7 +921,7 @@ func TestSignupAndLoginRejectBadInputInline(t *testing.T) {
 func TestLoginHonoursSameOriginNext(t *testing.T) {
 	s, _ := newTestServer(t)
 	seedDev(t, s, "a@x.com")
-	rec := postForm(s.Routes(), "/login?next=/mail?account_id=x", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+	rec := postFormCSRF(t, s.Routes(), "/login?next=/mail?account_id=x", url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
 	if loc := rec.Header().Get("Location"); loc != "/mail?account_id=x" {
 		t.Fatalf("location = %q", loc)
 	}
@@ -902,7 +933,7 @@ func TestLoginHonoursSameOriginNext(t *testing.T) {
 		`/\/evil.com`,
 		"//evil.example.com/",
 	} {
-		rec = postForm(s.Routes(), "/login?next="+url.QueryEscape(next), url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
+		rec = postFormCSRF(t, s.Routes(), "/login?next="+url.QueryEscape(next), url.Values{"email": {"a@x.com"}, "password": {"longenoughpassword"}})
 		if loc := rec.Header().Get("Location"); loc != "/dashboard" {
 			t.Fatalf("open redirect via next=%q: %q", next, loc)
 		}
@@ -911,15 +942,30 @@ func TestLoginHonoursSameOriginNext(t *testing.T) {
 
 func TestLogoutClearsSession(t *testing.T) {
 	s, db := newTestServer(t)
+	h := s.Routes()
 	dev, _ := seedDev(t, s, "a@x.com")
-	req := withSession(t, s, httptest.NewRequest(http.MethodPost, "/logout", nil), dev.ID)
-	tok, _ := req.Cookie(sessionCookie)
+
+	// An attacker's cross-site POST to /logout has no token, so it cannot
+	// plant a logged-out (or, on /login, attacker-owned) session.
+	noToken := withSession(t, s, httptest.NewRequest(http.MethodPost, "/logout", nil), dev.ID)
 	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, req)
+	h.ServeHTTP(rec, noToken)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("logout without a csrf token: %d %s", rec.Code, rec.Body.String())
+	}
+
+	c := newCSRF(t, h)
+	req := withSession(t, s, httptest.NewRequest(http.MethodPost, "/logout",
+		strings.NewReader(url.Values{"csrf": {c.Value}}.Encode())), dev.ID)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(c)
+	tok, _ := req.Cookie(sessionCookie)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
 		t.Fatalf("status = %d location = %q", rec.Code, rec.Header().Get("Location"))
 	}
-	if _, _, err := db.SessionDeveloper(tok.Value, time.Now()); err == nil {
+	if _, _, _, err := db.SessionDeveloper(auth.HashKey(tok.Value), time.Now()); err == nil {
 		t.Fatal("session survived logout")
 	}
 }
@@ -2733,5 +2779,206 @@ func TestHostedAuthRejectsBadTelegramAtMintTime(t *testing.T) {
 	if pending.Webhook == nil || pending.Webhook.Kind != "telegram" ||
 		pending.Webhook.ChatID != "-100" || pending.Webhook.BotToken != "123:ABC" {
 		t.Fatalf("pending = %+v", pending.Webhook)
+	}
+}
+
+// The sessions table must hold hashes only: a leaked database read (a backup,
+// a SQL injection, an operator) must not yield a replayable cookie.
+func TestSessionTokenIsHashedAtRest(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	tok, _, err := s.auth.NewSession(context.Background(), dev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, tok).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("raw token stored")
+	}
+	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, auth.HashKey(tok)).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("hashed row missing: %d %v", n, err)
+	}
+	if _, _, err := s.auth.SessionDeveloper(context.Background(), tok); err != nil {
+		t.Fatal("token must still resolve")
+	}
+}
+
+func TestSessionAbsoluteLifetime(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	tok, _, _ := s.auth.NewSession(context.Background(), dev.ID)
+	// Age the row past the absolute limit while keeping it unexpired by the
+	// sliding rule.
+	if _, err := db.DB().Exec(`UPDATE sessions SET created_at = ? WHERE id = ?`,
+		time.Now().Add(-91*24*time.Hour).Unix(), auth.HashKey(tok)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.auth.SessionDeveloper(context.Background(), tok); err == nil {
+		t.Fatal("session older than max age must be rejected")
+	}
+}
+
+func TestLoginRequiresCSRFAndSameOrigin(t *testing.T) {
+	s, _ := newTestServer(t)
+	seedDev(t, s, "a@x.com")
+	h := s.Routes()
+	// 1. no token
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/login", strings.NewReader("email=a%40x.com&password=longenoughpassword"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rec, req)
+	if rec.Code != 403 || !strings.Contains(rec.Body.String(), "csrf") {
+		t.Fatalf("no token: %d %s", rec.Code, rec.Body.String())
+	}
+	// 2. fetch the form to get the token cookie, then post with it
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/login", nil))
+	var csrf *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "um_csrf" {
+			csrf = c
+		}
+	}
+	if csrf == nil {
+		t.Fatal("no csrf cookie on the form page")
+	}
+	if !csrf.HttpOnly || csrf.SameSite != http.SameSiteStrictMode || csrf.Path != "/" || len(csrf.Value) != 43 {
+		t.Fatalf("csrf cookie = %+v", csrf)
+	}
+	if !strings.Contains(rec.Body.String(), `name="csrf" value="`+csrf.Value+`"`) {
+		t.Fatal("form lacks the csrf field")
+	}
+	post := func(origin string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/login", strings.NewReader("email=a%40x.com&password=longenoughpassword&csrf="+csrf.Value))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(csrf)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post("https://evil.example"); rec.Code != 403 {
+		t.Fatalf("cross-origin: %d", rec.Code)
+	}
+	if rec := post("http://example.com"); rec.Code != 303 {
+		t.Fatalf("same-origin (httptest host is example.com): %d %s", rec.Code, rec.Body.String())
+	}
+	// A stale or foreign token with the right cookie shape is still refused.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/login", strings.NewReader("email=a%40x.com&password=longenoughpassword&csrf="+strings.Repeat("A", 43)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(csrf)
+	h.ServeHTTP(rec, req)
+	if rec.Code != 403 {
+		t.Fatalf("mismatched token: %d", rec.Code)
+	}
+}
+
+// Signup must not tell a stranger which emails already have an account, so a
+// taken address and a malformed one fail identically.
+func TestSignupErrorIsUniform(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+	seedDev(t, s, "taken@x.com")
+
+	taken := postFormCSRF(t, h, "/signup", url.Values{"email": {"taken@x.com"}, "password": {"longenoughpassword"}})
+	bad := postFormCSRF(t, h, "/signup", url.Values{"email": {"nonsense"}, "password": {"short"}})
+	if taken.Code != http.StatusBadRequest || bad.Code != http.StatusBadRequest {
+		t.Fatalf("statuses differ or are not 400: taken %d, bad %d", taken.Code, bad.Code)
+	}
+	if !strings.Contains(taken.Body.String(), uniformSignupError) || !strings.Contains(bad.Body.String(), uniformSignupError) {
+		t.Fatalf("messages are not the uniform one:\ntaken: %s\nbad: %s", taken.Body.String(), bad.Body.String())
+	}
+}
+
+func TestChangePasswordInvalidatesOtherSessions(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	tokA, _, _ := s.auth.NewSession(context.Background(), dev.ID)
+	tokB, _, _ := s.auth.NewSession(context.Background(), dev.ID)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/me/password", strings.NewReader(`{"current_password":"longenoughpassword","new_password":"another strong one"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "um_session", Value: tokA})
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != 204 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if _, _, err := s.auth.SessionDeveloper(context.Background(), tokB); err == nil {
+		t.Fatal("other session must be gone")
+	}
+	if _, _, err := s.auth.SessionDeveloper(context.Background(), tokA); err != nil {
+		t.Fatal("current session must survive")
+	}
+	if _, err := s.auth.Login(context.Background(), "a@x.com", "another strong one"); err != nil {
+		t.Fatal("new password must work")
+	}
+	// API key must not reach it
+	_, key := seedDev(t, s, "b@x.com")
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest("POST", "/api/v1/me/password", strings.NewReader(`{}`)), key))
+	if rec.Code != 403 {
+		t.Fatalf("api key: %d", rec.Code)
+	}
+}
+
+func TestChangePasswordRejectsWrongCurrentAndWeakNew(t *testing.T) {
+	s, _, recs := newTestServerWithLog(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	tok, _, _ := s.auth.NewSession(context.Background(), dev.ID)
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/v1/me/password", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+		s.Routes().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post(`{"current_password":"nope nope nope","new_password":"another strong one"}`); rec.Code != 400 ||
+		!strings.Contains(rec.Body.String(), "invalid_credentials") {
+		t.Fatalf("wrong current: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := post(`{"current_password":"longenoughpassword","new_password":"short"}`); rec.Code != 400 ||
+		!strings.Contains(rec.Body.String(), "invalid_body") {
+		t.Fatalf("weak new: %d %s", rec.Code, rec.Body.String())
+	}
+	// The old password still works: nothing changed.
+	if _, err := s.auth.Login(context.Background(), "a@x.com", "longenoughpassword"); err != nil {
+		t.Fatal(err)
+	}
+	if recs.Contains("another strong one") || recs.Contains("longenoughpassword") {
+		t.Fatal("a password reached the logs")
+	}
+}
+
+// Every server-rendered page that can post to /logout has to carry the token,
+// or its own Log out button 403s.
+func TestSessionPagesCarryTheCSRFField(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+	dev, _ := seedDev(t, s, "a@x.com")
+	for _, path := range []string{"/dashboard", "/mail", "/chat"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, path, nil), dev.ID))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d", path, rec.Code)
+		}
+		var csrf *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == csrfCookie {
+				csrf = c
+			}
+		}
+		if csrf == nil {
+			t.Fatalf("%s: no csrf cookie", path)
+		}
+		if !strings.Contains(rec.Body.String(), `name="csrf" value="`+csrf.Value+`"`) {
+			t.Fatalf("%s: logout form lacks the csrf field", path)
+		}
 	}
 }

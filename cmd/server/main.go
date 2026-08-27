@@ -110,7 +110,7 @@ func run(log *slog.Logger) error {
 	}
 	acctMgr.SetRegistry(registry)
 
-	authSvc := auth.New(db, log, cfg.SessionTTL)
+	authSvc := auth.New(db, log, cfg.SessionTTL, cfg.SessionMaxAge)
 
 	opts := syncer.Options{
 		BackfillWindow: envDuration("BACKFILL_DAYS", 30*24*time.Hour, 24*time.Hour),
@@ -147,6 +147,7 @@ func run(log *slog.Logger) error {
 			"scopes", cfg.Scopes,
 			"client_secret_set", cfg.ClientSecret != "",
 			"session_ttl", cfg.SessionTTL,
+			"session_max_age", cfg.SessionMaxAge,
 			"backfill", opts.BackfillWindow,
 			"poll_every", opts.PollInterval,
 			"whatsapp", cfg.WhatsAppEnabled,

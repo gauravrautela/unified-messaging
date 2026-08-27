@@ -90,6 +90,7 @@ a{color:var(--accent)}
   <p>{{.Lead}}</p>
   {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
   <form method="post" action="{{.Action}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
     <input name="email" type="email" placeholder="Email" value="{{.Email}}" required autofocus>
     <input name="password" type="password" placeholder="Password{{if .Signup}} (10+ characters){{end}}" required minlength="{{if .Signup}}10{{else}}1{{end}}">
     {{if .Signup}}<input name="name" type="text" placeholder="Your name (optional)">{{end}}
@@ -101,8 +102,15 @@ a{color:var(--accent)}
 
 type authPage struct {
 	Title, Lead, Action, Button, AltLead, AltHref, AltText, Email, Error string
-	Signup                                                               bool
+	// CSRF is filled in by renderAuth, never by the page constructors, so no
+	// path can render a form without it.
+	CSRF   string
+	Signup bool
 }
+
+// uniformSignupError is the only thing a failed signup ever says, whatever
+// the real reason: see handleSignup.
+const uniformSignupError = "could not create the account — check the details or sign in"
 
 func loginPage(next, email, errMsg string) authPage {
 	action := "/login"
@@ -120,7 +128,11 @@ func signupPage(email, errMsg string) authPage {
 		Email: email, Error: errMsg, Signup: true}
 }
 
-func renderAuth(w http.ResponseWriter, status int, p authPage) {
+// renderAuth is a method so that every rendering of a form — the happy path
+// and all six error paths — mints or refreshes the CSRF cookie and embeds the
+// matching field. A page rendered without one would 403 on submit.
+func (s *Server) renderAuth(w http.ResponseWriter, r *http.Request, status int, p authPage) {
+	p.CSRF = s.csrfToken(w, r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_ = authTmpl.Execute(w, p)
@@ -131,13 +143,16 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusFound)
 		return
 	}
-	renderAuth(w, http.StatusOK, loginPage(r.URL.Query().Get("next"), "", ""))
+	s.renderAuth(w, r, http.StatusOK, loginPage(r.URL.Query().Get("next"), "", ""))
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	log := logx.From(r.Context())
 	if err := r.ParseForm(); err != nil {
-		renderAuth(w, http.StatusBadRequest, loginPage("", "", "bad form"))
+		s.renderAuth(w, r, http.StatusBadRequest, loginPage("", "", "bad form"))
+		return
+	}
+	if !s.checkCSRF(w, r) {
 		return
 	}
 	email := r.PostForm.Get("email")
@@ -146,11 +161,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	dev, err := s.auth.Login(r.Context(), email, r.PostForm.Get("password"))
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {
-			renderAuth(w, http.StatusUnauthorized, loginPage(next, email, err.Error()))
+			s.renderAuth(w, r, http.StatusUnauthorized, loginPage(next, email, err.Error()))
 			return
 		}
 		log.Error("login", "err", err)
-		renderAuth(w, http.StatusInternalServerError, loginPage(next, email, "something went wrong"))
+		s.renderAuth(w, r, http.StatusInternalServerError, loginPage(next, email, "something went wrong"))
 		return
 	}
 	s.startSession(w, r, dev, safeNext(next))
@@ -161,28 +176,34 @@ func (s *Server) handleSignupPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/dashboard", http.StatusFound)
 		return
 	}
-	renderAuth(w, http.StatusOK, signupPage("", ""))
+	s.renderAuth(w, r, http.StatusOK, signupPage("", ""))
 }
 
 func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	log := logx.From(r.Context())
 	if err := r.ParseForm(); err != nil {
-		renderAuth(w, http.StatusBadRequest, signupPage("", "bad form"))
+		s.renderAuth(w, r, http.StatusBadRequest, signupPage("", "bad form"))
+		return
+	}
+	if !s.checkCSRF(w, r) {
 		return
 	}
 	email := r.PostForm.Get("email")
-	log.Debug("signup attempt", "email", strings.ToLower(strings.TrimSpace(email)))
+	digest := logx.Digest(strings.ToLower(strings.TrimSpace(email)))
+	log.Debug("signup attempt", "email_digest", digest)
 	dev, err := s.auth.Signup(r.Context(), email, r.PostForm.Get("password"), r.PostForm.Get("name"))
 	switch {
-	case errors.Is(err, auth.ErrInvalidInput):
-		renderAuth(w, http.StatusBadRequest, signupPage(email, "invalid email or password (10+ characters)"))
-		return
-	case errors.Is(err, auth.ErrEmailTaken):
-		renderAuth(w, http.StatusConflict, signupPage(email, "could not create account — try signing in"))
+	// A taken email and a malformed one fail identically, in status and in
+	// wording: anything else turns the signup form into an oracle for "does
+	// this address already have an account here". The real reason is kept for
+	// the operator, against a digest of the address rather than the address.
+	case errors.Is(err, auth.ErrInvalidInput), errors.Is(err, auth.ErrEmailTaken):
+		log.Debug("signup rejected", "reason", err.Error(), "email_digest", digest)
+		s.renderAuth(w, r, http.StatusBadRequest, signupPage(email, uniformSignupError))
 		return
 	case err != nil:
 		log.Error("signup", "err", err)
-		renderAuth(w, http.StatusInternalServerError, signupPage(email, "something went wrong"))
+		s.renderAuth(w, r, http.StatusInternalServerError, signupPage(email, "something went wrong"))
 		return
 	}
 	s.startSession(w, r, dev, "/dashboard")
@@ -192,7 +213,7 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, dev model.
 	tok, exp, err := s.auth.NewSession(r.Context(), dev.ID)
 	if err != nil {
 		logx.From(r.Context()).Error("creating session", "developer_id", dev.ID, "err", err)
-		renderAuth(w, http.StatusInternalServerError, loginPage("", dev.Email, "something went wrong"))
+		s.renderAuth(w, r, http.StatusInternalServerError, loginPage("", dev.Email, "something went wrong"))
 		return
 	}
 	s.setSessionCookie(w, r, tok, exp)
@@ -201,6 +222,11 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, dev model.
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Logging someone out is state-changing and forgeable from any page, so
+	// it needs the same token as the sign-in forms.
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		_ = s.auth.DeleteSession(r.Context(), c.Value)
 	}
@@ -223,7 +249,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 func (s *Server) requireSession(w http.ResponseWriter, r *http.Request) bool {
 	if authKindFrom(r.Context()) != authKindSession {
 		logx.From(r.Context()).Debug("session-only endpoint refused api key")
-		writeError(w, http.StatusForbidden, "session_required", "sign in to the dashboard to manage API keys")
+		writeError(w, http.StatusForbidden, "session_required", "sign in to the dashboard to manage your account")
 		return false
 	}
 	return true
@@ -283,6 +309,57 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- password ----
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// handleChangePassword is session-only: an API key must not be able to take
+// over the account that issued it. Changing the password also signs every
+// other browser out, so it is a real remedy for a session somebody else is
+// holding — which is the whole reason to offer it.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSession(w, r) {
+		return
+	}
+	dev, _ := developerFrom(r.Context())
+	var req changePasswordRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	err := s.auth.ChangePassword(r.Context(), dev.ID, req.CurrentPassword, req.NewPassword)
+	switch {
+	case errors.Is(err, auth.ErrWeakPassword):
+		writeError(w, http.StatusBadRequest, "invalid_body", "the new password must be at least 10 characters")
+		return
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		writeError(w, http.StatusBadRequest, "invalid_credentials", "current password is incorrect")
+		return
+	case err != nil:
+		logx.From(r.Context()).Error("changing password", "developer_id", dev.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "could not change the password")
+		return
+	}
+	// The cookie on this request identifies the one browser that stays signed
+	// in; every other session dies with the old password.
+	keep := ""
+	if c, cookieErr := r.Cookie(sessionCookie); cookieErr == nil {
+		keep = c.Value
+	}
+	if err := s.auth.DeleteOtherSessions(r.Context(), dev.ID, keep); err != nil {
+		// The password did change, but "signed out everywhere else" is half
+		// of what this endpoint promises, so a failure here is not a success.
+		logx.From(r.Context()).Error("signing out other sessions", "developer_id", dev.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"the password was changed, but other sessions could not be signed out")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

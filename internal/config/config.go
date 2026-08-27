@@ -30,6 +30,12 @@ type Config struct {
 	// SessionTTL is how long a dashboard login lasts without use.
 	SessionTTL time.Duration
 
+	// SessionMaxAge is the absolute lifetime of a dashboard session: however
+	// active it has been, it dies this long after it was created and the
+	// developer signs in again. Sliding expiry alone would let a stolen
+	// cookie be renewed forever.
+	SessionMaxAge time.Duration
+
 	// TokenKey is the 32-byte AES key protecting refresh tokens at rest.
 	TokenKey []byte
 
@@ -64,6 +70,7 @@ func Load() (*Config, error) {
 		Tenant:        env("MS_TENANT", "consumers"),
 		RedirectURI:   env("MS_REDIRECT_URI", "http://localhost:8080/oauth/callback"),
 		SessionTTL:    time.Duration(envInt("SESSION_TTL_DAYS", 30)) * 24 * time.Hour,
+		SessionMaxAge: time.Duration(envInt("SESSION_MAX_AGE_DAYS", 90)) * 24 * time.Hour,
 
 		WhatsAppEnabled:     envBool("WHATSAPP_ENABLED", false),
 		WhatsAppMaxAccounts: envInt("WHATSAPP_MAX_ACCOUNTS", 200),

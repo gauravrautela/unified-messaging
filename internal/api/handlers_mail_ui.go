@@ -1,6 +1,7 @@
 package api
 
 import (
+	"html/template"
 	"net/http"
 	"net/url"
 )
@@ -8,18 +9,21 @@ import (
 // The mail viewer is the third human-facing screen: a read-only, three-pane
 // client over the synced mirror. Like the dashboard it requires a browser
 // session; the page's own fetches then ride the same cookie, so data stays
-// gated exactly where the REST API already gates it. It has no
-// developer-specific content, so unlike the dashboard it stays a plain string
-// rather than a template.
+// gated exactly where the REST API already gates it. Its only
+// server-rendered value is the CSRF token its Log out form has to carry.
 func (s *Server) handleMailPage(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.sessionDeveloper(w, r); !ok {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}
+	// Minted before anything is written; the Log out form below carries it.
+	csrf := s.csrfToken(w, r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(mailHTML))
+	_ = mailTmpl.Execute(w, struct{ CSRF string }{csrf})
 }
+
+var mailTmpl = template.Must(template.New("mail").Parse(mailHTML))
 
 const mailHTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -96,7 +100,7 @@ nav{width:220px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--borde
     <label class="toggle"><input id="unread-only" type="checkbox">Unread only</label>
     <a href="/dashboard">Accounts</a>
     <a href="/docs">API docs</a>
-    <form method="post" action="/logout" style="display:inline"><button type="submit">Log out</button></form>
+    <form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Log out</button></form>
   </header>
   <p id="err" class="err hidden" style="margin:.6rem 1rem"></p>
   <main>

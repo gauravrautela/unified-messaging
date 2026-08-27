@@ -1,6 +1,7 @@
 package api
 
 import (
+	"html/template"
 	"net/http"
 	"net/url"
 )
@@ -8,18 +9,21 @@ import (
 // The chat viewer is the fourth human-facing screen: a live, two-pane client
 // over the linked device's chats. Like the mail viewer it requires a browser
 // session; the page's own fetches then ride the same cookie, so data stays
-// gated exactly where the REST API already gates it. It stays a plain string
-// rather than a template for the same reason mailHTML does: nothing on the
-// page is developer-specific.
+// gated exactly where the REST API already gates it. Its only server-rendered
+// value is the CSRF token its Log out form has to carry.
 func (s *Server) handleChatPage(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.sessionDeveloper(w, r); !ok {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}
+	// Minted before anything is written; the Log out form below carries it.
+	csrf := s.csrfToken(w, r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(chatHTML))
+	_ = chatTmpl.Execute(w, struct{ CSRF string }{csrf})
 }
+
+var chatTmpl = template.Must(template.New("chat").Parse(chatHTML))
 
 const chatHTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -80,7 +84,7 @@ main{display:flex;flex:1;min-height:0}
     <select id="accounts"></select>
     <a href="/dashboard">Accounts</a>
     <a href="/docs">API docs</a>
-    <form method="post" action="/logout" style="display:inline"><button type="submit">Log out</button></form>
+    <form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Log out</button></form>
   </header>
   <p id="err" class="err hidden" style="margin:.6rem 1rem"></p>
   <main>
