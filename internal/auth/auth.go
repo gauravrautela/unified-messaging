@@ -99,11 +99,11 @@ func (a *Service) Signup(ctx context.Context, email, password, name string) (mod
 	email = strings.ToLower(strings.TrimSpace(email))
 	at := strings.Index(email, "@")
 	if at < 1 || !strings.Contains(email[at:], ".") {
-		log.Debug("signup rejected", "reason", "malformed email", "email", email)
+		log.Debug("signup rejected", "reason", "malformed email", "email_digest", logx.Digest(email))
 		return model.Developer{}, ErrInvalidInput
 	}
 	if len(password) < minPassword {
-		log.Debug("signup rejected", "reason", "password too short", "email", email, "len", len(password))
+		log.Debug("signup rejected", "reason", "password too short", "email_digest", logx.Digest(email), "len", len(password))
 		return model.Developer{}, ErrInvalidInput
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
@@ -117,12 +117,12 @@ func (a *Service) Signup(ctx context.Context, email, password, name string) (mod
 	d := model.Developer{ID: id, Email: email, Name: strings.TrimSpace(name), CreatedAt: time.Now().UTC()}
 	if err := a.store.CreateDeveloper(d, string(hash)); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			log.Debug("signup rejected", "reason", "email taken", "email", email)
+			log.Debug("signup rejected", "reason", "email taken", "email_digest", logx.Digest(email))
 			return model.Developer{}, ErrEmailTaken
 		}
 		return model.Developer{}, err
 	}
-	log.Info("developer signed up", "developer_id", d.ID, "email", d.Email)
+	log.Info("developer signed up", "developer_id", d.ID, "email_digest", logx.Digest(d.Email))
 	return d, nil
 }
 
@@ -134,7 +134,7 @@ func (a *Service) Login(ctx context.Context, email, password string) (model.Deve
 	if errors.Is(err, store.ErrNotFound) {
 		// Burn the same bcrypt cost as a real comparison.
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
-		log.Debug("login failed", "reason", "unknown email", "email", email, "bcrypt_ms", time.Since(start).Milliseconds())
+		log.Debug("login failed", "reason", "unknown email", "email_digest", logx.Digest(email), "bcrypt_ms", time.Since(start).Milliseconds())
 		return model.Developer{}, ErrInvalidCredentials
 	}
 	if err != nil {

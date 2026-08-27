@@ -272,7 +272,7 @@ func TestBrowserRoutesIsolation(t *testing.T) {
 				if rec.Code != http.StatusOK {
 					t.Errorf("connect/%s: status=%d, want 200 (body %s)", stateA, rec.Code, rec.Body.String())
 				}
-				if strings.Contains(rec.Body.String(), "a@outlook.com") || strings.Contains(rec.Body.String(), devA.ID) {
+				if strings.Contains(rec.Body.String(), devA.Email) || strings.Contains(rec.Body.String(), devA.ID) {
 					t.Errorf("connect/%s leaked A's identity: %s", stateA, rec.Body.String())
 				}
 			},
@@ -377,6 +377,28 @@ func TestBrowserRoutesIsolation(t *testing.T) {
 	for _, route := range browserRoutes {
 		if !covered[route] {
 			t.Errorf("route %q has no browser isolation case; add one", route)
+		}
+	}
+}
+
+// browserRoutes only gates the isolation test above through Routes()'s own
+// panic when a listed pattern has no handler. That catches a route dropped
+// from the map but not the reverse — a handler added to browserHandlers with
+// no browserRoutes entry, which Routes() would happily leave unregistered.
+// This test catches both directions directly by comparing the two.
+func TestBrowserHandlersMatchBrowserRoutes(t *testing.T) {
+	s, _ := newTestServer(t)
+	handlers := s.browserHandlers()
+	if len(handlers) != len(browserRoutes) {
+		t.Fatalf("browserHandlers has %d entries, browserRoutes lists %d", len(handlers), len(browserRoutes))
+	}
+	listed := make(map[string]bool, len(browserRoutes))
+	for _, route := range browserRoutes {
+		listed[route] = true
+	}
+	for pattern := range handlers {
+		if !listed[pattern] {
+			t.Errorf("browserHandlers has %q, which is not in browserRoutes", pattern)
 		}
 	}
 }

@@ -41,6 +41,14 @@ func TestSignupThenLogin(t *testing.T) {
 	if recs.Contains("correct horse battery") {
 		t.Fatal("password appeared in logs")
 	}
+	// The signup and login logs identify the developer by a digest, never the
+	// address itself.
+	if !recs.Contains("h_") {
+		t.Fatalf("expected a digested email handle in the logs: %v", recs.All())
+	}
+	if recs.Contains("dev@example.com") {
+		t.Fatalf("email appeared in clear in the logs: %v", recs.All())
+	}
 }
 
 func TestLoginFailuresAreUniform(t *testing.T) {

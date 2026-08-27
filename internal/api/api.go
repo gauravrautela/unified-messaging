@@ -159,48 +159,68 @@ var browserRoutes = []string{
 	"POST /notifications/{provider}/lifecycle",
 }
 
+// browserHandlers is the non-API-key counterpart to the apiRoutes/handlers
+// map below: every pattern in browserRoutes must have an entry here, and
+// vice versa (see TestBrowserHandlersMatchBrowserRoutes), so a route
+// registered on mux without a browserRoutes entry — or a browserRoutes entry
+// with no handler — fails, instead of silently going unchecked by the
+// isolation test.
+func (s *Server) browserHandlers() map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		// dropped_events is the one place a lost webhook notification is
+		// visible: an event discarded by a saturated dispatcher never reaches
+		// webhook_deliveries, so nothing else in the API can report it.
+		"GET /healthz": func(w http.ResponseWriter, r *http.Request) {
+			var dropped int64
+			if s.dispatcher != nil {
+				dropped = s.dispatcher.Dropped()
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "dropped_events": dropped})
+		},
+
+		// --- connection flow (browser-facing; no API key) ---
+		"GET /connect/{state}":          s.handleConnectRedirect,
+		"POST /connect/{state}/consent": s.handleConsent,
+		"GET /connect/{state}/qr":       s.handleLinkQR,
+		"GET /oauth/callback":           s.handleOAuthCallback,
+
+		// --- developer sign-in (form posts, cookie session) ---
+		"GET /login":   s.handleLoginPage,
+		"POST /login":  s.handleLogin,
+		"GET /signup":  s.handleSignupPage,
+		"POST /signup": s.handleSignup,
+		"POST /logout": s.handleLogout,
+
+		// --- account management + mail viewer UI (server-side session-gated; see handlers_auth.go) ---
+		// --- public integration guide ---
+		"GET /docs":     s.handleDocs,
+		"GET /llms.txt": s.handleLLMsTxt,
+
+		"GET /dashboard": s.handleDashboard,
+		"GET /mail":      s.handleMailPage,
+		"GET /chat":      s.handleChatPage,
+
+		// --- inbound push from providers ---
+		// Deliberately unauthenticated by API key: providers cannot send
+		// custom headers. Authenticity comes from the per-subscription
+		// clientState secret. Namespaced by provider so each one's
+		// validation quirks stay addressable.
+		"POST /notifications/{provider}":           s.handleProviderNotification,
+		"POST /notifications/{provider}/lifecycle": s.handleProviderNotification,
+	}
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// dropped_events is the one place a lost webhook notification is visible:
-	// an event discarded by a saturated dispatcher never reaches
-	// webhook_deliveries, so nothing else in the API can report it.
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		var dropped int64
-		if s.dispatcher != nil {
-			dropped = s.dispatcher.Dropped()
+	browserHandlers := s.browserHandlers()
+	for _, pattern := range browserRoutes {
+		hf, ok := browserHandlers[pattern]
+		if !ok {
+			panic("no handler for " + pattern)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "dropped_events": dropped})
-	})
-
-	// --- connection flow (browser-facing; no API key) ---
-	mux.HandleFunc("GET /connect/{state}", s.handleConnectRedirect)
-	mux.HandleFunc("POST /connect/{state}/consent", s.handleConsent)
-	mux.HandleFunc("GET /connect/{state}/qr", s.handleLinkQR)
-	mux.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
-
-	// --- developer sign-in (form posts, cookie session) ---
-	mux.HandleFunc("GET /login", s.handleLoginPage)
-	mux.HandleFunc("POST /login", s.handleLogin)
-	mux.HandleFunc("GET /signup", s.handleSignupPage)
-	mux.HandleFunc("POST /signup", s.handleSignup)
-	mux.HandleFunc("POST /logout", s.handleLogout)
-
-	// --- account management + mail viewer UI (server-side session-gated; see handlers_auth.go) ---
-	// --- public integration guide ---
-	mux.HandleFunc("GET /docs", s.handleDocs)
-	mux.HandleFunc("GET /llms.txt", s.handleLLMsTxt)
-
-	mux.HandleFunc("GET /dashboard", s.handleDashboard)
-	mux.HandleFunc("GET /mail", s.handleMailPage)
-	mux.HandleFunc("GET /chat", s.handleChatPage)
-
-	// --- inbound push from providers ---
-	// Deliberately unauthenticated by API key: providers cannot send custom
-	// headers. Authenticity comes from the per-subscription clientState secret.
-	// Namespaced by provider so each one's validation quirks stay addressable.
-	mux.HandleFunc("POST /notifications/{provider}", s.handleProviderNotification)
-	mux.HandleFunc("POST /notifications/{provider}/lifecycle", s.handleProviderNotification)
+		mux.HandleFunc(pattern, hf)
+	}
 
 	// --- the API proper ---
 	api := http.NewServeMux()
