@@ -94,6 +94,40 @@ func TestRedactMasksEmailAndPhoneValues(t *testing.T) {
 	}
 }
 
+// M-2: an array *under* one of these keys is masked element by element.
+// The *Value helpers fell through to Redact for anything that was not a
+// string, and Redact's []any branch recurses with Redact — whose default
+// case returns a bare string untouched. So {"emails":["victim@x.com"]} was
+// logged verbatim at DEBUG. Nothing the API itself decodes has that shape,
+// but logBody logs whatever JSON arrived before decoding, so any
+// authenticated caller could pick the key.
+func TestRedactMasksArraysUnderEmailPhoneAndContentKeys(t *testing.T) {
+	in := map[string]any{
+		"emails":     []any{"victim@x.com", "second@y.org"},
+		"phones":     []any{"+919888000855"},
+		"identifier": []any{"+15551234567"},
+		"body":       []any{"the whole message text"},
+	}
+	out := Redact(in).(map[string]any)
+	if got := out["emails"].([]any); got[0] != "v•••@x.com" || got[1] != "s•••@y.org" {
+		t.Fatalf("emails = %v, want each address masked", got)
+	}
+	if got := out["phones"].([]any)[0]; got != "+91 98••• •855" {
+		t.Fatalf("phones[0] = %v, want it masked", got)
+	}
+	if got := out["identifier"].([]any)[0]; got != "+1 55••• •567" {
+		t.Fatalf("identifier[0] = %v, want it masked", got)
+	}
+	if got := out["body"].([]any)[0]; got != "[22 chars]" {
+		t.Fatalf("body[0] = %v, want a length marker", got)
+	}
+	for _, leak := range []string{"victim@x.com", "second@y.org", "919888000855", "5551234567", "whole message"} {
+		if strings.Contains(toString(out), leak) {
+			t.Fatalf("redacted output leaked %q: %v", leak, out)
+		}
+	}
+}
+
 // An email with no "@" is not really an email; it is masked down entirely
 // rather than partially revealed, and an empty phone/identifier value stays
 // empty rather than becoming a mask of nothing.

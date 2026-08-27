@@ -183,6 +183,26 @@ func contentMarker(v any) any {
 	if s, ok := v.(string); ok {
 		return "[" + strconv.Itoa(len(s)) + " chars]"
 	}
+	return maskEach(v, contentMarker)
+}
+
+// maskEach applies mask to every element of an array, and otherwise hands the
+// value to Redact.
+//
+// The array case has to be spelled out here rather than left to Redact: the
+// key that earned the masking treatment belongs to the array itself, and
+// Redact recursing into the elements loses it — a bare string hits Redact's
+// default case and comes back untouched. So {"emails": ["victim@x.com"]} used
+// to be logged verbatim. Elements that are not strings still go through
+// Redact via mask, so a mixed or nested array is walked normally.
+func maskEach(v any, mask func(any) any) any {
+	if list, ok := v.([]any); ok {
+		out := make([]any, len(list))
+		for i, item := range list {
+			out[i] = mask(item)
+		}
+		return out
+	}
 	return Redact(v)
 }
 
@@ -206,7 +226,7 @@ func maskEmailValue(v any) any {
 	if s, ok := v.(string); ok {
 		return maskEmail(s)
 	}
-	return Redact(v)
+	return maskEach(v, maskEmailValue)
 }
 
 // maskPhoneValue masks a string value as a phone number; a non-string value
@@ -215,7 +235,7 @@ func maskPhoneValue(v any) any {
 	if s, ok := v.(string); ok {
 		return maskPhone(s)
 	}
-	return Redact(v)
+	return maskEach(v, maskPhoneValue)
 }
 
 // maskEmail keeps the first rune of the local part and the whole domain:
