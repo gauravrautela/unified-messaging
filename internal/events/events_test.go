@@ -167,13 +167,13 @@ func TestFailedDeliveryIsQueuedAndRetried(t *testing.T) {
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
 
 	waitFor(t, func() bool {
-		q, _ := db.ListDeliveries("wh_1")
+		q, _ := db.ListDeliveries("wh_1", 200, 0)
 		return len(q) == 1 && q[0].Attempts == 1 && q[0].LastError != "" && !q[0].Dead
 	})
 
 	rcv.setCode(http.StatusOK)
 	waitFor(t, func() bool {
-		q, _ := db.ListDeliveries("wh_1")
+		q, _ := db.ListDeliveries("wh_1", 200, 0)
 		return len(q) == 0
 	})
 	if rcv.count() < 2 {
@@ -220,10 +220,10 @@ func TestDeliveryIsDeadAfterScheduleExhausted(t *testing.T) {
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
 
 	waitFor(t, func() bool {
-		q, _ := db.ListDeliveries("wh_1")
+		q, _ := db.ListDeliveries("wh_1", 200, 0)
 		return len(q) == 1 && q[0].Dead
 	})
-	q, _ := db.ListDeliveries("wh_1")
+	q, _ := db.ListDeliveries("wh_1", 200, 0)
 	// first attempt + one per schedule entry
 	if q[0].Attempts != 3 || rcv.count() != 3 {
 		t.Fatalf("attempts = %d, hits = %d, want 3 each", q[0].Attempts, rcv.count())
@@ -424,10 +424,10 @@ func TestFailedDeliveryStoresScrubbedError(t *testing.T) {
 	d.Start(ctx)
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "s"}})
 	waitFor(t, func() bool {
-		dls, _ := db.ListDeliveries("wh_d")
+		dls, _ := db.ListDeliveries("wh_d", 200, 0)
 		return len(dls) == 1
 	})
-	dls, _ := db.ListDeliveries("wh_d")
+	dls, _ := db.ListDeliveries("wh_d", 200, 0)
 	if strings.Contains(dls[0].LastError, "topsecret") || !strings.Contains(dls[0].LastError, "500") {
 		t.Fatalf("last_error = %q", dls[0].LastError)
 	}
@@ -460,10 +460,10 @@ func TestFailedDiscordDeliveryMasksTokenInLastError(t *testing.T) {
 	d.Start(ctx)
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "s"}})
 	waitFor(t, func() bool {
-		dls, _ := db.ListDeliveries("wh_dm")
+		dls, _ := db.ListDeliveries("wh_dm", 200, 0)
 		return len(dls) == 1 && dls[0].LastError != ""
 	})
-	dls, _ := db.ListDeliveries("wh_dm")
+	dls, _ := db.ListDeliveries("wh_dm", 200, 0)
 	if strings.Contains(dls[0].LastError, "topsecret") || !strings.Contains(dls[0].LastError, "/api/webhooks/9/•••") {
 		t.Fatalf("last_error = %q", dls[0].LastError)
 	}
@@ -487,7 +487,7 @@ func TestFailedDeliveryLogsNumericStatus(t *testing.T) {
 	d.Start(ctx)
 	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "s"}})
 	waitFor(t, func() bool {
-		dls, _ := db.ListDeliveries("wh_st")
+		dls, _ := db.ListDeliveries("wh_st", 200, 0)
 		return len(dls) == 1
 	})
 	found := false
@@ -498,5 +498,38 @@ func TestFailedDeliveryLogsNumericStatus(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no delivery response line with status=503: %v", recs.All())
+	}
+}
+
+// --- concurrent hook delivery (I4) ---
+
+// One slow webhook target must not stall every other subscriber's deliveries:
+// the dispatcher fans hooks out under a worker pool rather than sending them
+// one at a time on the single delivery goroutine.
+func TestSlowHookDoesNotBlockOtherHooks(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	safehttp.AllowLoopbackForTests(t)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(3 * time.Second) }))
+	t.Cleanup(slow.Close)
+	fast := newReceiver(t, 200)
+	for _, h := range []model.Webhook{
+		{ID: "wh_slow", DeveloperID: "dev_1", URL: slow.URL, CreatedAt: time.Now()},
+		{ID: "wh_fast", DeveloperID: "dev_1", URL: fast.URL, CreatedAt: time.Now()},
+	} {
+		if err := db.SaveWebhook(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := NewDispatcher(db, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	d.DeliveryWorkers = 4
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	start := time.Now()
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{Subject: "x"}})
+	waitFor(t, func() bool { return fast.count() == 1 })
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("fast hook waited behind the slow one")
 	}
 }

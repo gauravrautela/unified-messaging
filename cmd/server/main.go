@@ -64,9 +64,34 @@ func run(log *slog.Logger) error {
 	db.SetSealKey(cfg.TokenKey)
 	db.SetLogger(log.With("component", "store"))
 	db.PurgeExpiredOAuthStates()
+	db.PurgeDeadDeliveries(time.Now().Add(-cfg.DeliveryRetention))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// oauth_states was previously purged only at boot, so a long-running
+	// process accumulated expired rows for its whole life; dead deliveries
+	// carry a full message payload each and were never purged at all. An
+	// hourly sweep bounds both, stopped by the same signal context that stops
+	// everything else.
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				db.PurgeExpiredOAuthStates()
+				n, err := db.PurgeDeadDeliveries(time.Now().Add(-cfg.DeliveryRetention))
+				if err != nil {
+					log.Error("purging dead deliveries", "err", err)
+					continue
+				}
+				log.Info("purge", "dead_deliveries", n)
+			}
+		}
+	}()
 
 	// The dispatcher outlives the signal context on purpose. Cancelling both at
 	// the same instant is what made the shutdown "drain" a no-op: the delivery

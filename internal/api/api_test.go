@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -739,6 +740,9 @@ func TestListWebhookDeliveries(t *testing.T) {
 	}
 	if len(list.Items) != 1 || !list.Items[0].Dead || list.Items[0].LastError != "status 500" {
 		t.Fatalf("items = %+v", list.Items)
+	}
+	if list.Limit != 50 || list.Offset != 0 {
+		t.Fatalf("limit/offset = %d/%d, want defaults 50/0", list.Limit, list.Offset)
 	}
 	if strings.Contains(rec.Body.String(), "secret") {
 		t.Fatal("payload leaked into delivery listing")
@@ -3115,5 +3119,53 @@ func TestCSRFCookieIsReissuedOnEveryRender(t *testing.T) {
 	}
 	if got.MaxAge != 12*3600 {
 		t.Fatalf("re-issued max-age = %d, want the full window back", got.MaxAge)
+	}
+}
+
+// GET /webhooks/{id}/deliveries must paginate: an outage can pile up hundreds
+// of dead deliveries, and returning them all in one response is unbounded.
+func TestListWebhookDeliveriesIsPaginated(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	now := time.Now().UTC()
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: dev.ID, URL: "https://x.example.com", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		created := now.Add(time.Duration(i) * time.Second)
+		if err := db.SaveDelivery(store.Delivery{
+			ID: "dl_" + strconv.Itoa(i), WebhookID: "wh_1", AccountID: "acc_1", EventType: "mail_received",
+			Payload: []byte(`{}`), Attempts: 1, NextAttemptAt: created, CreatedAt: created,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/webhooks/wh_1/deliveries?limit=2&offset=2", nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var list listResponse[store.Delivery]
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 || list.Limit != 2 || list.Offset != 2 {
+		t.Fatalf("items/limit/offset = %d/%d/%d, want 2/2/2", len(list.Items), list.Limit, list.Offset)
+	}
+
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/webhooks/wh_1/deliveries?limit=500", nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	list = listResponse[store.Delivery]{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Limit != 200 {
+		t.Fatalf("limit = %d, want clamped to 200", list.Limit)
 	}
 }

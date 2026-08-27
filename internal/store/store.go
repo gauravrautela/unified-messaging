@@ -226,12 +226,23 @@ func (s *Store) MarkSynced(id string) error {
 	return err
 }
 
+// DeleteAccount removes an account and everything scoped to it: its
+// account-bound webhooks, and any deliveries already queued against it
+// (which otherwise keep a deleted tenant's full message payloads around and
+// can go on retrying against a hook that no longer applies to anyone). All
+// three deletes run in one transaction so a crash mid-way never leaves
+// deliveries or webhooks orphaned from a half-deleted account.
 func (s *Store) DeleteAccount(id string) error {
-	if _, err := s.db.Exec(`DELETE FROM webhooks WHERE account_id = ?`, id); err != nil {
+	return s.inTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM webhook_deliveries WHERE account_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM webhooks WHERE account_id = ?`, id); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id)
 		return err
-	}
-	_, err := s.db.Exec(`DELETE FROM accounts WHERE id = ?`, id)
-	return err
+	})
 }
 
 type scanner interface{ Scan(...any) error }
@@ -454,8 +465,8 @@ func (s *Store) ListEmails(q EmailQuery) (result []model.Email, err error) {
 		args = append(args, b2i(!*q.Unread))
 	}
 	if q.Search != "" {
-		where = append(where, "(subject LIKE ? OR snippet LIKE ? OR from_email LIKE ?)")
-		like := "%" + q.Search + "%"
+		where = append(where, "(subject LIKE ? ESCAPE '\\' OR snippet LIKE ? ESCAPE '\\' OR from_email LIKE ? ESCAPE '\\')")
+		like := "%" + escapeLike(q.Search) + "%"
 		args = append(args, like, like, like)
 	}
 	if q.Limit <= 0 || q.Limit > 200 {
@@ -544,6 +555,17 @@ func scanEmail(r scanner) (model.Email, error) {
 	e.Date = time.Unix(date, 0).UTC()
 	e.Read, e.Flagged, e.Draft, e.HasAttachments = read == 1, flagged == 1, draft == 1, hasAtt == 1
 	return e, nil
+}
+
+// escapeLike escapes a caller-supplied search string for safe use inside a
+// LIKE pattern with ESCAPE '\': the backslash itself is escaped first so a
+// literal one in the input can't be mistaken for an escape sequence, then '%'
+// and '_' are escaped so they match themselves instead of acting as
+// wildcards. Every LIKE ? built from user input pairs this with an
+// `ESCAPE '\'` clause on the query.
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 func b2i(b bool) int {

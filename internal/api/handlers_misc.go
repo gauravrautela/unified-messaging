@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -389,12 +390,36 @@ func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	items, err := s.store.ListDeliveries(id)
+	limit, offset := deliveriesPaging(r)
+	items, err := s.store.ListDeliveries(id, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, listResponse[store.Delivery]{Items: items})
+	writeJSON(w, http.StatusOK, listResponse[store.Delivery]{Items: items, Limit: limit, Offset: offset})
+}
+
+// deliveriesPaging parses limit/offset for the deliveries listing. Unlike
+// paging (used elsewhere), an out-of-range limit clamps to the max rather
+// than silently falling back to the default: an operator asking for 500
+// still gets the largest page this endpoint will hand back, not a smaller
+// one than they asked for.
+func deliveriesPaging(r *http.Request) (limit, offset int) {
+	limit, offset = 50, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+			if limit > 200 {
+				limit = 200
+			}
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	return limit, offset
 }
 
 // ---- per-account webhooks ----

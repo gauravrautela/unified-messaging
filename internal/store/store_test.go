@@ -400,7 +400,7 @@ func TestDueDeliveriesHonoursSchedule(t *testing.T) {
 	if err := s.DeleteDelivery("dl_soon"); err != nil {
 		t.Fatal(err)
 	}
-	all, err := s.ListDeliveries("wh_1")
+	all, err := s.ListDeliveries("wh_1", 200, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +427,7 @@ func TestDeleteWebhookDropsQueuedDeliveries(t *testing.T) {
 	if err := s.DeleteWebhook("dev_1", "wh_1"); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.ListDeliveries("wh_1"); len(got) != 0 {
+	if got, _ := s.ListDeliveries("wh_1", 200, 0); len(got) != 0 {
 		t.Fatalf("deliveries survived webhook deletion: %+v", got)
 	}
 }
@@ -1222,5 +1222,149 @@ func TestUpdatePasswordAndDeveloperPasswordHash(t *testing.T) {
 	}
 	if _, err := s.DeveloperPasswordHash("dev_nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown developer err = %v", err)
+	}
+}
+
+// PurgeDeadDeliveries is the only thing standing between an abandoned
+// delivery's full message payload and unbounded growth of webhook_deliveries;
+// it must only remove rows that are both dead and old, never a live retry.
+func TestPurgeDeadDeliveriesRemovesRowsOlderThanCutoff(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// Five dead deliveries spanning 10 days: two older than the 7-day cutoff,
+	// three within it.
+	for i, daysOld := range []int{10, 8, 5, 2, 0} {
+		created := now.AddDate(0, 0, -daysOld)
+		if err := s.SaveDelivery(Delivery{
+			ID: fmt.Sprintf("dl_%d", i), WebhookID: "wh_1", AccountID: "acc_1", EventType: "mail_received",
+			Payload: []byte(`{"big":"payload"}`), Attempts: 8, Dead: true,
+			NextAttemptAt: created, CreatedAt: created,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A live (non-dead) delivery, however old, must survive the purge.
+	live := now.AddDate(0, 0, -30)
+	if err := s.SaveDelivery(Delivery{
+		ID: "dl_live", WebhookID: "wh_1", AccountID: "acc_1", EventType: "mail_received",
+		Payload: []byte(`{}`), Attempts: 1, Dead: false, NextAttemptAt: live, CreatedAt: live,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PurgeDeadDeliveries(now.Add(-7 * 24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("PurgeDeadDeliveries removed %d rows, want 2 (the 10d and 8d old dead rows)", n)
+	}
+	all, err := s.ListDeliveries("wh_1", 200, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("ListDeliveries after purge = %d rows, want 4 (3 recent dead + 1 live)", len(all))
+	}
+	for _, d := range all {
+		if d.ID == "dl_0" || d.ID == "dl_1" {
+			t.Fatalf("purge left an old dead row behind: %+v", d)
+		}
+	}
+}
+
+// ListDeliveries paginates: a webhook with many rows returns only the page
+// asked for.
+func TestListDeliveriesIsPaginated(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		created := now.Add(time.Duration(i) * time.Second)
+		if err := s.SaveDelivery(Delivery{
+			ID: fmt.Sprintf("dl_page_%d", i), WebhookID: "wh_1", AccountID: "acc_1", EventType: "mail_received",
+			Payload: []byte(`{}`), Attempts: 1, NextAttemptAt: created, CreatedAt: created,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := s.ListDeliveries("wh_1", 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].ID != "dl_page_2" || page[1].ID != "dl_page_3" {
+		t.Fatalf("page = %+v, want [dl_page_2 dl_page_3]", page)
+	}
+}
+
+// DeleteAccount must take the account's queued deliveries with it: otherwise
+// a full message payload from a deleted tenant sits in webhook_deliveries
+// forever, and a stray retry keeps posting on the deleted account's behalf.
+func TestDeleteAccountRemovesItsDeliveries(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.UpsertAccount(model.Account{ID: "acc_1", DeveloperID: "dev_1", Provider: "OUTLOOK", Email: "u@x.com", Status: model.AccountOK}); err != nil {
+		t.Fatal(err)
+	}
+	// Developer-wide hook (no account_id), so DeleteAccount must not drop the
+	// hook itself, only the account's own queued deliveries.
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.SaveDelivery(Delivery{
+		ID: "dl_acc1", WebhookID: "wh_1", AccountID: "acc_1", EventType: "mail_received",
+		Payload: []byte(`{}`), Attempts: 1, NextAttemptAt: now, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteAccount("acc_1"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := s.ListDeliveries("wh_1", 200, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range all {
+		if d.AccountID == "acc_1" {
+			t.Fatalf("delivery for deleted account survived: %+v", d)
+		}
+	}
+	// The developer-wide hook itself is untouched: it belongs to the
+	// developer, not the deleted account.
+	if _, err := s.GetWebhook("dev_1", "wh_1"); err != nil {
+		t.Fatalf("developer-wide hook was removed: %v", err)
+	}
+}
+
+// LIKE search inputs must be escaped: a literal "%" or "_" in a caller's
+// query should match itself, not act as a wildcard over every row.
+func TestSearchEscapesLikeWildcards(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	now := time.Now()
+	for _, e := range []model.Email{
+		{AccountID: acct, ID: "m1", Subject: "50% off", Date: now},
+		{AccountID: acct, ID: "m2", Subject: "500 off", Date: now},
+	} {
+		if err := s.UpsertEmail(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListEmails(EmailQuery{AccountID: acct, Search: "50%"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "m1" {
+		t.Fatalf("ListEmails(q=\"50%%\") = %+v, want only m1", got)
 	}
 }

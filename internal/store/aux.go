@@ -298,16 +298,30 @@ func (s *Store) DueDeliveries(now time.Time, limit int) ([]Delivery, error) {
 	return out, err
 }
 
-// ListDeliveries returns everything queued or dead for one webhook.
-func (s *Store) ListDeliveries(webhookID string) ([]Delivery, error) {
+// ListDeliveries returns one page of what is queued or dead for one webhook,
+// oldest first. An outage can pile up hundreds of dead deliveries with full
+// message payloads, so an unbounded listing is not safe to expose.
+func (s *Store) ListDeliveries(webhookID string, limit, offset int) ([]Delivery, error) {
 	return s.queryDeliveries(`
 		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
-		FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at`, webhookID)
+		FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at LIMIT ? OFFSET ?`, webhookID, limit, offset)
 }
 
 func (s *Store) DeleteDelivery(id string) error {
 	_, err := s.db.Exec(`DELETE FROM webhook_deliveries WHERE id = ?`, id)
 	return err
+}
+
+// PurgeDeadDeliveries removes abandoned deliveries older than before. A dead
+// delivery keeps the full message payload it failed to send, so leaving them
+// forever is an unbounded (and increasingly sensitive) amount of retained
+// mail/chat content. Live deliveries — still retrying — are never touched.
+func (s *Store) PurgeDeadDeliveries(before time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM webhook_deliveries WHERE dead = 1 AND created_at < ?`, before.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) queryDeliveries(q string, args ...any) ([]Delivery, error) {

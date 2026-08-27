@@ -39,6 +39,10 @@ type Dispatcher struct {
 	queue   chan model.Event
 	done    chan struct{}
 
+	// sem bounds how many hook deliveries run at once, across both fresh
+	// dispatch and retries. Created in Start from DeliveryWorkers.
+	sem chan struct{}
+
 	// dropped counts events discarded because the queue stayed full for
 	// EmitBlock. It is the only signal that anything was lost, so it is
 	// reported on /healthz as well as logged.
@@ -50,6 +54,11 @@ type Dispatcher struct {
 	// EmitBlock bounds how long Emit blocks on a full queue before giving up
 	// on the event. Settable before Start; tests shorten it.
 	EmitBlock time.Duration
+	// DeliveryWorkers bounds how many hook POSTs run concurrently. Without a
+	// bound, one slow subscriber's hook would occupy the single delivery
+	// goroutine and stall every other tenant's deliveries behind it.
+	// Settable before Start.
+	DeliveryWorkers int
 }
 
 func NewDispatcher(s *store.Store, senders *notify.Registry, log *slog.Logger) *Dispatcher {
@@ -65,11 +74,12 @@ func NewDispatcher(s *store.Store, senders *notify.Registry, log *slog.Logger) *
 		// (see Emit) and only then drops, counting what it dropped: a delivery
 		// becomes durable at its first attempt, so an event dropped here is
 		// never written to webhook_deliveries and cannot be replayed.
-		queue:         make(chan model.Event, 1024),
-		done:          make(chan struct{}),
-		RetrySchedule: DefaultRetrySchedule,
-		RetryPoll:     30 * time.Second,
-		EmitBlock:     5 * time.Second,
+		queue:           make(chan model.Event, 1024),
+		done:            make(chan struct{}),
+		RetrySchedule:   DefaultRetrySchedule,
+		RetryPoll:       30 * time.Second,
+		EmitBlock:       5 * time.Second,
+		DeliveryWorkers: 8,
 	}
 }
 
@@ -77,6 +87,12 @@ func NewDispatcher(s *store.Store, senders *notify.Registry, log *slog.Logger) *
 // other re-sends deliveries that failed earlier. The retry worker owns the
 // timing, so a subscriber's outage never backs up fresh deliveries.
 func (d *Dispatcher) Start(ctx context.Context) {
+	workers := d.DeliveryWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	d.sem = make(chan struct{}, workers)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -188,6 +204,12 @@ func (d *Dispatcher) drain(ctx context.Context) {
 	}
 }
 
+// deliver fans an event out to every subscribed hook concurrently, bounded by
+// d.sem, so one slow target cannot hold up another tenant's delivery behind
+// it on the single delivery goroutine. It waits for every hook to finish
+// before returning, which is what keeps events ordered per producer: the
+// next event off the queue is not picked up until this one's hooks have all
+// at least had their first attempt.
 func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 	hooks, err := d.store.ListWebhooksFor(ev.AccountID)
 	if err != nil {
@@ -195,15 +217,19 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 		return
 	}
 	d.log.Debug("dispatching", "event", ev.Type, "account_id", ev.AccountID, "hooks", len(hooks))
+	var wg sync.WaitGroup
 	for _, h := range hooks {
 		if !subscribes(h, ev.Type) {
 			d.log.Debug("hook skipped", "webhook_id", h.ID, "account_id", ev.AccountID,
 				"developer_id", h.DeveloperID, "reason", "event filter")
 			continue
 		}
-		// Encoded per hook: the payload names the hook it went through.
-		ev.Webhook = &model.WebhookRef{ID: h.ID, Name: h.Name}
-		payload, err := json.Marshal(ev)
+		// Encoded per hook: the payload names the hook it went through. ev is
+		// copied into the closure below so concurrent goroutines never share
+		// (and race on) the Webhook field set here.
+		evForHook := ev
+		evForHook.Webhook = &model.WebhookRef{ID: h.ID, Name: h.Name}
+		payload, err := json.Marshal(evForHook)
 		if err != nil {
 			d.log.Error("encoding event", "err", err)
 			return
@@ -217,13 +243,21 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 		if id, err := accounts.NewID("dl"); err == nil {
 			dl.ID = id
 		}
-		if err := d.send(ctx, h, dl, 1); err != nil {
-			d.enqueue(dl, err)
-			continue
-		}
-		d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
-			"decision", "delivered", "attempts", 1)
+		h := h
+		wg.Add(1)
+		d.sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-d.sem }()
+			if err := d.send(ctx, h, dl, 1); err != nil {
+				d.enqueue(dl, err)
+				return
+			}
+			d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
+				"decision", "delivered", "attempts", 1)
+		}()
 	}
+	wg.Wait()
 }
 
 // enqueue parks a delivery after its first failure.
@@ -277,9 +311,14 @@ func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 	if len(due) > 0 {
 		d.log.Debug("retry tick", "due", len(due))
 	}
+	// Retries share d.sem with fresh deliveries, so a burst of due retries
+	// cannot starve fresh dispatch (or each other) of every worker any more
+	// than a fresh event's own fan-out can. Sending is fanned out the same
+	// way; this call returns once every retry fired this tick has finished.
+	var wg sync.WaitGroup
 	for _, dl := range due {
 		if stop.Err() != nil {
-			return
+			break
 		}
 		h, err := d.store.GetAnyWebhook(dl.WebhookID)
 		if err != nil {
@@ -290,16 +329,23 @@ func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 			continue
 		}
 		dl.Attempts++
-		if err := d.send(postCtx, h, dl, dl.Attempts); err != nil {
-			d.schedule(dl, err)
-			continue
-		}
-		d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
-			"decision", "delivered", "attempts", dl.Attempts)
-		if err := d.store.DeleteDelivery(dl.ID); err != nil {
-			d.log.Error("clearing delivered event", "delivery_id", dl.ID, "err", err)
-		}
+		wg.Add(1)
+		d.sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-d.sem }()
+			if err := d.send(postCtx, h, dl, dl.Attempts); err != nil {
+				d.schedule(dl, err)
+				return
+			}
+			d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
+				"decision", "delivered", "attempts", dl.Attempts)
+			if err := d.store.DeleteDelivery(dl.ID); err != nil {
+				d.log.Error("clearing delivered event", "delivery_id", dl.ID, "err", err)
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 func subscribes(h model.Webhook, eventType string) bool {

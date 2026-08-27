@@ -123,8 +123,8 @@ func (s *Store) ListChats(q ChatQuery) ([]model.Chat, error) {
 		}
 	}
 	if q.Search != "" {
-		where = append(where, "name LIKE ?")
-		args = append(args, "%"+q.Search+"%")
+		where = append(where, "name LIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escapeLike(q.Search)+"%")
 	}
 	limit := q.Limit
 	if limit <= 0 || limit > 200 {
@@ -235,8 +235,8 @@ func (s *Store) ListAttendees(accountID, search string, limit, offset int) ([]mo
 	where := "account_id = ?"
 	args := []any{accountID}
 	if search != "" {
-		where += " AND name LIKE ?"
-		args = append(args, "%"+search+"%")
+		where += " AND name LIKE ? ESCAPE '\\'"
+		args = append(args, "%"+escapeLike(search)+"%")
 	}
 	if limit <= 0 || limit > 200 {
 		limit = 50

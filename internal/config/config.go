@@ -58,6 +58,13 @@ type Config struct {
 	// X-Forwarded-Proto before setting its own — otherwise a client can
 	// spoof "https" and downgrade those protections.
 	TrustProxy bool
+
+	// DeliveryRetention is how long an abandoned (dead) webhook delivery is
+	// kept before the hourly purge deletes it. A dead delivery still carries
+	// the full message payload it failed to send, so this bounds how long
+	// that content sits in the database after the subscriber has given up on
+	// it.
+	DeliveryRetention time.Duration
 }
 
 func Load() (*Config, error) {
@@ -77,6 +84,8 @@ func Load() (*Config, error) {
 		WhatsAppDeviceName:  env("WHATSAPP_DEVICE_NAME", "Unified Messaging"),
 
 		TrustProxy: envBool("TRUST_PROXY", false),
+
+		DeliveryRetention: time.Duration(envInt("DELIVERY_RETENTION_DAYS", 7)) * 24 * time.Hour,
 	}
 
 	// offline_access is what earns us a refresh token; without it the
