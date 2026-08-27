@@ -39,9 +39,20 @@ type Dispatcher struct {
 	queue   chan model.Event
 	done    chan struct{}
 
-	// sem bounds how many hook deliveries run at once, across both fresh
-	// dispatch and retries. Created in Start from DeliveryWorkers.
+	// sem bounds how many fresh hook deliveries run at once. Created in Start
+	// from DeliveryWorkers.
 	sem chan struct{}
+
+	// retrySem is the same bound for retryDue, and is deliberately a separate
+	// pool. Sharing one meant a single developer whose endpoint accepts and
+	// never answers could hold every slot indefinitely — DueDeliveries returns
+	// 100 per tick and each burns a worker for the client's full timeout, which
+	// is far longer than the tick — so the fresh-dispatch goroutine blocked
+	// inside deliver, the queue filled behind it, and Emit pushed back on every
+	// other tenant's producer (including the inline emit on an API request
+	// path). Retries are the background half of this work and must never be
+	// able to price out the foreground half.
+	retrySem chan struct{}
 
 	// dropped counts events discarded because the queue stayed full for
 	// EmitBlock. It is the only signal that anything was lost, so it is
@@ -92,6 +103,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 		workers = 1
 	}
 	d.sem = make(chan struct{}, workers)
+	d.retrySem = make(chan struct{}, workers)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -251,8 +263,15 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 			dl.ID = id
 		}
 		h := h
+		// Bounded by ctx so the shutdown drain can honour drainDeadline: a
+		// plain blocking acquire here would hold the drain open for as long as
+		// whoever owns the pool takes, however short the deadline was.
+		select {
+		case d.sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		wg.Add(1)
-		d.sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-d.sem }()
@@ -317,10 +336,11 @@ func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 	if len(due) > 0 {
 		d.log.Debug("retry tick", "due", len(due))
 	}
-	// Retries share d.sem with fresh deliveries, so a burst of due retries
-	// cannot starve fresh dispatch (or each other) of every worker any more
-	// than a fresh event's own fan-out can. Sending is fanned out the same
-	// way; this call returns once every retry fired this tick has finished.
+	// Retries run under d.retrySem, their own pool of the same size as fresh
+	// dispatch's: a backlog of due retries against a subscriber that never
+	// answers can then saturate the retry half without touching the fresh
+	// half. Sending is fanned out within that bound; this call returns once
+	// every retry fired this tick has finished.
 	var wg sync.WaitGroup
 	for _, dl := range due {
 		if stop.Err() != nil {
@@ -335,11 +355,19 @@ func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 			continue
 		}
 		dl.Attempts++
+		// stop is the shutdown signal: waiting here for a slot is exactly
+		// where a cancelled dispatcher would otherwise sit for a full client
+		// timeout before noticing.
+		select {
+		case d.retrySem <- struct{}{}:
+		case <-stop.Done():
+			wg.Wait()
+			return
+		}
 		wg.Add(1)
-		d.sem <- struct{}{}
 		go func() {
 			defer wg.Done()
-			defer func() { <-d.sem }()
+			defer func() { <-d.retrySem }()
 			if err := d.send(postCtx, h, dl, dl.Attempts); err != nil {
 				d.schedule(dl, err)
 				return

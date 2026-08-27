@@ -598,3 +598,104 @@ func TestDeliverSkipsOnlyTheHookThatFailsToEncode(t *testing.T) {
 		t.Fatalf("hits = %d, want exactly 1 (the bad event must not double-fire or hang the queue)", rcv.count())
 	}
 }
+
+// --- retries must not starve fresh dispatch (I-2) ---
+
+// A tenant whose endpoint accepts and never answers generates 100 due
+// retries per tick, each holding a worker for the client's full timeout.
+// While retries and fresh dispatch shared one 8-slot pool that was
+// continuous full occupancy: the fresh-delivery goroutine blocked on the
+// semaphore inside deliver, the event queue filled behind it, and Emit — which
+// some API request paths call inline — pushed back on every other tenant.
+// Retries get their own pool of the same size, so a fresh event still goes
+// out promptly no matter how deep the retry backlog is.
+func TestRetryBacklogDoesNotStarveFreshDelivery(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	safehttp.AllowLoopbackForTests(t)
+
+	// Never answers within the test's lifetime: every retry that reaches it
+	// holds its worker for as long as the test runs.
+	var inflight atomic.Int64
+	release := make(chan struct{})
+	stuck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inflight.Add(1)
+		<-release
+	}))
+	// Released before Close, or Close would block for as long as the handlers
+	// do — the point of the endpoint is that it never answers on its own.
+	t.Cleanup(func() { close(release); stuck.Close() })
+	fast := newReceiver(t, http.StatusOK)
+
+	// The backlog is on acc_2's hook; the fresh event goes to acc_1's, so
+	// nothing but the worker pool connects the two.
+	for _, h := range []model.Webhook{
+		{ID: "wh_stuck", DeveloperID: "dev_1", AccountID: "acc_2", URL: stuck.URL, CreatedAt: time.Now()},
+		{ID: "wh_fast", DeveloperID: "dev_1", AccountID: "acc_1", URL: fast.URL, CreatedAt: time.Now()},
+	} {
+		if err := db.SaveWebhook(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload, err := json.Marshal(model.Event{Type: model.EventMailReceived, AccountID: "acc_2",
+		Email: &model.Email{ID: "M1"}, Timestamp: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Minute).UTC()
+	for i := range 100 {
+		if err := db.SaveDelivery(store.Delivery{
+			ID: fmt.Sprintf("dl_%03d", i), WebhookID: "wh_stuck", AccountID: "acc_2",
+			EventType: model.EventMailReceived, Payload: payload, Attempts: 1,
+			NextAttemptAt: past, CreatedAt: past,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	d := NewDispatcher(db, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	d.RetryPoll = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	// Let the retry ticks take every worker they can before the fresh event
+	// is emitted — that is the state the starvation happens in. The pool is
+	// DeliveryWorkers wide, so that many in-flight retries means saturated.
+	waitFor(t, func() bool { return inflight.Load() >= int64(d.DeliveryWorkers) })
+
+	start := time.Now()
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M2"}})
+	waitFor(t, func() bool { return fast.count() == 1 })
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("fresh delivery took %v behind the retry backlog, want < 2s", elapsed)
+	}
+}
+
+// The shutdown drain gives whatever is still queued one attempt, but must
+// give up at drainDeadline. deliver's semaphore acquire used to be an
+// unbounded block, so a pool held by someone else kept drain — and with it
+// the whole process shutdown — waiting for as long as that took, however
+// short the deadline was.
+func TestDrainHonoursItsDeadlineWhenThePoolIsBusy(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	rcv := newReceiver(t, http.StatusOK)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1",
+		URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(db, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// A one-slot pool, already taken: drain can never get a worker.
+	d.sem = make(chan struct{}, 1)
+	d.sem <- struct{}{}
+	d.queue <- model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}}
+
+	done := make(chan struct{})
+	go func() { d.drain(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(drainDeadline + 2*time.Second):
+		t.Fatalf("drain did not return within %v of its %v deadline", 2*time.Second, drainDeadline)
+	}
+}
