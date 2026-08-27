@@ -399,7 +399,7 @@ func (s *Server) withDeveloper(next http.Handler) http.Handler {
 			return
 		}
 
-		if c, err := r.Cookie(sessionCookie); err == nil {
+		if c, err := readCookie(r, sessionCookie); err == nil {
 			log.Debug("auth: no bearer, session cookie present, resolving")
 			dev, exp, err := s.auth.SessionDeveloper(ctx, c.Value)
 			if err != nil {

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,7 +62,7 @@ const cookieLinkName = "um_link"
 // page load.
 func (s *Server) ensureLinkCookie(w http.ResponseWriter, r *http.Request, expiresAt time.Time) {
 	value := logx.RandomToken(32)
-	if c, err := r.Cookie(cookieLinkName); err == nil && c.Value != "" {
+	if c, err := readCookie(r, cookieLinkName); err == nil && c.Value != "" {
 		value = c.Value
 	}
 	// At least a second: a state on the edge of expiry still gets a cookie
@@ -71,10 +72,22 @@ func (s *Server) ensureLinkCookie(w http.ResponseWriter, r *http.Request, expire
 	if maxAge < 1 {
 		maxAge = 1
 	}
+	// Scoping the cookie to /connect/ keeps it off every other route, but the
+	// __Host- prefix requires Path=/ and pinning the cookie to this exact host
+	// is worth more than the path scope: an opaque, HttpOnly, SameSite=Strict
+	// value being readable by our own handlers costs nothing, whereas a
+	// sibling subdomain being able to set it for the parent domain would let
+	// it pre-claim a state. Over plain http there is no prefix and the narrow
+	// path stays.
+	name := s.cookieName(r, cookieLinkName)
+	path := "/connect/"
+	if strings.HasPrefix(name, hostCookiePrefix) {
+		path = "/"
+	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieLinkName,
+		Name:     name,
 		Value:    value,
-		Path:     "/connect/",
+		Path:     path,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Secure:   s.requestIsHTTPS(r),
@@ -88,7 +101,7 @@ func (s *Server) ensureLinkCookie(w http.ResponseWriter, r *http.Request, expire
 // stripped cookie must never pass as "the first caller" for a state nobody
 // has claimed yet.
 func linkBrowserHash(r *http.Request) (hash string, ok bool) {
-	c, err := r.Cookie(cookieLinkName)
+	c, err := readCookie(r, cookieLinkName)
 	if err != nil || c.Value == "" {
 		return "", false
 	}

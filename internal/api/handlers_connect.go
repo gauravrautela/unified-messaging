@@ -14,6 +14,7 @@ import (
 
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -420,7 +421,12 @@ func (s *Server) notify(target string, payload map[string]any) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := notifyClient.Do(req)
 	if err != nil {
-		s.log.Warn("notify_url delivery failed", "url", target, "err", err)
+		// The target is developer-chosen and may carry a credential in its
+		// path or query — the same reason the notify body goes through Scrub.
+		// The error gets the same treatment: net/http builds a *url.Error
+		// that quotes the whole URL back, so scrubbing only the url attr
+		// would leave the credential in the line anyway.
+		s.log.Warn("notify_url delivery failed", "url", notify.Scrub(target), "err", notify.ScrubErr(err))
 		return
 	}
 	resp.Body.Close()

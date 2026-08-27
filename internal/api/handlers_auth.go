@@ -19,22 +19,67 @@ import (
 
 // ---- cookies ----
 
+// hostCookiePrefix pins a cookie to exactly this host. A browser only accepts
+// a cookie whose name starts with it when the cookie is Secure, has Path=/
+// and carries no Domain attribute — which is precisely what a sibling
+// subdomain (foo.example.com, holding a foothold) cannot arrange for
+// example.com. Without it, nothing stops such a sibling from writing our
+// session, CSRF or link cookie for the parent domain, and SameSite=Strict is
+// no help because a request from a sibling *is* same-site.
+//
+// It only works over HTTPS, by design: over plain http a browser drops the
+// cookie entirely rather than downgrading, so cookieName falls back to the
+// bare name and a local http://localhost run keeps working.
+const hostCookiePrefix = "__Host-"
+
+// cookieName is the name to write for one of this service's browser cookies
+// on this request. Always pair it with readCookie, which accepts either form:
+// a browser that got a bare cookie over http keeps sending it under that name
+// after a deployment moves behind TLS, and a request must not be treated as
+// unauthenticated just because the name it carries is the older one.
+func (s *Server) cookieName(r *http.Request, base string) string {
+	if s.requestIsHTTPS(r) {
+		return hostCookiePrefix + base
+	}
+	return base
+}
+
+// readCookie finds one of this service's browser cookies under its pinned
+// name first, then its bare name. Prefixed wins: it is the one a sibling
+// origin provably could not have written, so where a browser somehow sends
+// both, the trustworthy one is the one that counts.
+func readCookie(r *http.Request, base string) (*http.Cookie, error) {
+	if c, err := r.Cookie(hostCookiePrefix + base); err == nil {
+		return c, nil
+	}
+	return r.Cookie(base)
+}
+
 func (s *Server) secureCookies(r *http.Request) bool {
 	return s.requestIsHTTPS(r)
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
 	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: token, Path: "/", Expires: expires,
+		Name: s.cookieName(r, sessionCookie), Value: token, Path: "/", Expires: expires,
 		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookies(r),
 	})
 }
 
+// clearSessionCookie expires both spellings. A browser holding the bare name
+// from before the deployment moved behind TLS must still be logged out by a
+// logout served over TLS, and vice versa.
 func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookies(r),
-	})
+	names := []string{sessionCookie}
+	if s.requestIsHTTPS(r) {
+		names = append(names, hostCookiePrefix+sessionCookie)
+	}
+	for _, name := range names {
+		http.SetCookie(w, &http.Cookie{
+			Name: name, Value: "", Path: "/", MaxAge: -1,
+			HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookies(r),
+		})
+	}
 }
 
 // sessionDeveloper resolves the browser session for page handlers, which
@@ -45,7 +90,7 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 // every successful resolution is a single header and always correct, which
 // beats comparing against whatever the old cookie happened to carry.
 func (s *Server) sessionDeveloper(w http.ResponseWriter, r *http.Request) (model.Developer, bool) {
-	c, err := r.Cookie(sessionCookie)
+	c, err := readCookie(r, sessionCookie)
 	if err != nil {
 		return model.Developer{}, false
 	}
@@ -231,7 +276,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if !s.checkFormCSRF(w, r, func(msg string) authPage { return loginPage("", "", msg) }) {
 		return
 	}
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, err := readCookie(r, sessionCookie); err == nil {
 		_ = s.auth.DeleteSession(r.Context(), c.Value)
 	}
 	s.clearSessionCookie(w, r)
@@ -355,7 +400,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// The cookie on this request identifies the one browser that stays signed
 	// in; every other session dies with the old password.
 	keep := ""
-	if c, cookieErr := r.Cookie(sessionCookie); cookieErr == nil {
+	if c, cookieErr := readCookie(r, sessionCookie); cookieErr == nil {
 		keep = c.Value
 	}
 	if err := s.auth.DeleteOtherSessions(r.Context(), dev.ID, keep); err != nil {

@@ -51,12 +51,12 @@ const (
 // Log out button going dead 12 hours after the token was first minted.
 func (s *Server) csrfToken(w http.ResponseWriter, r *http.Request) string {
 	tok := ""
-	if c, err := r.Cookie(csrfCookie); err == nil && len(c.Value) == csrfTokenLen {
+	if c, err := readCookie(r, csrfCookie); err == nil && len(c.Value) == csrfTokenLen {
 		tok = c.Value
 	} else {
 		tok = logx.RandomToken(32)
 	}
-	http.SetCookie(w, &http.Cookie{Name: csrfCookie, Value: tok, Path: "/", HttpOnly: true,
+	http.SetCookie(w, &http.Cookie{Name: s.cookieName(r, csrfCookie), Value: tok, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteStrictMode, Secure: s.requestIsHTTPS(r), MaxAge: 12 * 3600})
 	return tok
 }
@@ -67,7 +67,7 @@ func (s *Server) csrfToken(w http.ResponseWriter, r *http.Request) string {
 // subdomain or XSS foothold.
 func (s *Server) csrfFailure(r *http.Request) string {
 	log := logx.From(r.Context())
-	c, err := r.Cookie(csrfCookie)
+	c, err := readCookie(r, csrfCookie)
 	field := r.PostFormValue("csrf")
 	if err != nil || field == "" || subtle.ConstantTimeCompare([]byte(c.Value), []byte(field)) != 1 {
 		log.Debug("csrf rejected", "reason", "missing or mismatched token",

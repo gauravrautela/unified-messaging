@@ -18,7 +18,13 @@ func (s *Server) requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil || strings.HasPrefix(s.cfg.PublicBaseURL, "https://") {
 		return true
 	}
-	return s.cfg.TrustProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	// Only the first token counts: a chain of proxies appends rather than
+	// replaces, so two hops produce "https, http" and the client-facing hop —
+	// the one that decides whether the *browser's* connection was secure — is
+	// the first entry. Comparing the header whole made that read as plain HTTP
+	// and quietly dropped both HSTS and the Secure cookie flag.
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	return s.cfg.TrustProxy && strings.EqualFold(strings.TrimSpace(proto), "https")
 }
 
 // noStorePrefixes are tenant- or credential-bearing surfaces a shared cache

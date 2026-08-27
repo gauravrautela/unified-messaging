@@ -3857,3 +3857,135 @@ func TestQRRetryAfterFailedStartLinkStillEnforcesTheOriginalBrowserClaim(t *test
 		t.Fatalf("retry from the original browser: %d %+v", rec.Code, q)
 	}
 }
+
+// M-1: nothing pins um_session / um_csrf / um_link to this host, so a
+// foothold on a sibling subdomain can set them for the parent domain — and
+// SameSite=Strict does not stop a same-site request. The __Host- prefix is
+// what closes that: a browser only accepts such a cookie when it is Secure,
+// Path=/ and carries no Domain, none of which a sibling origin can satisfy
+// for us. It is only usable over HTTPS, so the bare names stay in place for
+// a plain-HTTP local run, and every read tries the prefixed name first.
+func TestSecureRequestsUseHostPrefixedCookies(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg.TrustProxy = true
+	dev, _ := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	// https, as declared by the proxy the operator has vouched for.
+	secure := func(req *http.Request) *httptest.ResponseRecorder {
+		req.Header.Set("X-Forwarded-Proto", "https")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	find := func(t *testing.T, rec *httptest.ResponseRecorder, name string) *http.Cookie {
+		t.Helper()
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == name {
+				return c
+			}
+		}
+		t.Fatalf("no %s cookie: %v", name, rec.Header().Values("Set-Cookie"))
+		return nil
+	}
+	assertHostPrefixed := func(t *testing.T, c *http.Cookie) {
+		t.Helper()
+		if !c.Secure {
+			t.Errorf("%s: not Secure, so a browser rejects the __Host- prefix", c.Name)
+		}
+		if c.Path != "/" {
+			t.Errorf("%s: Path = %q, want %q", c.Name, c.Path, "/")
+		}
+		if c.Domain != "" {
+			t.Errorf("%s: Domain = %q, want none", c.Name, c.Domain)
+		}
+	}
+
+	// Session: re-issued on any page that resolves one.
+	rec := secure(withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard: %d", rec.Code)
+	}
+	assertHostPrefixed(t, find(t, rec, "__Host-"+sessionCookie))
+
+	// CSRF: minted while rendering any page carrying a form.
+	rec = secure(httptest.NewRequest(http.MethodGet, "/login", nil))
+	csrf := find(t, rec, "__Host-"+csrfCookie)
+	assertHostPrefixed(t, csrf)
+
+	// And the prefixed cookie is what the form check then reads back.
+	form := httptest.NewRequest(http.MethodPost, "/logout",
+		strings.NewReader("csrf="+url.QueryEscape(csrf.Value)))
+	form.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	form.AddCookie(&http.Cookie{Name: "__Host-" + csrfCookie, Value: csrf.Value})
+	if rec = secure(form); rec.Code != http.StatusSeeOther {
+		t.Fatalf("logout with the prefixed csrf cookie: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// um_link: minted on a Linker provider's connect page. Path widens to "/"
+	// with the prefix, which the prefix itself requires.
+	_, key := seedDev(t, s, "b@x.com")
+	mint := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth",
+		strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	mint.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, mint)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hosted-auth: %d %s", rec.Code, rec.Body.String())
+	}
+	var minted hostedAuthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatal(err)
+	}
+	rec = secure(httptest.NewRequest(http.MethodGet, "/connect/"+minted.State, nil))
+	assertHostPrefixed(t, find(t, rec, "__Host-"+cookieLinkName))
+
+	// Plain HTTP keeps the bare names: __Host- would simply be dropped.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/login", nil))
+	find(t, rec, csrfCookie)
+}
+
+// M-4: a two-hop proxy chain appends rather than replaces, so the header
+// arrives as "https, http". Comparing it whole made that false and silently
+// dropped both HSTS and the Secure cookie flag — session cookies then
+// travelling without Secure.
+func TestForwardedProtoUsesTheFirstToken(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg.TrustProxy = true
+	for _, hdr := range []string{"https", "https, http", " https ,http", "HTTPS,http"} {
+		req := httptest.NewRequest(http.MethodGet, "/login", nil)
+		req.Header.Set("X-Forwarded-Proto", hdr)
+		if !s.requestIsHTTPS(req) {
+			t.Errorf("X-Forwarded-Proto %q: requestIsHTTPS = false, want true", hdr)
+		}
+	}
+	for _, hdr := range []string{"http", "http, https", ""} {
+		req := httptest.NewRequest(http.MethodGet, "/login", nil)
+		req.Header.Set("X-Forwarded-Proto", hdr)
+		if s.requestIsHTTPS(req) {
+			t.Errorf("X-Forwarded-Proto %q: requestIsHTTPS = true, want false", hdr)
+		}
+	}
+}
+
+// M-7: notify_url is developer-chosen and may carry a credential in its path
+// or query — a Telegram bot token being the obvious shape. The delivery
+// failure warn logged it verbatim; it goes through the same notify.Scrub the
+// body path already used.
+func TestNotifyFailureScrubsTheTargetURL(t *testing.T) {
+	s, _, recs := newTestServerWithLog(t)
+	// Port 1 on loopback: refused immediately, so this fails without a
+	// network round trip and without any listener to receive the secret.
+	s.notify("http://127.0.0.1:1/bot123456:AA-super-secret-token/notify",
+		map[string]any{"status": "CREATED"})
+	if !recs.Contains("notify_url delivery failed") {
+		t.Fatalf("no delivery-failure warn was logged: %v", recs.All())
+	}
+	if recs.Contains("AA-super-secret-token") {
+		t.Fatal("the notify_url's bot token reached the log verbatim")
+	}
+	if !recs.Contains("bot•••") {
+		t.Fatalf("the logged notify_url was not scrubbed: %v", recs.All())
+	}
+}
