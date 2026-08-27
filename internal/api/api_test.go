@@ -25,6 +25,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
 	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
 )
@@ -35,6 +36,11 @@ import (
 // exercised against a real (if scripted) Linker/Chatter without a network.
 func newTestServerCore(t *testing.T, maxChatAccounts int) (*Server, *store.Store, *logx.Records) {
 	t.Helper()
+	// The default notify registry, the connect-time notify() client, and
+	// checkTelegram all deliver through safehttp.Client, which refuses
+	// loopback by default; every httptest receiver these tests point at is
+	// loopback.
+	safehttp.AllowLoopbackForTests(t)
 	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -98,6 +104,7 @@ func newTestServerWithChatCapacity(t *testing.T, maxChatAccounts int) (*Server, 
 // path this exercises touches chat, sync or accounts, so those are left nil/zero.
 func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*Server, *store.Store) {
 	t.Helper()
+	safehttp.AllowLoopbackForTests(t)
 	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
 	if err != nil {
 		t.Fatal(err)

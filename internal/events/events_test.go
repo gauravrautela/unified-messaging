@@ -17,11 +17,17 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/notify"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	// Every test in this file that builds a dispatcher with a nil registry
+	// (or notify.NewRegistry(nil)) delivers through safehttp.Client, whose
+	// dial guard refuses loopback by default; httptest servers are always
+	// loopback.
+	safehttp.AllowLoopbackForTests(t)
 	s, err := store.Open(filepath.Join(t.TempDir(), "events.db"))
 	if err != nil {
 		t.Fatal(err)

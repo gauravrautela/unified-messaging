@@ -15,8 +15,14 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
+
+// notifyClient delivers notify_url callbacks. notify_url is attacker-chosen
+// (any developer can point it anywhere), so it goes through the same
+// no-redirect, public-only dial guard as webhook and chat deliveries.
+var notifyClient = safehttp.Client(15 * time.Second)
 
 type hostedAuthRequest struct {
 	// Provider names the backend to connect. Optional while exactly one is
@@ -393,7 +399,7 @@ func (s *Server) notify(target string, payload map[string]any) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := notifyClient.Do(req)
 	if err != nil {
 		s.log.Warn("notify_url delivery failed", "url", target, "err", err)
 		return

@@ -19,6 +19,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -36,6 +37,10 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	// The dispatcher's default registry delivers through safehttp.Client,
+	// whose dial guard refuses loopback by default; h.hook below is an
+	// httptest server (loopback).
+	safehttp.AllowLoopbackForTests(t)
 	db, err := store.Open(filepath.Join(t.TempDir(), "cs.db"))
 	if err != nil {
 		t.Fatal(err)

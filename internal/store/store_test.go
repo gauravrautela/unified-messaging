@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -464,6 +465,50 @@ func TestScanEmailDerivesBodyPlain(t *testing.T) {
 	}
 	if got.BodyPlain != "Hello & bye" {
 		t.Fatalf("body_plain = %q", got.BodyPlain)
+	}
+}
+
+// The SQLite file holds sealed OAuth tokens and webhook secrets; a mode that
+// lets other local users read it defeats sealing-at-rest entirely, so Open
+// must always leave it 0600 regardless of the umask that created it.
+func TestOpenSetsDatabaseFilePermsTo0600(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "perms.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("db file mode = %o, want 0600", perm)
+	}
+}
+
+// A pre-existing file with looser permissions (e.g. created under a lax
+// umask before this hardening landed) must be tightened on the next Open,
+// not just on first creation.
+func TestOpenTightensExistingLoosePerms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "loose.db")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("db file mode = %o, want 0600", perm)
 	}
 }
 

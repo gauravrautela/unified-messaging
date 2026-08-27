@@ -20,6 +20,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/outlook"
 	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -173,6 +174,10 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) bool {
 }
 
 func TestSyncAccountBackfillThenIncremental(t *testing.T) {
+	// The dispatcher's default registry delivers through safehttp.Client,
+	// whose dial guard refuses loopback by default; the webhook sink below
+	// is an httptest server (loopback).
+	safehttp.AllowLoopbackForTests(t)
 	fg := &fakeGraph{t: t}
 	srv := httptest.NewServer(fg.handler())
 	defer srv.Close()

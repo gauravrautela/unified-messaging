@@ -17,6 +17,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/provider/providertest"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
@@ -58,6 +59,10 @@ func TestSoak(t *testing.T) {
 	if testing.Short() {
 		t.Skip("soak test skipped under -short")
 	}
+	// The dispatcher's default registry delivers through safehttp.Client,
+	// whose dial guard refuses loopback by default; srv below is an httptest
+	// server (loopback).
+	safehttp.AllowLoopbackForTests(t)
 
 	db, err := store.Open(filepath.Join(t.TempDir(), "soak.db"))
 	if err != nil {

@@ -129,6 +129,10 @@ func run(log *slog.Logger) error {
 		Addr:              cfg.ListenAddr,
 		Handler:           api.NewServer(cfg, db, registry, acctMgr, sync, authSvc, chat, dispatcher, senders, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
 	go func() {

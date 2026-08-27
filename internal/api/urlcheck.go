@@ -16,11 +16,12 @@ import (
 // through GET /api/v1/webhooks/{id}/deliveries, which reports the status code.
 //
 // The check is deliberately literal — it inspects the host as written and
-// never resolves DNS. A hostname that resolves to a private address still gets
-// through, and so does DNS rebinding; closing those needs resolution at dial
-// time with a control on the socket, which is a bigger change than this and is
-// recorded as a known gap in the README. What this does close is the whole
-// class of attacks that needs no DNS at all, which is the cheap one to run.
+// never resolves DNS, so a hostname that resolves to a private address, or a
+// DNS rebind, still gets through this check alone. What actually closes that
+// gap is the safehttp dial guard every one of these targets is fetched
+// through: it checks the resolved IP at dial time, on every connection
+// attempt, however the hostname resolves. This check remains as a fast,
+// early rejection of the literal-IP case, before a link is ever minted.
 func publicHTTPURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {

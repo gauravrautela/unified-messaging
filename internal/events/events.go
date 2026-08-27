@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +54,7 @@ type Dispatcher struct {
 
 func NewDispatcher(s *store.Store, senders *notify.Registry, log *slog.Logger) *Dispatcher {
 	if senders == nil {
-		senders = notify.NewRegistry(&http.Client{Timeout: 15 * time.Second})
+		senders = notify.NewRegistry(nil)
 	}
 	return &Dispatcher{
 		store:   s,

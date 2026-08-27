@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,19 @@ func (s *Store) trace(op string, start time.Time, kv ...any) {
 }
 
 func Open(path string) (*Store, error) {
+	// The file holds sealed OAuth tokens and webhook secrets. Create it 0600
+	// up front so no window exists where the umask's default mode is on disk,
+	// then tighten an existing file that predates this (or was created under
+	// a laxer umask) rather than trusting whatever is already there.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	f.Close()
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		_ = os.Chmod(path, 0o600)
+	}
+
 	// foreign_keys is per-connection state, so it belongs in the DSN rather
 	// than in a one-off PRAGMA: a PRAGMA in the migration only covers whichever
 	// connection ran it, which today is every connection solely because the

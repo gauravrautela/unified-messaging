@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 )
 
 // Sender delivers one event to one hook. payload is the JSON event as the
@@ -66,7 +67,7 @@ type Registry struct {
 
 func NewRegistry(client *http.Client) *Registry {
 	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+		client = safehttp.Client(15 * time.Second)
 	}
 	return &Registry{client: client, telegramBase: telegramAPI}
 }
