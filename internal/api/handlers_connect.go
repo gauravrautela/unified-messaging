@@ -335,7 +335,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("account connected",
-		"account_id", acct.ID, "provider", acct.Provider, "email", acct.Email)
+		"account_id", acct.ID, "provider", acct.Provider, "email_digest", logx.Digest(acct.Email))
 
 	// Bind the connect-time webhook before the first sync runs, so nothing
 	// that backfill emits is missed.

@@ -129,6 +129,36 @@ var apiRoutes = []string{
 	"GET /api/v1/attendees/{id}",
 }
 
+// browserRoutes is every pattern Routes registers outside apiRoutes: the
+// connect/session/UI surface a browser (not an API key) talks to, plus the
+// two provider-facing push endpoints. Like apiRoutes, it exists so the
+// isolation test can prove each one is covered — a route added to Routes()
+// without being added here fails that test.
+var browserRoutes = []string{
+	"GET /healthz",
+
+	"GET /connect/{state}",
+	"POST /connect/{state}/consent",
+	"GET /connect/{state}/qr",
+	"GET /oauth/callback",
+
+	"GET /login",
+	"POST /login",
+	"GET /signup",
+	"POST /signup",
+	"POST /logout",
+
+	"GET /docs",
+	"GET /llms.txt",
+
+	"GET /dashboard",
+	"GET /mail",
+	"GET /chat",
+
+	"POST /notifications/{provider}",
+	"POST /notifications/{provider}/lifecycle",
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 

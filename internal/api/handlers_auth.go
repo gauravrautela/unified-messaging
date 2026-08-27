@@ -160,7 +160,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.checkFormCSRF(w, r, func(msg string) authPage { return loginPage(next, email, msg) }) {
 		return
 	}
-	log.Debug("login attempt", "email", strings.ToLower(strings.TrimSpace(email)), "next", next)
+	log.Debug("login attempt", "email_digest", logx.Digest(strings.ToLower(strings.TrimSpace(email))), "next", next)
 	dev, err := s.auth.Login(r.Context(), email, r.PostForm.Get("password"))
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {

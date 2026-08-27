@@ -112,9 +112,15 @@ var secretKeys = []string{"password", "secret", "token", "bot_token", "key", "co
 var contentKeys = []string{"body", "content"}
 var contentKeysExact = []string{"html", "text"}
 
-// Redact returns a copy of v with secret-looking map values replaced and
-// message content reduced to a length marker. It walks maps and slices
-// produced by encoding/json; other values pass through.
+// Redact returns a copy of v with secret-looking map values replaced,
+// message content reduced to a length marker, and email/phone-looking values
+// masked. It walks maps and slices produced by encoding/json; other values
+// pass through.
+//
+// The checks run in a fixed order — secret, then content, then email/phone —
+// so a key that happens to match more than one (there is none today, but the
+// substring matching is deliberately loose) always redacts fully rather than
+// getting the weaker masking treatment.
 func Redact(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -125,6 +131,10 @@ func Redact(v any) any {
 				out[k] = "[redacted]"
 			case isContent(k):
 				out[k] = contentMarker(val)
+			case isEmailKey(k):
+				out[k] = maskEmailValue(val)
+			case isPhoneKey(k):
+				out[k] = maskPhoneValue(val)
 			default:
 				out[k] = Redact(val)
 			}
@@ -174,6 +184,87 @@ func contentMarker(v any) any {
 		return "[" + strconv.Itoa(len(s)) + " chars]"
 	}
 	return Redact(v)
+}
+
+// isEmailKey matches any key naming an email address: "email", "to_email",
+// "notify_email", and so on.
+func isEmailKey(k string) bool {
+	return strings.Contains(strings.ToLower(k), "email")
+}
+
+// isPhoneKey matches keys naming a phone number. "identifier" is included
+// exactly (not as a substring, to avoid swallowing unrelated *_identifier
+// keys) because that is the field name a chat account's own number rides in.
+func isPhoneKey(k string) bool {
+	lk := strings.ToLower(k)
+	return strings.Contains(lk, "phone") || lk == "identifier"
+}
+
+// maskEmailValue masks a string value as an email address; a non-string
+// value keeps walking, the same way contentMarker does for content keys.
+func maskEmailValue(v any) any {
+	if s, ok := v.(string); ok {
+		return maskEmail(s)
+	}
+	return Redact(v)
+}
+
+// maskPhoneValue masks a string value as a phone number; a non-string value
+// keeps walking, the same way contentMarker does for content keys.
+func maskPhoneValue(v any) any {
+	if s, ok := v.(string); ok {
+		return maskPhone(s)
+	}
+	return Redact(v)
+}
+
+// maskEmail keeps the first rune of the local part and the whole domain:
+// "john.doe@example.com" -> "j•••@example.com". A value with no "@" is not
+// actually an email address, so it is masked down to "•••" entirely rather
+// than partially revealed.
+func maskEmail(s string) string {
+	local, domain, ok := strings.Cut(s, "@")
+	if !ok || local == "" {
+		return "•••"
+	}
+	r := []rune(local)
+	return string(r[0]) + "•••@" + domain
+}
+
+// maskPhone keeps the country code and first two digits plus the last three:
+// +919888000855 -> "+91 98••• •855". Short or odd values keep their first two
+// characters only.
+//
+// This is a byte-for-byte copy of notify.MaskPhone (internal/notify/scrub.go).
+// logx cannot import notify to reuse it directly — notify depends on packages
+// that already import logx, so doing so would create an import cycle — so the
+// algorithm is duplicated here instead. Keep the two in sync by hand.
+func maskPhone(p string) string {
+	if p == "" {
+		return ""
+	}
+	digits := strings.TrimPrefix(p, "+")
+	if len(digits) < 8 {
+		if len(digits) <= 2 {
+			return p
+		}
+		return p[:len(p)-len(digits)+2] + "•••"
+	}
+	cc := ""
+	rest := digits
+	// Country codes are 1–3 digits; take 1 for +1, 2 otherwise (good enough
+	// for a notification — this is display, not parsing).
+	if strings.HasPrefix(p, "+") {
+		n := 2
+		if strings.HasPrefix(digits, "1") {
+			n = 1
+		}
+		cc, rest = "+"+digits[:n], digits[n:]
+	}
+	if len(rest) < 5 {
+		return cc + " " + rest[:1] + "•••"
+	}
+	return strings.TrimSpace(cc + " " + rest[:2] + "••• •" + rest[len(rest)-3:])
 }
 
 // Records collects text log lines for assertions in tests.

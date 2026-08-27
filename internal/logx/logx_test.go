@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -22,8 +23,10 @@ func TestRedactMasksSecretFields(t *testing.T) {
 		}},
 	}
 	out := Redact(in).(map[string]any)
-	if out["email"] != "a@b.com" {
-		t.Fatalf("non-secret changed: %v", out["email"])
+	// email is not a secret, but it is PII: masked, not redacted outright and
+	// not left in clear either.
+	if out["email"] != "a•••@b.com" {
+		t.Fatalf("email not masked: %v", out["email"])
 	}
 	if out["password"] != "[redacted]" {
 		t.Fatalf("password not redacted: %v", out["password"])
@@ -58,6 +61,57 @@ func TestRedactMasksSecretFields(t *testing.T) {
 	if out["subject"] != "hello there" {
 		t.Fatalf("subject changed: %v", out["subject"])
 	}
+}
+
+// Email and phone values are masked wherever they appear, at any depth, and
+// regardless of which of the recognised key names carries them.
+func TestRedactMasksEmailAndPhoneValues(t *testing.T) {
+	in := map[string]any{
+		"to":         []any{map[string]any{"email": "john.doe@example.com"}},
+		"phone":      "+919888000855",
+		"identifier": "+15551234567",
+		"subject":    "keep",
+	}
+	out := Redact(in).(map[string]any)
+	toEmail := out["to"].([]any)[0].(map[string]any)["email"]
+	if toEmail != "j•••@example.com" {
+		t.Fatalf("nested email = %v, want j•••@example.com", toEmail)
+	}
+	if out["phone"] != "+91 98••• •855" {
+		t.Fatalf("phone = %v, want +91 98••• •855", out["phone"])
+	}
+	if out["identifier"] != "+1 55••• •567" {
+		t.Fatalf("identifier = %v, want +1 55••• •567", out["identifier"])
+	}
+	if out["subject"] != "keep" {
+		t.Fatalf("subject changed: %v", out["subject"])
+	}
+	// No raw address or number may survive into the redacted copy.
+	for _, leak := range []string{"john.doe@example.com", "919888000855", "5551234567"} {
+		if strings.Contains(toString(out), leak) {
+			t.Fatalf("redacted output leaked %q: %v", leak, out)
+		}
+	}
+}
+
+// An email with no "@" is not really an email; it is masked down entirely
+// rather than partially revealed, and an empty phone/identifier value stays
+// empty rather than becoming a mask of nothing.
+func TestRedactMasksMalformedEmailAndEmptyPhone(t *testing.T) {
+	in := map[string]any{"email": "not-an-email", "phone": ""}
+	out := Redact(in).(map[string]any)
+	if out["email"] != "•••" {
+		t.Fatalf("malformed email = %v, want •••", out["email"])
+	}
+	if out["phone"] != "" {
+		t.Fatalf("empty phone = %v, want empty", out["phone"])
+	}
+}
+
+// toString is a crude stringifier good enough for a "did this leak"
+// substring check across nested maps and slices.
+func toString(v any) string {
+	return fmt.Sprintf("%v", v)
 }
 
 func TestContextLoggerRoundTrip(t *testing.T) {

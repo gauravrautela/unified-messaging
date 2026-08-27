@@ -132,6 +132,68 @@ func newTestServerWithProviders(t *testing.T, providers ...provider.Provider) (*
 	return NewServer(cfg, db, registry, nil, sync, authSvc, nil, disp, nil, log), db
 }
 
+// newTestServerWithProvidersAndLog is newTestServerWithProviders but also
+// wires a real accounts.Manager (so a connect flow can run end to end) and
+// exposes the captured log records, for tests asserting what that flow does
+// and does not log.
+func newTestServerWithProvidersAndLog(t *testing.T, providers ...provider.Provider) (*Server, *store.Store, *logx.Records) {
+	t.Helper()
+	safehttp.AllowLoopbackForTests(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetSealKey([]byte("0123456789abcdef0123456789abcdef"))
+	cfg := &config.Config{
+		ClientID: "client-123", Tenant: "consumers",
+		RedirectURI:   "http://localhost:8080/oauth/callback",
+		Scopes:        []string{"offline_access"},
+		SessionTTL:    30 * 24 * time.Hour,
+		SessionMaxAge: 90 * 24 * time.Hour,
+	}
+	log, recs := logx.Capture()
+	registry := provider.NewRegistry(providers...)
+	acctMgr := accounts.NewManager(db, make([]byte, 32), log)
+	acctMgr.SetRegistry(registry)
+	disp := events.NewDispatcher(db, nil, log)
+	sync := syncer.New(db, registry, acctMgr, disp, log, syncer.Options{PollInterval: time.Hour})
+	authSvc := auth.New(db, log, cfg.SessionTTL, cfg.SessionMaxAge)
+	return NewServer(cfg, db, registry, acctMgr, sync, authSvc, nil, disp, nil, log), db, recs
+}
+
+// fakeMailAuth is a minimal provider.Authenticator whose Exchange/Identify
+// never touch the network, so a connect flow's success path — code exchange,
+// identify, account persistence — can be driven end to end in a test without
+// a live provider on the other end.
+type fakeMailAuth struct{ email string }
+
+func (f fakeMailAuth) AuthorizeURL(state, challenge string, forceConsent bool) string {
+	return "https://example.com/authorize?state=" + state
+}
+
+func (f fakeMailAuth) Exchange(ctx context.Context, code, verifier string) (provider.Token, error) {
+	return provider.Token{AccessToken: "tok", RefreshToken: "rtok", ExpiresAt: time.Now().Add(time.Hour)}, nil
+}
+
+func (f fakeMailAuth) Refresh(ctx context.Context, refreshToken string) (provider.Token, error) {
+	return provider.Token{AccessToken: "tok2", RefreshToken: "rtok2", ExpiresAt: time.Now().Add(time.Hour)}, nil
+}
+
+func (f fakeMailAuth) Identify(ctx context.Context, accessToken string) (provider.Identity, error) {
+	return provider.Identity{Identifier: f.email, Email: f.email, Name: "Victim"}, nil
+}
+
+// fakeAuthMail is a FakeMail (a real Mailbox/Pusher with no network
+// dependency) fitted with a working Auth(), so the OAuth callback's full
+// success path runs against fakeMailAuth instead of a live provider.
+type fakeAuthMail struct {
+	*providertest.FakeMail
+	auth provider.Authenticator
+}
+
+func (f fakeAuthMail) Auth() provider.Authenticator { return f.auth }
+
 // mailStub is a bare-bones mail-kind provider.Provider for exercising
 // resolveProvider's default-selection logic. It is never actually connected
 // to, so every capability but Name/Kind is nil.
@@ -665,6 +727,41 @@ func TestHostedAuthStoresPendingWebhook(t *testing.T) {
 	}
 }
 
+// The account-connected log lines are the one place an end user's address
+// used to reach INFO in clear: both accounts.Connect and handleOAuthCallback
+// log "account connected". Both must now carry only a digest, never the
+// address itself.
+func TestConnectLogsDigestNotEmail(t *testing.T) {
+	const victimEmail = "victim@example.com"
+	fp := fakeAuthMail{FakeMail: providertest.NewFakeMail("FAKEMAIL"), auth: fakeMailAuth{email: victimEmail}}
+	s, _, recs := newTestServerWithProvidersAndLog(t, fp)
+	h := s.Routes()
+	_, key := seedDev(t, s, "dev@x.com")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hosted-auth: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp hostedAuthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/callback?code=fakecode&state="+resp.State, nil))
+	if rec.Code < 200 || rec.Code >= 400 {
+		t.Fatalf("oauth callback: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if !recs.Contains("email_digest=h_") {
+		t.Fatalf("account-connected log missing email_digest: %v", recs.All())
+	}
+	if recs.Contains(victimEmail) {
+		t.Fatalf("account-connected log leaked the address: %v", recs.All())
+	}
+}
+
 func TestHostedAuthRejectsBadWebhookURL(t *testing.T) {
 	s, _ := newTestServer(t)
 	_, key := seedDev(t, s, "a@x.com")
@@ -936,6 +1033,32 @@ func TestSignupSetsSessionCookieAndRedirects(t *testing.T) {
 	}
 	if !recs.Contains("request_id=req_") || !recs.Contains("developer signed up") {
 		t.Fatalf("expected request-scoped signup logs: %v", recs.All())
+	}
+}
+
+// The login-attempt DEBUG line used to log the submitted address in clear
+// (a carry-over from the signup path's own fix); it must now carry only a
+// digest, like signup already does.
+func TestLoginAttemptLogsDigestNotEmail(t *testing.T) {
+	s, _, recs := newTestServerWithLog(t)
+	h := s.Routes()
+	seedDev(t, s, "a@x.com")
+
+	rec := loginForm(t, h, "a@x.com", "longenoughpassword")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("login: %d", rec.Code)
+	}
+	var loginLine string
+	for _, l := range recs.All() {
+		if strings.Contains(l, "login attempt") {
+			loginLine = l
+		}
+	}
+	if loginLine == "" || !strings.Contains(loginLine, "email_digest=h_") {
+		t.Fatalf("expected a digested login-attempt log, got: %q", loginLine)
+	}
+	if strings.Contains(loginLine, "email=a@x.com") {
+		t.Fatalf("login attempt leaked the address into the log: %q", loginLine)
 	}
 }
 
@@ -1277,6 +1400,20 @@ func TestHostedAuthRedirectMustBeAllowlisted(t *testing.T) {
 	}
 	if rec := mint(`{"success_redirect_url":"https://customer.com/done"}`); rec.Code != 400 {
 		t.Fatal("apex is not covered by *.customer.com")
+	}
+	// Allowlist bypass shapes: none of these may be accepted, even though
+	// *.customer.com is genuinely on the allowlist at this point. url.Parse's
+	// Hostname() must resolve to the real authority (never a userinfo
+	// prefix or a suffix trick), and a non-http(s) scheme must never reach
+	// the host check at all.
+	for _, bypass := range []string{
+		`https://app.customer.com@evil.com/`, // userinfo: real host is evil.com
+		`https://app.customer.com.evil.com/`, // suffix trick: real host ends in evil.com
+		`javascript:alert(1)`,                // no host at all; wrong scheme
+	} {
+		if rec := mint(`{"success_redirect_url":"` + bypass + `"}`); rec.Code != 400 {
+			t.Errorf("bypass %q: status = %d, want 400 (body %s)", bypass, rec.Code, rec.Body.String())
+		}
 	}
 	// api key cannot change the list; bad entries rejected
 	rec = httptest.NewRecorder()
@@ -3218,6 +3355,25 @@ func TestListWebhookDeliveriesIsPaginated(t *testing.T) {
 	}
 	if list.Limit != 200 {
 		t.Fatalf("limit = %d, want clamped to 200", list.Limit)
+	}
+
+	// Garbage paging input (negative, non-numeric) must fall back to the
+	// defaults, not 400 or panic: deliveriesPaging only accepts a parsed value
+	// that also satisfies the sign check.
+	for _, query := range []string{"?limit=-5", "?limit=abc", "?offset=-1"} {
+		rec = httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+			"/api/v1/webhooks/wh_1/deliveries"+query, nil), key))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200 (body %s)", query, rec.Code, rec.Body.String())
+		}
+		list = listResponse[store.Delivery]{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		if list.Limit != 50 || list.Offset != 0 {
+			t.Fatalf("%s: limit/offset = %d/%d, want defaults 50/0", query, list.Limit, list.Offset)
+		}
 	}
 }
 

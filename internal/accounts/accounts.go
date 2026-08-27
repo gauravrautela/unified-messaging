@@ -125,7 +125,7 @@ func (m *Manager) Connect(ctx context.Context, developerID, providerName, code, 
 	if err := m.persist(realID, tok); err != nil {
 		return model.Account{}, err
 	}
-	log.Info("account connected", "account_id", realID, "email", identity.Email, "reconnect", reconnect)
+	log.Info("account connected", "account_id", realID, "email_digest", logx.Digest(identity.Email), "reconnect", reconnect)
 	return m.store.GetAnyAccount(realID)
 }
 
