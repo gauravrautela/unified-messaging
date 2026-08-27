@@ -422,3 +422,128 @@ func TestSyncAccountOnChatAccountReturnsError(t *testing.T) {
 		t.Fatal("SyncAccount on a chat account = nil error, want one")
 	}
 }
+
+// A subscription the provider reports as already existing (typically because
+// our own record of it was lost) must never be adopted with its original,
+// unknown clientState: that leaves HandleNotifications trusting the
+// subscription ID alone, which anyone who learns or guesses it can then use
+// to force a sync. EnsureSubscription must delete the pre-existing
+// subscription and create a fresh one of its own instead.
+func TestAdoptedSubscriptionIsReplacedNotTrusted(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "adopt.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAccount(model.Account{
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "FAKEMAIL", Email: "me@example.com", Status: model.AccountOK,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	fm.DuplicateOnce = true
+	fm.ListSubs = []provider.Subscription{
+		{ID: "REMOTE1", Resource: "me/mailFolders/inbox/messages", ExpiresAt: time.Now().Add(24 * time.Hour)},
+	}
+
+	log, recs := logx.Capture()
+	s := New(db, provider.NewRegistry(fm), nil, events.NewDispatcher(db, nil, log), log,
+		Options{PollInterval: time.Hour, PublicBaseURL: "https://example.com"})
+
+	// Mirrors how reconcileSubscriptions attaches the base logger before
+	// calling EnsureSubscription; a bare context.Background() would fall back
+	// to slog.Default() and the log assertion below would see nothing.
+	ctx := logx.With(context.Background(), log)
+	if err := s.EnsureSubscription(ctx, "acc_1"); err != nil {
+		t.Fatalf("EnsureSubscription: %v", err)
+	}
+
+	if got := fm.Deleted(); len(got) != 1 || got[0] != "REMOTE1" {
+		t.Fatalf("Delete calls = %v, want exactly [REMOTE1]", got)
+	}
+	subs, err := db.SubscriptionsForAccount("acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("stored subscriptions = %+v, want 1", subs)
+	}
+	if subs[0].ID == "REMOTE1" {
+		t.Fatal("stored subscription is still the adopted remote one, want a freshly created one")
+	}
+	if subs[0].ClientState == "" {
+		t.Fatal("stored subscription has no clientState: it is still being trusted blind")
+	}
+	if !recs.Contains("replaced pre-existing subscription") {
+		t.Errorf("missing replace decision log: %v", recs.All())
+	}
+}
+
+// HandleNotifications must reject anything but an exact clientState match: an
+// empty one (the shape an adopted-and-trusted subscription used to have), and
+// a near-miss that only differs by case, must both be treated as forged.
+func TestNotificationWithoutMatchingClientStateIsRejected(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "cstate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAccount(model.Account{
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "FAKEMAIL", Email: "me@example.com", Status: model.AccountOK,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveSubscription(store.Subscription{
+		ID: "SUB1", AccountID: "acc_1", Resource: "me/mailFolders/inbox/messages",
+		ClientState: "s", ExpiresAt: time.Now().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	fm.SetNotifications([]provider.Notification{{SubscriptionID: "SUB1", ClientState: ""}})
+	log, _ := logx.Capture()
+	s := New(db, provider.NewRegistry(fm), nil, events.NewDispatcher(db, nil, log), log, Options{})
+
+	if err := s.HandleNotifications(context.Background(), "FAKEMAIL", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if drainWake(s) {
+		t.Fatal("empty clientState woke the account; want it rejected")
+	}
+
+	fm.SetNotifications([]provider.Notification{{SubscriptionID: "SUB1", ClientState: "S"}})
+	if err := s.HandleNotifications(context.Background(), "FAKEMAIL", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if drainWake(s) {
+		t.Fatal("near-miss clientState woke the account; want it rejected")
+	}
+
+	fm.SetNotifications([]provider.Notification{{SubscriptionID: "SUB1", ClientState: "s"}})
+	if err := s.HandleNotifications(context.Background(), "FAKEMAIL", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !drainWake(s) {
+		t.Fatal("matching clientState did not wake the account")
+	}
+}
+
+// drainWake reports whether a Wake was queued (and consumes it), without
+// requiring the worker goroutine to be running: the syncer under test here is
+// never Start-ed, so s.wake is a plain channel this test can inspect directly.
+func drainWake(s *Syncer) bool {
+	select {
+	case <-s.wake:
+		return true
+	default:
+		return false
+	}
+}

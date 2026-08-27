@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"time"
 
@@ -143,9 +144,12 @@ func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName
 	})
 	if err != nil {
 		if errors.Is(err, provider.ErrSubscriptionExists) {
-			// A subscription we lost track of is still alive upstream. Adopt it
-			// rather than fighting the duplicate rule forever.
-			return s.adoptExisting(ctx, accountID, pusher)
+			// A subscription we lost track of is still alive upstream. Its
+			// clientState is one we never knew, so notifications for it could
+			// only ever be checked by subscription ID — not good enough to
+			// trust, since anyone who learns that ID could force a sync.
+			// Replace it with one we mint ourselves instead of adopting it blind.
+			return s.adoptExisting(ctx, accountID, providerName, pusher)
 		}
 		return err
 	}
@@ -158,23 +162,30 @@ func (s *Syncer) createSubscription(ctx context.Context, accountID, providerName
 	})
 }
 
-func (s *Syncer) adoptExisting(ctx context.Context, accountID string, pusher provider.Pusher) error {
+// adoptExisting replaces every subscription the provider reports as already
+// registered for this account. Trusting one of them in place — as this used
+// to do — meant storing it with no clientState, which made HandleNotifications
+// accept any inbound POST that merely named that subscription ID: anyone who
+// learned or guessed the ID could force a sync with no secret at all. Deleting
+// and recreating costs one extra round trip but ensures every stored
+// subscription carries a clientState only we ever knew.
+func (s *Syncer) adoptExisting(ctx context.Context, accountID, providerName string, pusher provider.Pusher) error {
 	remote, err := pusher.List(ctx, accountID)
 	if err != nil {
 		return err
 	}
-	for _, r := range remote {
-		logx.From(ctx).With("component", "syncer").Info("adopting pre-existing subscription",
-			"account_id", accountID, "subscription_id", r.ID,
-			"resource", r.Resource, "expires_at", r.ExpiresAt)
-		// The clientState of a subscription we did not create is unrecoverable,
-		// so notifications for it can only be verified by subscription ID.
-		return s.store.SaveSubscription(store.Subscription{
-			ID: r.ID, AccountID: accountID, Resource: r.Resource,
-			ClientState: "", ExpiresAt: r.ExpiresAt,
-		})
+	if len(remote) == 0 {
+		return errors.New("syncer: provider reported a duplicate subscription but did not list it")
 	}
-	return errors.New("syncer: provider reported a duplicate subscription but did not list it")
+	log := logx.From(ctx).With("component", "syncer")
+	for _, r := range remote {
+		if err := pusher.Delete(ctx, accountID, r.ID); err != nil {
+			log.Warn("deleting pre-existing subscription before replacing it",
+				"account_id", accountID, "subscription_id", r.ID, "err", err)
+		}
+	}
+	log.Info("replaced pre-existing subscription", "account_id", accountID, "count", len(remote))
+	return s.createSubscription(ctx, accountID, providerName, pusher)
 }
 
 // HandleNotifications processes an inbound push payload from a named provider.
@@ -203,9 +214,15 @@ func (s *Syncer) HandleNotifications(ctx context.Context, providerName string, r
 				"subscription_id", n.SubscriptionID)
 			continue
 		}
-		// A blank stored clientState means we adopted this subscription and
-		// never knew its secret; ID ownership is the only check available.
-		if sub.ClientState != "" && sub.ClientState != n.ClientState {
+		// A blank stored clientState means we never had one to check — which,
+		// since adoptExisting no longer stores subscriptions that way, should
+		// not happen for anything created going forward; reject it outright
+		// rather than falling back to trusting the subscription ID alone.
+		// The comparison itself is constant-time: this string is a bearer
+		// secret, and a timing side-channel on it would undo the point of
+		// having one.
+		if sub.ClientState == "" ||
+			subtle.ConstantTimeCompare([]byte(sub.ClientState), []byte(n.ClientState)) != 1 {
 			log.Warn("rejecting notification: clientState mismatch",
 				"subscription_id", n.SubscriptionID)
 			continue

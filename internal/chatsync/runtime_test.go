@@ -438,3 +438,39 @@ func TestAttachAfterShutdownIsRefused(t *testing.T) {
 		t.Fatal("Attach after shutdown opened a connection anyway")
 	}
 }
+
+// A provider bug that reports the wrong accountID on a live connection must
+// never let one tenant's chat land in another's mirror. Every sink callback
+// checks the accountID it is actually called with against the account its
+// actor owns, not just whatever the closed-over connection is supposed to be
+// talking about.
+func TestSinkRejectsForeignAccountID(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "1")
+	_ = h.rt.Attach(acc)
+	waitFor(t, func() bool { return h.fake.Sink(acc) != nil })
+	s := h.fake.Sink(acc)
+
+	s.Message(acc, model.ChatMessage{ID: "M1", ChatID: "c1", Kind: "text", Text: "hi", SentAt: time.Now(), Sender: model.Attendee{ID: "a1"}},
+		model.Chat{ID: "c1", Kind: "direct"}, model.Attendee{ID: "a1"})
+	waitFor(t, func() bool { return len(h.events()) == 1 })
+
+	s.Message("acc_other", model.ChatMessage{ID: "M2", ChatID: "c1", Kind: "text", Text: "forged", SentAt: time.Now(), Sender: model.Attendee{ID: "a1"}},
+		model.Chat{ID: "c1", Kind: "direct"}, model.Attendee{ID: "a1"})
+	time.Sleep(100 * time.Millisecond)
+	if len(h.events()) != 1 {
+		t.Fatalf("a message reported under a foreign account id emitted an event: %d", len(h.events()))
+	}
+	if _, err := h.db.GetChatMessage(acc, "M2"); err == nil {
+		t.Fatal("foreign-account message was stored under the real (calling) account")
+	}
+	if _, err := h.db.GetChatMessage("acc_other", "M2"); err == nil {
+		t.Fatal("foreign-account message was stored under the reported account")
+	}
+	if !h.recs.Contains("foreign account id") {
+		t.Fatalf("missing foreign-account error log: %v", h.recs.All())
+	}
+	if h.recs.Contains("acc_other") {
+		t.Fatal("the foreign account id was logged raw instead of digested")
+	}
+}

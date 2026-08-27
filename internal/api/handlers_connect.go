@@ -255,6 +255,7 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	// A chat provider has no authorize URL at all — Auth() is nil for it — so
 	// this must branch before ever calling it.
 	if p.Linker() != nil {
+		s.ensureLinkCookie(w, r)
 		renderLink(w, linkPageData{
 			Provider: displayName(p.Name()),
 			State:    state,

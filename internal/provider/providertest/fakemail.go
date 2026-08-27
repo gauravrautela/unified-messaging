@@ -3,6 +3,7 @@ package providertest
 import (
 	"context"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +33,21 @@ type FakeMail struct {
 
 	inFlight    atomic.Int64
 	maxInFlight atomic.Int64
+
+	// DuplicateOnce makes the very next Create call report
+	// provider.ErrSubscriptionExists instead of succeeding — enough to drive
+	// a duplicate-then-adopt test without any special-casing by account or
+	// subscription id. Every Create after that first one succeeds normally.
+	DuplicateOnce bool
+	dupUsed       atomic.Bool
+
+	// ListSubs is what List reports for every account; nil means "none",
+	// matching a provider that genuinely has nothing registered.
+	ListSubs []provider.Subscription
+
+	mu            sync.Mutex
+	deleted       []string
+	notifications []provider.Notification
 }
 
 func NewFakeMail(name string) *FakeMail {
@@ -105,17 +121,32 @@ func (f *FakeMail) SendDraft(ctx context.Context, accountID, draftID string) err
 // push-capable one without further wiring.
 
 func (f *FakeMail) Create(ctx context.Context, accountID string, cfg provider.PushConfig) (provider.Subscription, error) {
-	return provider.Subscription{ID: "FAKESUB1"}, nil
+	if f.DuplicateOnce && !f.dupUsed.Swap(true) {
+		return provider.Subscription{}, provider.ErrSubscriptionExists
+	}
+	return provider.Subscription{ID: "FAKESUB1", ExpiresAt: time.Now().Add(48 * time.Hour)}, nil
 }
 
 func (f *FakeMail) Renew(ctx context.Context, accountID, subscriptionID string) (provider.Subscription, error) {
 	return provider.Subscription{ID: subscriptionID}, nil
 }
 
-func (f *FakeMail) Delete(ctx context.Context, accountID, subscriptionID string) error { return nil }
+func (f *FakeMail) Delete(ctx context.Context, accountID, subscriptionID string) error {
+	f.mu.Lock()
+	f.deleted = append(f.deleted, subscriptionID)
+	f.mu.Unlock()
+	return nil
+}
+
+// Deleted reports every subscription ID passed to Delete, in call order.
+func (f *FakeMail) Deleted() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deleted...)
+}
 
 func (f *FakeMail) List(ctx context.Context, accountID string) ([]provider.Subscription, error) {
-	return nil, nil
+	return f.ListSubs, nil
 }
 
 func (f *FakeMail) RenewBefore() time.Duration { return 10 * time.Minute }
@@ -136,6 +167,15 @@ func (f *FakeMail) InFlight() int64 { return f.inFlight.Load() }
 // calls seen so far.
 func (f *FakeMail) MaxInFlight() int64 { return f.maxInFlight.Load() }
 
+// SetNotifications makes every subsequent ParseNotifications call return ns,
+// regardless of raw, so a test can drive HandleNotifications with a scripted
+// clientState without depending on any real wire format.
+func (f *FakeMail) SetNotifications(ns []provider.Notification) {
+	f.mu.Lock()
+	f.notifications = ns
+	f.mu.Unlock()
+}
+
 func (f *FakeMail) ParseNotifications(raw []byte) ([]provider.Notification, error) {
 	n := f.inFlight.Add(1)
 	defer f.inFlight.Add(-1)
@@ -151,7 +191,9 @@ func (f *FakeMail) ParseNotifications(raw []byte) ([]provider.Notification, erro
 			<-ch
 		}
 	}
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.notifications, nil
 }
 
 func (f *FakeMail) ValidationResponse(query url.Values) (string, bool) {

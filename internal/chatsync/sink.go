@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 )
@@ -19,6 +20,23 @@ type sink struct {
 }
 
 var _ provider.EventSink = (*sink)(nil)
+
+// foreignAccount reports whether accountID is not the account this sink was
+// created for, logging the mismatch first. The adapter is trusted to report
+// its own connection's events, but never so trusted that a bug — or, worse,
+// an adapter confusing two live sockets — can land another tenant's message
+// in this account's mirror: every callback checks the accountID it was
+// actually called with, rather than assuming it must match the one closed
+// over in s.a. Digested, not logged raw: an account id can double as an
+// identifier worth protecting the same way a chat id is.
+func (s *sink) foreignAccount(accountID string) bool {
+	if accountID == s.a.acct.ID {
+		return false
+	}
+	s.a.log.Error("chat sink: foreign account id",
+		"got", logx.Digest(accountID), "want", logx.Digest(s.a.acct.ID))
+	return true
+}
 
 // enqueue hands work to the actor. A full inbox blocks the caller rather than
 // dropping the event — back-pressure onto the provider's reader is recoverable,
@@ -38,6 +56,9 @@ func (s *sink) enqueue(f func()) {
 }
 
 func (s *sink) Message(accountID string, m model.ChatMessage, chat model.Chat, sender model.Attendee) {
+	if s.foreignAccount(accountID) {
+		return
+	}
 	s.enqueue(func() {
 		m.AccountID = accountID
 		log := s.log.With("chat_id", logChat(m.ChatID), "message_id", m.ID)
@@ -93,6 +114,9 @@ func (s *sink) Message(accountID string, m model.ChatMessage, chat model.Chat, s
 }
 
 func (s *sink) Receipt(accountID, chatID string, messageIDs []string, status string) {
+	if s.foreignAccount(accountID) {
+		return
+	}
 	ids := append([]string(nil), messageIDs...)
 	s.enqueue(func() {
 		if len(ids) == 0 {
@@ -119,6 +143,9 @@ func (s *sink) Receipt(accountID, chatID string, messageIDs []string, status str
 }
 
 func (s *sink) Reaction(accountID, chatID, messageID string, r model.Reaction) {
+	if s.foreignAccount(accountID) {
+		return
+	}
 	s.enqueue(func() {
 		log := s.log.With("chat_id", logChat(chatID), "message_id", messageID)
 		if err := s.a.rt.store.ApplyReaction(accountID, messageID, r); err != nil {
@@ -134,6 +161,9 @@ func (s *sink) Reaction(accountID, chatID, messageID string, r model.Reaction) {
 }
 
 func (s *sink) Edited(accountID, chatID, messageID, text string, at time.Time) {
+	if s.foreignAccount(accountID) {
+		return
+	}
 	s.enqueue(func() {
 		log := s.log.With("chat_id", logChat(chatID), "message_id", messageID)
 		prev, err := s.a.rt.store.GetChatMessage(accountID, messageID)
@@ -161,6 +191,9 @@ func (s *sink) Edited(accountID, chatID, messageID, text string, at time.Time) {
 }
 
 func (s *sink) Deleted(accountID, chatID, messageID string) {
+	if s.foreignAccount(accountID) {
+		return
+	}
 	s.enqueue(func() {
 		log := s.log.With("chat_id", logChat(chatID), "message_id", messageID)
 		prev, err := s.a.rt.store.GetChatMessage(accountID, messageID)
@@ -187,6 +220,9 @@ func (s *sink) Deleted(accountID, chatID, messageID string) {
 // deadlock a full inbox. The channel is one-deep and the send never blocks —
 // a second report of the same dead socket tells us nothing new.
 func (s *sink) Disconnected(accountID, reason string, loggedOut bool) {
+	if s.foreignAccount(accountID) {
+		return
+	}
 	select {
 	case s.disc <- disconnect{reason: reason, loggedOut: loggedOut}:
 	default:

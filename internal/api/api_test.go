@@ -158,6 +158,33 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met")
 }
 
+// openLink simulates a browser's first visit to a Linker provider's connect
+// landing page and returns the um_link cookie handleConnectRedirect mints
+// there, so a test can attach it to consent/qr requests the way a real
+// browser's cookie jar would.
+func openLink(t *testing.T, h http.Handler, state string) *http.Cookie {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state, nil))
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieLinkName {
+			return c
+		}
+	}
+	t.Fatal("connect landing page did not set the um_link cookie")
+	return nil
+}
+
+// linkReq builds a request for the connect/consent/qr flow carrying cookie,
+// the way a browser would attach it automatically.
+func linkReq(method, path string, cookie *http.Cookie) *http.Request {
+	req := httptest.NewRequest(method, path, nil)
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	return req
+}
+
 // seedChat links a fake chat account under devID, attaches it to the runtime,
 // and gives it one chat with one attendee — the minimum a chat-facing test
 // needs to have something to read. It also fills one slot of chat capacity,
@@ -1388,18 +1415,27 @@ func TestLinkerConnectPageRequiresConsentThenServesQR(t *testing.T) {
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `name="consent"`) || strings.Contains(rec.Body.String(), "login.microsoftonline.com") {
 		t.Fatalf("linker page: %d %s", rec.Code, rec.Body.String()[:200])
 	}
+	var cookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieLinkName {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("connect landing page did not set the um_link cookie")
+	}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("qr before consent: %d", rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+state+"/consent", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodPost, "/connect/"+state+"/consent", cookie))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("consent: %d", rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+state+"/qr", cookie))
 	var q struct {
 		Status string `json:"status"`
 		PNG    string `json:"png_base64"`
@@ -1411,17 +1447,23 @@ func TestLinkerConnectPageRequiresConsentThenServesQR(t *testing.T) {
 	s.fake().EmitCode("qr-abc")
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+		h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+state+"/qr", cookie))
 		_ = json.Unmarshal(rec.Body.Bytes(), &q)
 		return q.PNG != ""
 	})
+	// A different browser's cookie must never see this state's QR code.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+state+"/qr", &http.Cookie{Name: cookieLinkName, Value: "someone-elses-browser"}))
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "link_browser_mismatch") {
+		t.Fatalf("qr with the wrong browser cookie: %d %s", rec.Code, rec.Body.String())
+	}
 	// Pair -> account under the minting developer, notify + webhook bound, state consumed.
 	notified := make(chan map[string]any, 1)
 	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
 	s.fake().Pair(provider.Identity{Identifier: "+919888000000", Name: "G"}, "919888000000:5@s.whatsapp.net")
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+state+"/qr", nil))
+		h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+state+"/qr", cookie))
 		_ = json.Unmarshal(rec.Body.Bytes(), &q)
 		return q.Status == "paired"
 	})
@@ -1460,12 +1502,13 @@ func TestLinkTimeoutNotifiesFailed(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	var r hostedAuthResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+	cookie := openLink(t, h, r.State)
 	notified := make(chan map[string]any, 1)
 	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 	s.fake().FailLink(provider.ErrLinkTimeout)
 	select {
 	case p := <-notified:
@@ -1515,8 +1558,9 @@ func TestLinkQRConcurrentPollsStartExactlyOneSession(t *testing.T) {
 	var r hostedAuthResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &r)
 
+	cookie := openLink(t, h, r.State)
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("consent: %d", rec.Code)
 	}
@@ -1529,7 +1573,7 @@ func TestLinkQRConcurrentPollsStartExactlyOneSession(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+			h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 			codes[i] = rec.Code
 		}(i)
 	}
@@ -1596,12 +1640,13 @@ func TestFinishLinkNotifiesExpiredWhenLinkExpiresDuringPairing(t *testing.T) {
 	var r hostedAuthResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &r)
 
+	cookie := openLink(t, h, r.State)
 	notified := make(chan map[string]any, 1)
 	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
 
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
 	// Starts the pairing session (and pumpLink) while the state is still valid.
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 
 	// Simulate the user taking so long to scan that the connect link's own
 	// expiry passes before pairing resolves.
@@ -1625,7 +1670,7 @@ func TestFinishLinkNotifiesExpiredWhenLinkExpiresDuringPairing(t *testing.T) {
 	}
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+		h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 		var q struct {
 			Status string `json:"status"`
 		}
@@ -1662,11 +1707,12 @@ func TestFinishLinkNotifiesFailedWhenAccountCreationFails(t *testing.T) {
 	var r hostedAuthResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &r)
 
+	cookie := openLink(t, h, r.State)
 	notified := make(chan map[string]any, 1)
 	s.notifyTransport = func(url string, payload map[string]any) { notified <- payload }
 
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 
 	// An empty Identifier is what accounts.ConnectLinked rejects.
 	s.fake().Pair(provider.Identity{Identifier: "", Name: "G"}, "somejid")
@@ -1685,7 +1731,7 @@ func TestFinishLinkNotifiesFailedWhenAccountCreationFails(t *testing.T) {
 	}
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+		h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 		var q struct {
 			Status string `json:"status"`
 		}
@@ -1751,26 +1797,27 @@ func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
 	_, key := seedDev(t, s, "a@x.com")
 	h := s.Routes()
 
-	mint := func() string {
+	mint := func() (string, *http.Cookie) {
 		req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		var r hostedAuthResponse
 		_ = json.Unmarshal(rec.Body.Bytes(), &r)
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
-		return r.State
+		cookie := openLink(t, h, r.State)
+		h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
+		return r.State, cookie
 	}
 
-	slowState := mint()
-	fastState := mint()
+	slowState, slowCookie := mint()
+	fastState, fastCookie := mint()
 
 	s.fake().SetStartLinkDelay(time.Second)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+slowState+"/qr", nil))
+		h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodGet, "/connect/"+slowState+"/qr", slowCookie))
 	}()
 	// Give the slow poll time to actually enter StartLink (past the delay
 	// read) before the fast one races it.
@@ -1779,7 +1826,7 @@ func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
 
 	start := time.Now()
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+fastState+"/qr", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+fastState+"/qr", fastCookie))
 	elapsed := time.Since(start)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("fast state poll: %d %s", rec.Code, rec.Body.String())
@@ -1807,7 +1854,8 @@ func TestLinkQRSecondPollerSeesStartLinkFailure(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	var r hostedAuthResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &r)
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	cookie := openLink(t, h, r.State)
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
 
 	// Set both knobs up front, before any concurrent poll begins, so the two
 	// pollers below only ever read them (no concurrent mutation to race on).
@@ -1822,7 +1870,7 @@ func TestLinkQRSecondPollerSeesStartLinkFailure(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+			h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 			codes[i] = rec.Code
 			bodies[i] = rec.Body.String()
 		}(i)
@@ -1846,7 +1894,7 @@ func TestLinkQRSecondPollerSeesStartLinkFailure(t *testing.T) {
 	s.fake().SetStartLinkDelay(0)
 	s.fake().StartLinkErr = nil
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 	var q struct {
 		Status string `json:"status"`
 	}
@@ -2588,14 +2636,15 @@ func TestQRPairedStatusCarriesAccountID(t *testing.T) {
 	var r hostedAuthResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &r)
 
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+	cookie := openLink(t, h, r.State)
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
+	h.ServeHTTP(httptest.NewRecorder(), linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 	s.fake().Pair(provider.Identity{Identifier: "+919888000008", Name: "Ada"}, "919888000008:1@s.whatsapp.net")
 
 	var q map[string]any
 	waitFor(t, func() bool {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State+"/qr", nil))
+		h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
 		q = map[string]any{}
 		_ = json.Unmarshal(rec.Body.Bytes(), &q)
 		return q["status"] == "paired"
@@ -3348,5 +3397,71 @@ func TestNotificationHandlingIsBounded(t *testing.T) {
 		if code != http.StatusAccepted {
 			t.Fatalf("request %d: status = %d, want 202", i, code)
 		}
+	}
+}
+
+// --- QR link browser binding (I11) ---
+
+// A leaked /connect/{state} URL must not let a second browser hijack a
+// pairing attempt someone else already started: consent and every /qr poll
+// have to come from the same browser that first opened the connect landing
+// page, proven by a cookie no leaked URL alone carries.
+func TestQRLinkIsBoundToTheBrowserThatOpenedIt(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	h := s.Routes()
+
+	req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var r hostedAuthResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &r)
+
+	// Opening the connect landing page mints the browser-binding cookie.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/connect/"+r.State, nil))
+	var cookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == cookieLinkName {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("connect landing page did not set the um_link cookie")
+	}
+
+	// Consent without the cookie at all is refused outright.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/connect/"+r.State+"/consent", nil))
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "link_browser_mismatch") {
+		t.Fatalf("consent without cookie: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Consent with the real cookie succeeds and claims the state for it.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodPost, "/connect/"+r.State+"/consent", cookie))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("consent with cookie: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// A different browser's cookie is refused at /qr, even though the state
+	// itself is perfectly valid and consented.
+	other := &http.Cookie{Name: cookieLinkName, Value: "attacker-browser-value"}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", other))
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "link_browser_mismatch") {
+		t.Fatalf("qr with a different browser's cookie: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The real browser's own cookie still works.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, linkReq(http.MethodGet, "/connect/"+r.State+"/qr", cookie))
+	var q struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &q)
+	if rec.Code != http.StatusOK || q.Status != "waiting" {
+		t.Fatalf("qr with the right cookie: %d %+v", rec.Code, q)
 	}
 }

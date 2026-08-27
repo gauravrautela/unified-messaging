@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"html/template"
 	"log/slog"
@@ -30,6 +33,50 @@ import (
 // notify_url / retry, not the pairing window.
 const linkTTL = 3 * time.Minute
 
+// cookieLinkName names the cookie that binds one browser to one connect
+// state. handleConnectRedirect mints it — only when the browser does not
+// already have one — the moment a Linker provider's landing page is shown;
+// handleConsent and handleLinkQR both require it and bind a state's pairing
+// attempt to whichever value they see first. A /connect/{state} URL that
+// leaks after the flow has already started — forwarded, logged, pasted
+// somewhere it shouldn't be — cannot then be used from a second browser to
+// hijack that attempt and pair an unrelated phone into the tenant.
+const cookieLinkName = "um_link"
+
+// ensureLinkCookie mints cookieLinkName the first time a browser reaches a
+// Linker provider's landing page for any state. A browser that already has
+// one keeps it, so opening a second connect link in the same browser still
+// binds consistently, and reloading the same link never mints a new one out
+// from under an in-progress pairing attempt.
+func (s *Server) ensureLinkCookie(w http.ResponseWriter, r *http.Request) {
+	if _, err := r.Cookie(cookieLinkName); err == nil {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieLinkName,
+		Value:    logx.RandomToken(32),
+		Path:     "/connect/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   s.requestIsHTTPS(r),
+		MaxAge:   int(linkTTL.Seconds()),
+	})
+}
+
+// linkBrowserHash reports a one-way handle for the browser's um_link cookie.
+// ok is false when no cookie (or an empty one) was sent at all, which is
+// refused outright rather than treated as an empty value worth binding — a
+// stripped cookie must never pass as "the first caller" for a state nobody
+// has claimed yet.
+func linkBrowserHash(r *http.Request) (hash string, ok bool) {
+	c, err := r.Cookie(cookieLinkName)
+	if err != nil || c.Value == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(c.Value))
+	return hex.EncodeToString(sum[:]), true
+}
+
 // link is one in-flight (or just-finished) pairing attempt. ready is closed
 // exactly once — when session has been set (StartLink succeeded) or startErr
 // has been set (it failed) — which is what lets a concurrent poll that lost
@@ -48,10 +95,21 @@ type link struct {
 	accountID  string
 	successURL string
 
+	// browserHash is the sha256 of the um_link cookie belonging to whichever
+	// browser first claimed this state (see linkRegistry.claim). It is set
+	// once, at creation, under linkRegistry.mu, and every later read of it
+	// happens under that same lock — never mutated afterwards, so it needs
+	// no separate guard of its own.
+	browserHash string
+
+	// pump ensures startPairing's dial (StartLink) runs exactly once for this
+	// entry, however many /qr callers see it not started yet.
+	pump sync.Once
+
 	started time.Time
 }
 
-// startError reports whether getOrStart's call to StartLink failed for this
+// startError reports whether startPairing's call to StartLink failed for this
 // link. Safe to call before l.ready closes (it just observes the zero value,
 // nil, until the creator sets it).
 func (l *link) startError() error {
@@ -115,48 +173,63 @@ func (lr *linkRegistry) get(state string) *link {
 	return lr.links[state]
 }
 
-// getOrStart returns the existing link for state, or installs a placeholder
-// and starts one via start. Only the check-then-insert of the placeholder
-// runs under lr.mu; start itself (StartLink, for a real provider a blocking
-// network dial) runs after the lock is released, so one state's dial can
-// never stall another state's poll, or the sweeper, behind the registry
-// lock. created reports whether this call is the one that installed the
-// placeholder and ran start — the caller starts pumpLink only then, and only
-// once it has confirmed start actually succeeded (l.startErr == nil): a
-// concurrent caller that lost the create race gets the same *link back with
-// created=false and must wait on l.ready before trusting anything on it.
-func (lr *linkRegistry) getOrStart(state string, start func() (provider.LinkSession, error), successURL string) (l *link, created bool) {
+// claim returns the registry entry for state — creating an inert placeholder
+// (no session, no dial attempted) if this is the first request to name state
+// at all — and reports whether hash is the browser allowed to keep driving
+// it. In the normal flow handleConsent is what creates the entry, since it
+// always runs before the first /qr poll; handleLinkQR calls the very same
+// method, so a retry after a previous StartLink failure (which drops the
+// entry entirely — see dropFailed) is bound exactly the same way, and a /qr
+// call that somehow beat consent to naming the state still gets a
+// consistent answer rather than a special case. Only the map lookup runs
+// under lr.mu; every subsequent poll for the same state is a plain
+// constant-time comparison of an already-resident hash, no store or provider
+// I/O involved.
+func (lr *linkRegistry) claim(state, hash, successURL string) (l *link, ok bool) {
 	lr.mu.Lock()
-	if existing, ok := lr.links[state]; ok {
-		lr.mu.Unlock()
-		return existing, false
+	defer lr.mu.Unlock()
+	if existing, found := lr.links[state]; found {
+		return existing, subtle.ConstantTimeCompare([]byte(existing.browserHash), []byte(hash)) == 1
 	}
-	l = &link{ready: make(chan struct{}), successURL: successURL, started: time.Now()}
+	l = &link{ready: make(chan struct{}), browserHash: hash, successURL: successURL, started: time.Now()}
 	lr.links[state] = l
-	lr.mu.Unlock()
+	return l, true
+}
 
-	sess, err := start()
-	if err != nil {
-		// Publish the failure before the placeholder becomes unreachable: a
-		// concurrent poll holding this *link must never observe a link that is
-		// no longer in the registry and still reports startErr == nil.
+// startPairing runs start (StartLink) exactly once for l, however many /qr
+// polls see it not started yet — whether l was just created by this very
+// call or reserved earlier by handleConsent's claim. It reports true only
+// for the single caller whose invocation actually ran start; that caller
+// owns launching pumpLink on success, or dropping l via dropFailed on
+// failure. sync.Once.Do blocks every other caller until start has returned
+// and l.ready is closed, so by the time any of them gets control back the
+// outcome is already visible on l — no separate wait is needed here.
+func (l *link) startPairing(start func() (provider.LinkSession, error)) (ran bool) {
+	l.pump.Do(func() {
+		ran = true
+		sess, err := start()
 		l.mu.Lock()
-		l.startErr = err
+		if err != nil {
+			l.startErr = err
+		} else {
+			l.session = sess
+		}
 		l.mu.Unlock()
 		close(l.ready)
-		lr.mu.Lock()
-		if lr.links[state] == l {
-			delete(lr.links, state)
-		}
-		lr.mu.Unlock()
-		return l, true
-	}
+	})
+	return ran
+}
 
-	l.mu.Lock()
-	l.session = sess
-	l.mu.Unlock()
-	close(l.ready)
-	return l, true
+// dropFailed removes l from the registry after its one StartLink attempt
+// failed, so the next /qr poll starts a fresh attempt — and a fresh claim —
+// rather than replaying the same failure forever. Guarded against a state
+// that has already moved on to a newer entry by the time this runs.
+func (lr *linkRegistry) dropFailed(state string, l *link) {
+	lr.mu.Lock()
+	if lr.links[state] == l {
+		delete(lr.links, state)
+	}
+	lr.mu.Unlock()
 }
 
 // sweep closes and drops every link older than maxAge. It is the backstop
@@ -200,10 +273,23 @@ func (s *Server) sweepLinks() {
 	}
 }
 
+// linkBrowserMismatch is the 403 both handleConsent and handleLinkQR report
+// when a request's um_link cookie is missing or does not match the browser
+// that first claimed this connect state.
+func linkBrowserMismatch(w http.ResponseWriter) {
+	writeError(w, http.StatusForbidden, "link_browser_mismatch",
+		"open the link in the browser where you started")
+}
+
 // handleConsent records that the end user accepted the linker disclosure.
 // It is the gate /qr checks before it will start spending a real pairing
 // session: without it, a bare GET on a guessed-but-valid state could kick off
 // a device link the end user never agreed to.
+//
+// It is also, in the normal flow, the first thing to claim this state's
+// registry entry for a browser (see linkRegistry.claim): a /connect/{state}
+// URL handed to (or intercepted by) a second browser after the first one
+// already consented is refused here, before it can ever reach /qr.
 func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	state := r.PathValue("state")
 	pending, err := s.store.PeekOAuthState(state)
@@ -224,6 +310,15 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "unknown link")
 		return
 	}
+	hash, hasCookie := linkBrowserHash(r)
+	if !hasCookie {
+		linkBrowserMismatch(w)
+		return
+	}
+	if _, ok := s.links.claim(state, hash, pending.SuccessURL); !ok {
+		linkBrowserMismatch(w)
+		return
+	}
 	if err := s.store.SetOAuthConsent(state, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -233,10 +328,12 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLinkQR is polled by the connect page every couple of seconds. The
-// first call after consent starts the actual pairing session; every call
-// after that — including a second poll that arrives while that first call's
-// StartLink is still in flight — waits on the same outcome rather than
-// reporting "waiting" for a session that may already have failed.
+// first call whose pairing dial has not been attempted yet — normally the
+// very first poll after consent, since consent already claimed the registry
+// entry for its browser — starts the actual pairing session; every call
+// after that, including one that arrives while that dial is still in
+// flight, waits on the same outcome rather than reporting "waiting" for a
+// session that may already have failed.
 func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 	// The pairing state changes underneath a fixed URL every couple of
 	// seconds; nothing about this response is ever safe to cache.
@@ -244,14 +341,29 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 	state := r.PathValue("state")
 
 	l := s.links.get(state)
-	created := false
-	if l == nil {
-		// No link exists yet for this state: this is the validation path
-		// that only ever runs for whichever poll actually reaches
-		// getOrStart's create branch (or loses that race to a concurrent
-		// twin) — the store's copy of this state is gone the moment pairing
-		// later succeeds or fails, so this is the last point anything here
-		// can check consent or expiry against it.
+
+	// needsStart is true exactly when nothing has attempted this state's
+	// StartLink dial yet: either nothing has touched its registry entry at
+	// all (l == nil — the usual reason is a retry after a previous attempt's
+	// failure dropped the entry via dropFailed), or consent's claim reserved
+	// a placeholder for it that no /qr call has started yet. The read of
+	// l.ready is non-blocking on purpose: once it is closed, the dial has
+	// already been attempted and this poll only needs the outcome.
+	needsStart := l == nil
+	if !needsStart {
+		select {
+		case <-l.ready:
+		default:
+			needsStart = true
+		}
+	}
+
+	if needsStart {
+		// The store's copy of this state is gone the moment pairing later
+		// succeeds or fails (finishLink consumes it), so this is the last
+		// point anything here can check consent or expiry against it —
+		// which is also why this whole branch only ever runs before the
+		// dial has been attempted, never on a poll after.
 		pending, err := s.store.PeekOAuthState(state)
 		if err != nil {
 			writeError(w, http.StatusNotFound, "not_found", "unknown link")
@@ -271,32 +383,55 @@ func (s *Server) handleLinkQR(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Only past this point is the state itself known-legitimate, which
+		// is deliberate: probing /qr before consent must never get to claim
+		// (and so bind, or reject) a browser hash — that would let a
+		// premature guess lock a legitimate user's own consent call out.
+		hash, hasCookie := linkBrowserHash(r)
+		if !hasCookie {
+			linkBrowserMismatch(w)
+			return
+		}
+		var ok bool
+		l, ok = s.links.claim(state, hash, pending.SuccessURL)
+		if !ok {
+			linkBrowserMismatch(w)
+			return
+		}
+
 		// The session must outlive this request: the end user has not
 		// scanned anything yet, and the request/response round trip is over
-		// long before that happens. getOrStart guarantees only one caller
-		// ever calls StartLink for this state; everyone else gets the same
-		// placeholder back and falls through to the wait below.
-		l, created = s.links.getOrStart(state, func() (provider.LinkSession, error) {
+		// long before that happens. startPairing guarantees only one caller
+		// ever calls StartLink for this entry; everyone else blocks inside
+		// it until the outcome is already set.
+		if l.startPairing(func() (provider.LinkSession, error) {
 			return p.Linker().StartLink(context.Background())
-		}, pending.SuccessURL)
-
-		if created && l.startError() == nil {
-			go s.pumpLink(state, pending, l)
+		}) {
+			if err := l.startError(); err != nil {
+				s.links.dropFailed(state, l)
+			} else {
+				go s.pumpLink(state, pending, l)
+			}
+		}
+	} else {
+		// The dial was already attempted by an earlier poll (or by this
+		// state's consent-time claim resolving on a previous request); this
+		// poll still has to prove it is the same browser before it can see
+		// anything — a QR code, a status, anything — about that outcome.
+		hash, hasCookie := linkBrowserHash(r)
+		if !hasCookie {
+			linkBrowserMismatch(w)
+			return
+		}
+		if _, ok := s.links.claim(state, hash, ""); !ok {
+			linkBrowserMismatch(w)
+			return
 		}
 	}
 
-	if !created {
-		// Either this poll found an already-installed link (every poll after
-		// the first, the common case), or it just lost the create race for a
-		// brand new one. Either way getOrStart's StartLink for it may still
-		// be in flight; wait for it to resolve, but only up to a bound — a
-		// hung dial must delay this one poll, never every poll for this
-		// state forever, and never report "waiting" for a session that has
-		// already failed.
-		select {
-		case <-l.ready:
-		case <-time.After(5 * time.Second):
-		}
+	select {
+	case <-l.ready:
+	case <-time.After(5 * time.Second):
 	}
 
 	if err := l.startError(); err != nil {
