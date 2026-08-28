@@ -119,7 +119,7 @@ func (a *actor) run() {
 
 		a.setState(stateConnected)
 		log.Info("connected", "reconnects", a.health().Reconnects)
-		a.roster(ctx, log)
+		go a.roster(ctx, log)
 
 		// A connection that holds this long has proved itself; forgive the
 		// failures that led up to it so an account that flaps once a week
@@ -173,11 +173,32 @@ func (a *actor) serve(disc <-chan disconnect) disconnect {
 	}
 }
 
+// rosterTimeout bounds one roster fetch. Fetching the roster can involve the
+// provider library writing thousands of rows of its own bookkeeping (whatsmeow
+// persists every LID mapping the group list mentions, one statement at a
+// time), which on a remote database can take far longer than any message
+// should wait. Past this, freshness loses and the fetch is abandoned.
+const rosterTimeout = 2 * time.Minute
+
+// rosterChunk is how many roster rows one inbox turn writes. A real account's
+// roster can run to tens of thousands of rows, each a round trip to the
+// database; applied in one go they would hold the serve loop — and every
+// inbound message behind it — for as long as that takes. In chunks, the
+// message queued behind a chunk waits for a handful of writes, not all.
+const rosterChunk = 10
+
 // roster refreshes chats, attendees and group membership from the provider's
-// own view. It runs once per connection and is best-effort: a failure here
-// costs metadata freshness, not messages, so it must never stop the actor.
+// own view. It runs once per connection, off the actor goroutine so that the
+// serve loop drains inbound messages while the provider is still answering;
+// the store writes themselves are handed back through the inbox in small
+// chunks, which keeps every write for this account on the one goroutine and
+// in arrival order while letting messages interleave. It is best-effort: a
+// failure here costs metadata freshness, not messages, so it must never stop
+// the actor.
 func (a *actor) roster(ctx context.Context, log *slog.Logger) {
-	chats, attendees, members, err := a.chat.Chats(ctx, a.acct.ID)
+	rctx, cancel := context.WithTimeout(ctx, rosterTimeout)
+	defer cancel()
+	chats, attendees, members, err := a.chat.Chats(rctx, a.acct.ID)
 	if err != nil {
 		log.Warn("loading roster", "err", err)
 		return
@@ -185,28 +206,59 @@ func (a *actor) roster(ctx context.Context, log *slog.Logger) {
 	if len(chats)+len(attendees)+len(members) == 0 {
 		return
 	}
-	// Attendees first, so a chat's members resolve to real people rather than
-	// bare ids for the window between the two writes.
-	for _, at := range attendees {
-		if err := a.rt.store.UpsertAttendee(at, a.acct.ID); err != nil {
-			log.Error("storing attendee", "err", err)
-		}
-	}
-	for _, c := range chats {
-		if err := a.rt.store.UpsertChat(chatOrExisting(a, c)); err != nil {
-			log.Error("storing chat", "chat_id", logChat(c.ID), "err", err)
-		}
-	}
 	byChat := map[string][]model.ChatMember{}
+	var chatIDs []string
 	for _, m := range members {
+		if _, ok := byChat[m.ChatID]; !ok {
+			chatIDs = append(chatIDs, m.ChatID)
+		}
 		byChat[m.ChatID] = append(byChat[m.ChatID], m)
 	}
-	for chatID, ms := range byChat {
-		if err := a.rt.store.ReplaceChatMembers(a.acct.ID, chatID, ms); err != nil {
-			log.Error("storing chat members", "chat_id", logChat(chatID), "err", err)
+
+	var steps []func()
+	// Attendees first, so a chat's members resolve to real people rather than
+	// bare ids for the window between the two writes.
+	for i := 0; i < len(attendees); i += rosterChunk {
+		batch := attendees[i:min(i+rosterChunk, len(attendees))]
+		steps = append(steps, func() {
+			for _, at := range batch {
+				if err := a.rt.store.UpsertAttendee(at, a.acct.ID); err != nil {
+					log.Error("storing attendee", "err", err)
+				}
+			}
+		})
+	}
+	for i := 0; i < len(chats); i += rosterChunk {
+		batch := chats[i:min(i+rosterChunk, len(chats))]
+		steps = append(steps, func() {
+			for _, c := range batch {
+				if err := a.rt.store.UpsertChat(chatOrExisting(a, c)); err != nil {
+					log.Error("storing chat", "chat_id", logChat(c.ID), "err", err)
+				}
+			}
+		})
+	}
+	for i := 0; i < len(chatIDs); i += rosterChunk {
+		batch := chatIDs[i:min(i+rosterChunk, len(chatIDs))]
+		steps = append(steps, func() {
+			for _, chatID := range batch {
+				if err := a.rt.store.ReplaceChatMembers(a.acct.ID, chatID, byChat[chatID]); err != nil {
+					log.Error("storing chat members", "chat_id", logChat(chatID), "err", err)
+				}
+			}
+		})
+	}
+	steps = append(steps, func() {
+		log.Info("roster loaded", "chats", len(chats), "attendees", len(attendees), "members", len(members))
+	})
+	for _, step := range steps {
+		select {
+		case a.inbox <- step:
+		case <-a.ctx.Done():
+			log.Debug("dropping roster; actor is stopping")
+			return
 		}
 	}
-	log.Info("roster loaded", "chats", len(chats), "attendees", len(attendees), "members", len(members))
 }
 
 // markLoggedOut ends the account: the manager clears the device and flips the

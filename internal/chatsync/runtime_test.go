@@ -469,3 +469,41 @@ func TestSinkRejectsForeignAccountID(t *testing.T) {
 		t.Fatal("the foreign account id was logged raw instead of digested")
 	}
 }
+
+// A roster fetch that never returns (whatsmeow bulk-writing thousands of LID
+// mappings against a slow database, say) must not hold up inbound messages:
+// the serve loop, not the roster, is what drains the inbox.
+func TestSlowRosterDoesNotBlockInbound(t *testing.T) {
+	h := newHarness(t)
+	release := make(chan struct{})
+	h.fake.Roster = func(string) ([]model.Chat, []model.Attendee, []model.ChatMember, error) {
+		<-release
+		// Several chunks' worth, so the apply itself is exercised in pieces.
+		var ats []model.Attendee
+		for i := 0; i < 35; i++ {
+			ats = append(ats, model.Attendee{ID: "r" + strconv.Itoa(i), Name: "R"})
+		}
+		return []model.Chat{{ID: "c1", Kind: "direct", Name: "Ada from roster"}}, ats, nil, nil
+	}
+	t.Cleanup(func() { close(release) })
+	acc := h.link(t, "1")
+	if err := h.rt.Attach(acc); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { c, ok := h.rt.HealthFor(acc); return ok && c.State == "connected" })
+	m := model.ChatMessage{ID: "M1", ChatID: "c1", Kind: "text", Text: "hello", SentAt: time.Now(), Sender: model.Attendee{ID: "a1", Name: "Ada"}}
+	h.fake.Sink(acc).Message(acc, m, model.Chat{ID: "c1", Kind: "direct", Name: "Ada"}, m.Sender)
+	waitFor(t, func() bool { _, err := h.db.GetChatMessage(acc, "M1"); return err == nil })
+	waitFor(t, func() bool { return len(h.events()) == 1 })
+
+	// When the roster does arrive it is applied on the actor goroutine, after
+	// the message, and does not clobber what the message already established.
+	release <- struct{}{}
+	waitFor(t, func() bool { return h.recs.Contains("roster loaded") })
+	if c, err := h.db.GetChat(acc, "c1"); err != nil || c.UnreadCount != 1 {
+		t.Fatalf("chat after roster = %+v %v", c, err)
+	}
+	if ats, _ := h.db.ListAttendees(acc, "", 100, 0); len(ats) < 35 {
+		t.Fatalf("roster attendees stored = %d, want >= 35", len(ats))
+	}
+}

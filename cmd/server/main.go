@@ -140,6 +140,7 @@ func run(log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		wa.RosterGroups = cfg.WhatsAppRosterGroups
 		registry.Add(wa)
 	}
 	acctMgr.SetRegistry(registry)

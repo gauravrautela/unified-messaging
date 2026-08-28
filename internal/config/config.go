@@ -73,6 +73,14 @@ type Config struct {
 	// WhatsAppDeviceName is what the end user sees in WhatsApp's own "Linked
 	// devices" list after pairing.
 	WhatsAppDeviceName string
+	// WhatsAppRosterGroups controls whether connecting an account also scans
+	// its joined groups for the roster. whatsmeow persists every member LID
+	// mapping that scan returns one statement at a time while holding the
+	// lock every inbound decrypt needs, so on a high-latency database the
+	// scan blocks live messages for as long as it runs. Off, groups are still
+	// mirrored as their messages arrive; only the up-front names and member
+	// lists are skipped.
+	WhatsAppRosterGroups bool
 
 	// TrustProxy tells the server it sits behind a TLS-terminating reverse
 	// proxy, so X-Forwarded-Proto may be trusted to decide whether the
@@ -105,9 +113,10 @@ func Load() (*Config, error) {
 		SessionTTL:     time.Duration(envInt("SESSION_TTL_DAYS", 30)) * 24 * time.Hour,
 		SessionMaxAge:  time.Duration(envInt("SESSION_MAX_AGE_DAYS", 90)) * 24 * time.Hour,
 
-		WhatsAppEnabled:     envBool("WHATSAPP_ENABLED", false),
-		WhatsAppMaxAccounts: envInt("WHATSAPP_MAX_ACCOUNTS", 200),
-		WhatsAppDeviceName:  env("WHATSAPP_DEVICE_NAME", "Unified Messaging"),
+		WhatsAppEnabled:      envBool("WHATSAPP_ENABLED", false),
+		WhatsAppMaxAccounts:  envInt("WHATSAPP_MAX_ACCOUNTS", 200),
+		WhatsAppDeviceName:   env("WHATSAPP_DEVICE_NAME", "Unified Messaging"),
+		WhatsAppRosterGroups: envBool("WHATSAPP_ROSTER_GROUPS", true),
 
 		TrustProxy: envBool("TRUST_PROXY", false),
 
