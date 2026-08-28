@@ -75,6 +75,24 @@
     return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
 
+  // accountState turns an account into the one badge a human needs: a pill
+  // class, a label in words, and a single line of supporting detail. It is the
+  // only place the raw socket state is read, so the dashboard and the chat page
+  // cannot drift into describing the same account differently.
+  function accountState(a) {
+    const c = a.connection;
+    if (a.kind === "chat") {
+      if (a.status === "CREDENTIALS" || (c && c.state === "stopped")) return { cls: "danger", label: "Needs relink", sub: (c && c.last_error) || "" };
+      if (!c) return { cls: "info", label: "Connecting", sub: "" };
+      if (c.state === "connected") return { cls: "ok", label: "Connected", sub: "since " + relTime(c.since) + (c.reconnects ? " · " + c.reconnects + " reconnect" + (c.reconnects > 1 ? "s" : "") : "") };
+      if (c.state === "backoff") return { cls: "warn", label: "Reconnecting", sub: "attempt " + c.reconnects + (c.last_error ? ": " + c.last_error : "") };
+      if (c.state === "error") return { cls: "danger", label: "Error", sub: c.last_error || "" };
+      return { cls: "info", label: "Connecting", sub: "" };
+    }
+    if (a.status === "CREDENTIALS") return { cls: "danger", label: "Needs reconnect", sub: "sign in again to resume" };
+    return { cls: "ok", label: "Connected", sub: a.last_synced_at ? "synced " + relTime(a.last_synced_at) : "first sync pending" };
+  }
+
   function poll(fn, ms) {
     let timer = null, stopped = false;
     const tick = async () => { if (stopped || document.hidden) return; try { await fn(); } catch (_) { /* fn reports */ } };
@@ -97,5 +115,5 @@
     });
   }
 
-  window.um = { $, esc, api, notice, confirm, copy, relTime, poll, listNav };
+  window.um = { $, esc, api, notice, confirm, copy, relTime, accountState, poll, listNav };
 })();

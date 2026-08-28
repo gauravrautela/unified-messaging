@@ -600,24 +600,31 @@ func TestPagesRedirectToLoginWithoutSession(t *testing.T) {
 	}
 }
 
-// The dashboard shows which developer is signed in and lets them manage their
-// own API keys; it no longer carries the client-side localStorage key gate.
+// The dashboard shows which developer is signed in and sections them through
+// the shared design system: every panel is addressable by hash, the shared
+// stylesheet and helpers are loaded from /static, and nothing on the page
+// falls back to a browser dialog or to client-side credential storage.
 func TestDashboardShowsDeveloperAndKeysPanel(t *testing.T) {
 	s, _ := newTestServer(t)
-	dev, _ := seedDev(t, s, "dev@x.com")
+	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"dev@x.com", `id="keys"`, `data-action="create-key"`, `id="logout-form"`, "/api/v1/api-keys"} {
+	for _, want := range []string{
+		"a@x.com", `href="#api-keys"`, `id="api-keys"`, `id="webhooks"`, `id="settings"`,
+		"/static/app.js", `aria-current="page"`, "Entropix", "/api/v1/api-keys",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("dashboard missing %q", want)
 		}
 	}
-	if strings.Contains(body, "um_api_key") || strings.Contains(body, `id="gate-form"`) {
-		t.Fatal("dashboard still has the localStorage API-key gate")
+	for _, never := range []string{"alert(", "confirm(", "localStorage"} {
+		if strings.Contains(body, never) {
+			t.Fatalf("dashboard still uses %q", never)
+		}
 	}
 }
 
@@ -646,15 +653,20 @@ func TestDashboardLinksToMailPage(t *testing.T) {
 	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
-
-	if !strings.Contains(rec.Body.String(), `"/mail`) {
-		t.Fatal("dashboard has no link to the mail viewer")
+	body := rec.Body.String()
+	// Top-level nav reaches mail and chat even with zero accounts.
+	for _, want := range []string{`href="/mail"`, `href="/chat"`, `href="/docs"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard nav missing %q", want)
+		}
 	}
 }
 
 // The dashboard offers a provider picker for the connect flow and renders
 // chat accounts with a Reconnect action, a masked-phone helper, and a link
-// into the chat viewer.
+// into the chat viewer. The status badge is never the raw socket state: the
+// human mapping is um.accountState in app.js, which the chat page reuses, so
+// no "c.state" branch may appear in the page itself.
 func TestDashboardShowsProviderPickerAndChatCards(t *testing.T) {
 	s, db := newTestServer(t)
 	dev, _ := seedDev(t, s, "a@x.com")
@@ -662,9 +674,14 @@ func TestDashboardShowsProviderPickerAndChatCards(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest("GET", "/dashboard", nil), dev.ID))
 	body := rec.Body.String()
-	for _, want := range []string{`id="provider"`, `data-action="reconnect"`, `/chat?account_id=`, `maskPhone(`} {
+	for _, want := range []string{`id="connect-dialog"`, `um.accountState(`, `data-action="reconnect"`, `/chat?account_id=`, `maskPhone(`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)
+		}
+	}
+	for _, never := range []string{"c.state", "connection.state"} {
+		if strings.Contains(body, never) {
+			t.Errorf("dashboard interpolates %q instead of going through um.accountState", never)
 		}
 	}
 }
@@ -895,6 +912,16 @@ func TestDashboardRendersWebhookForm(t *testing.T) {
 	for _, want := range []string{`name="kind"`, `value="discord"`, `value="telegram"`, `name="bot_token"`, `name="chat_id"`, `data-kind-fields`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)
+		}
+	}
+	// The event checkboxes are rendered from the Go constants, so a new event
+	// name cannot go missing from the picker.
+	for _, e := range webhookEvents {
+		if !model.KnownEvent(e) {
+			t.Errorf("webhookEvents lists %q, which the API rejects", e)
+		}
+		if !strings.Contains(body, `value="`+e+`"`) {
+			t.Errorf("dashboard event picker missing %q", e)
 		}
 	}
 	// A Discord webhook URL is a bearer credential, and a dashboard ends up in
