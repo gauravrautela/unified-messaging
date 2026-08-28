@@ -319,6 +319,27 @@ func TestBrowserRoutesIsolation(t *testing.T) {
 			},
 		},
 		{
+			name: "root serves the public site and carries no tenant data", route: "GET /{$}",
+			req: httptest.NewRequest(http.MethodGet, "/", nil),
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				if rec.Code != http.StatusOK {
+					t.Errorf("GET /: status=%d, want 200 (body %s)", rec.Code, rec.Body.String())
+				}
+				if strings.Contains(rec.Body.String(), devA.Email) || strings.Contains(rec.Body.String(), devA.ID) {
+					t.Errorf("GET / leaked A's identity: %s", rec.Body.String())
+				}
+			},
+		},
+		{
+			name: "static assets are served without a session", route: "GET /static/",
+			req: httptest.NewRequest(http.MethodGet, "/static/app.css", nil),
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				if rec.Code != http.StatusOK {
+					t.Errorf("GET /static/app.css: status=%d, want 200", rec.Code)
+				}
+			},
+		},
+		{
 			name: "healthz is public and sets no cookie", route: "GET /healthz",
 			req: httptest.NewRequest(http.MethodGet, "/healthz", nil),
 			check: func(t *testing.T, rec *httptest.ResponseRecorder) {

@@ -26,6 +26,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
 type Server struct {
@@ -137,6 +138,9 @@ var apiRoutes = []string{
 var browserRoutes = []string{
 	"GET /healthz",
 
+	"GET /{$}",
+	"GET /static/",
+
 	"GET /connect/{state}",
 	"POST /connect/{state}/consent",
 	"GET /connect/{state}/qr",
@@ -197,6 +201,10 @@ func (s *Server) browserHandlers() map[string]http.HandlerFunc {
 			}
 			writeJSON(w, status, body)
 		},
+
+		// --- public product website + embedded static assets ---
+		"GET /{$}":     s.handleSite,
+		"GET /static/": web.Static().ServeHTTP,
 
 		// --- connection flow (browser-facing; no API key) ---
 		"GET /connect/{state}":          s.handleConnectRedirect,

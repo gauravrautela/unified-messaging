@@ -1,0 +1,12 @@
+{{define "layout_site_start"}}{{template "layout_head" .}}
+<link rel="stylesheet" href="/static/site.css?v={{.Shell.Version}}">
+<header class="topbar site-bar">
+  <a class="wordmark" href="/">Entro<b>pix</b></a>
+  <nav aria-label="Site"><a href="#features">Features</a><a href="#providers">Providers</a><a href="/docs">Docs</a></nav>
+  <span class="spacer"></span>
+  {{if .Shell.Email}}<a class="btn sm" href="/dashboard">Dashboard</a>{{else}}<a class="btn ghost sm" href="/login">Sign in</a><a class="btn primary sm" href="/signup">Get API key</a>{{end}}
+</header>
+{{end}}
+
+{{define "layout_site_end"}}<div id="notice" aria-live="polite"></div>
+</body></html>{{end}}

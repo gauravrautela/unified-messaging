@@ -17,7 +17,22 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/notify"
 	"github.com/gauravrautela/unified-messaging/internal/store"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
+
+// handleSite is the public product website. It is the only page that
+// renders for both anonymous and signed-in visitors on the same route.
+func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
+	email := ""
+	if dev, ok := s.sessionDeveloper(w, r); ok {
+		email = dev.Email
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = web.Templates().ExecuteTemplate(w, "site", map[string]any{
+		"Shell": web.Shell{Title: "Entropix", Version: web.Version, Email: email},
+	})
+}
 
 // ---- accounts ----
 

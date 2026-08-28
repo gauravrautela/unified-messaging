@@ -4015,3 +4015,23 @@ func TestNotifyFailureScrubsTheTargetURL(t *testing.T) {
 		t.Fatalf("the logged notify_url was not scrubbed: %v", recs.All())
 	}
 }
+
+func TestRootServesWebsiteAndStaticIsCacheable(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Entropix") {
+		t.Fatalf("GET / = %d %q", rec.Code, rec.Body.String()[:min(200, rec.Body.Len())])
+	}
+	if rec.Header().Get("Content-Security-Policy") == "" {
+		t.Fatal("website served without CSP")
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/app.js", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("static: %d cache=%q", rec.Code, rec.Header().Get("Cache-Control"))
+	}
+}
