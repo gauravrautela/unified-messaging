@@ -541,11 +541,17 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	}
 	body := rec.Body.String()
 
-	start := strings.Index(body, `href="`)
+	// The landing page renders through the shared public layout now, so the
+	// first href in the document is the stylesheet's. The authorize URL is the
+	// one the Continue button carries, and pinning it to that button is also
+	// what keeps this test honest: it asserts the link the end user actually
+	// clicks, not whichever href happens to come first in the markup.
+	const continueHref = `<a class="btn primary" href="`
+	start := strings.Index(body, continueHref)
 	if start == -1 {
-		t.Fatalf("no link found in landing page: %s", body)
+		t.Fatalf("no authorize link found in landing page: %s", body)
 	}
-	start += len(`href="`)
+	start += len(continueHref)
 	end := strings.Index(body[start:], `"`)
 	if end == -1 {
 		t.Fatalf("malformed href in landing page: %s", body)
