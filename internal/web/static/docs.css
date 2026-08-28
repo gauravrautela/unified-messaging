@@ -1,0 +1,98 @@
+/* Entropix developer reference. Loaded only by /docs, after app.css, so the
+   three-column reading layout and the endpoint blocks cost nothing on any
+   other page. Every colour here is an app.css token: this file adds shape,
+   never a second palette. */
+
+/* main.page already sets a max-width, so the reading layout has to beat it
+   on specificity rather than tie with it. */
+main.page.docs{max-width:88rem;display:grid;gap:var(--s6);grid-template-columns:15rem minmax(0,1fr) 22rem;align-items:start}
+
+/* --- left rail: contents --- */
+.docs .toc-wrap{position:sticky;top:calc(52px + var(--s5));max-height:calc(100dvh - 52px - var(--s7));overflow:auto;font-size:13px}
+.docs .toc-wrap > summary{display:none}
+.docs .toc h2{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:var(--s4) 0 var(--s2)}
+.docs .toc h2:first-of-type{margin-top:0}
+.docs .toc ul{list-style:none;margin:0;padding:0}
+.docs .toc li{margin:0}
+.docs .toc a{display:flex;align-items:center;gap:6px;padding:3px var(--s2);border-radius:var(--r1);color:var(--muted);text-decoration:none;border-left:2px solid transparent}
+.docs .toc a:hover{background:var(--surface-2);color:var(--text)}
+.docs .toc a[aria-current=true]{color:var(--text);background:var(--surface-2);border-left-color:var(--accent)}
+.docs .toc a .m{flex:none}
+.docs .toc a code{min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.docs #toc-filter{margin-bottom:var(--s3)}
+.docs .toc .none{color:var(--muted);padding:var(--s2);display:none}
+.docs .toc.empty .none{display:block}
+
+/* --- middle: the reference itself --- */
+.docs .body{min-width:0}
+.docs .body h2{font-size:19px;margin:var(--s7) 0 var(--s3);padding-top:var(--s4);border-top:1px solid var(--border);scroll-margin-top:calc(52px + var(--s4))}
+.docs .body > section:first-of-type > h2{margin-top:var(--s5);border-top:0;padding-top:0}
+.docs .body p,.docs .body li{max-width:68ch}
+.docs .lede{font-size:16px;color:var(--muted);max-width:60ch}
+.docs .steps{counter-reset:step;list-style:none;padding:0;margin:0}
+.docs .steps > li{counter-increment:step;position:relative;padding-left:var(--s6);margin:0 0 var(--s5)}
+.docs .steps > li::before{content:counter(step);position:absolute;left:0;top:0;width:22px;height:22px;border-radius:50%;
+  background:var(--accent-bg);color:var(--accent);font:600 12px/22px var(--mono);text-align:center}
+.docs .steps > li > b{display:block;margin-bottom:var(--s1)}
+.docs .note{border-left:3px solid var(--accent);background:var(--surface);padding:var(--s3) var(--s4);border-radius:0 var(--r1) var(--r1) 0;margin:var(--s4) 0}
+.docs .note.warn{border-left-color:var(--warn)}
+
+/* --- method chips --- */
+.m{display:inline-block;font:600 11px/1.5 var(--mono);padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--muted)}
+.m.GET{background:var(--ok-bg);color:var(--ok)}
+.m.POST{background:var(--info-bg);color:var(--info)}
+.m.PUT,.m.PATCH{background:var(--warn-bg);color:var(--warn)}
+.m.DELETE{background:var(--danger-bg);color:var(--danger)}
+
+/* --- endpoint blocks --- */
+.docs .endpoint{border:1px solid var(--border);background:var(--surface);border-radius:var(--r2);padding:var(--s4);margin:0 0 var(--s4);scroll-margin-top:calc(52px + var(--s4))}
+.docs .endpoint > h3{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;font-size:14px;margin:0 0 var(--s2)}
+.docs .endpoint > h3 code{font-size:13px;word-break:break-all}
+.docs .endpoint > h3 .anchor{color:var(--muted);text-decoration:none;opacity:0;font-weight:400}
+.docs .endpoint > h3:hover .anchor,.docs .endpoint > h3 .anchor:focus-visible{opacity:1}
+.docs .endpoint h4{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:var(--s4) 0 var(--s2)}
+.docs .endpoint .table{font-size:13px;margin-bottom:var(--s2)}
+.docs .endpoint .table th,.docs .endpoint .table td{padding:var(--s2) var(--s3) var(--s2) 0}
+.docs .endpoint .table td:first-child{white-space:nowrap;font-family:var(--mono);font-size:12px}
+.docs .req{color:var(--danger);font-weight:600}
+
+/* --- code panes, tabs and copy --- */
+.docs pre{font-size:12.5px;line-height:1.55;max-height:32rem}
+.docs .pane{position:relative}
+.docs .pane > pre{margin:0}
+.docs .copy{position:absolute;top:var(--s2);right:var(--s2);opacity:0;transition:opacity .12s}
+.docs .pane:hover .copy,.docs .copy:focus-visible{opacity:1}
+.docs .snippet{margin:var(--s2) 0 var(--s4)}
+.docs .snippet .tabs{margin:0 0 var(--s1);border-bottom:0;align-items:center}
+.docs .snippet .tabs button{background:none;border:0;font:inherit;font-size:13px;color:var(--muted);cursor:pointer;
+  padding:var(--s2) var(--s3);border-bottom:2px solid transparent;border-radius:var(--r1) var(--r1) 0 0}
+.docs .snippet .tabs button:hover{color:var(--text)}
+.docs .snippet .tabs button[aria-selected=true]{color:var(--text);border-bottom-color:var(--accent)}
+.docs .snippet .tabs .spacer{flex:1}
+
+/* --- events and errors --- */
+.docs .event{border:1px solid var(--border);background:var(--surface);border-radius:var(--r2);padding:var(--s4);margin-bottom:var(--s4);scroll-margin-top:calc(52px + var(--s4))}
+.docs .event > h3{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;font-family:var(--mono);font-size:13px}
+.docs .errors td:first-child{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+.docs .errors td:nth-child(2){white-space:nowrap}
+
+/* --- right rail --- */
+.docs .rail{position:sticky;top:calc(52px + var(--s5));display:flex;flex-direction:column;gap:var(--s4);font-size:13px}
+.docs .rail .card-body{padding:var(--s3) var(--s4)}
+.docs .rail h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 var(--s2)}
+.docs .rail pre{padding:var(--s2) var(--s3);font-size:12px;margin:0}
+.docs .rail ul{list-style:none;margin:0;padding:0;columns:2;column-gap:var(--s3)}
+.docs .rail ul a{display:block;padding:2px 0;font-family:var(--mono);font-size:12px;text-decoration:none}
+.docs .rail ul a:hover{text-decoration:underline}
+
+@media (max-width:64rem){
+  main.page.docs{grid-template-columns:14rem minmax(0,1fr)}
+  .docs .rail{display:none}
+}
+@media (max-width:48rem){
+  main.page.docs{grid-template-columns:minmax(0,1fr);gap:var(--s4)}
+  .docs .toc-wrap{position:static;max-height:none;border:1px solid var(--border);border-radius:var(--r2);background:var(--surface);padding:var(--s3)}
+  .docs .toc-wrap > summary{display:list-item;cursor:pointer;font-weight:600}
+  .docs .toc-wrap[open] > summary{margin-bottom:var(--s3)}
+  .docs .copy{opacity:1}
+}

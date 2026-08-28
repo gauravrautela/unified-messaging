@@ -23,7 +23,7 @@ func (s *Server) handleLLMsTxt(w http.ResponseWriter, r *http.Request) {
 
 var llmsTmpl = template.Must(template.New("llms").Parse(llmsTxt))
 
-const llmsTxt = `# Unified Messaging API
+const llmsTxt = `# Entropix API
 
 > One REST API to connect end users' mailboxes (Outlook / Microsoft 365) and WhatsApp numbers, read and send mail or chat messages in a provider-neutral shape, and receive signed webhooks when something arrives. Multi-tenant: every resource belongs to exactly one developer.
 

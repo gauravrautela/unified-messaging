@@ -1,0 +1,54 @@
+{{define "login"}}{{template "layout_public_start" .}}{{template "login_content" .}}{{template "layout_public_end" .}}{{end}}
+
+{{define "login_content"}}
+<h1>{{.P.Title}}</h1>
+<p class="muted">{{.P.Lead}}</p>
+{{if .P.Error}}<p class="alert error" role="alert">{{.P.Error}}</p>{{end}}
+<form method="post" action="{{.P.Action}}" id="auth">
+  <input type="hidden" name="csrf" value="{{.P.CSRF}}">
+  <div class="field">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email" required value="{{.P.Email}}" autofocus>
+  </div>
+  <div class="field">
+    <label for="password">Password</label>
+    <div style="display:flex;gap:var(--s2)">
+      <input id="password" name="password" type="password" required
+             autocomplete="{{if .P.Signup}}new-password{{else}}current-password{{end}}"
+             {{if .P.Signup}}minlength="10"{{end}}>
+      <button class="btn" type="button" id="toggle" aria-pressed="false" aria-controls="password" style="flex:none">Show</button>
+    </div>
+    {{if .P.Signup}}<p class="hint">At least 10 characters.</p>{{end}}
+  </div>
+  {{if .P.Signup}}
+  <div class="field">
+    <label for="name">Name <span class="muted">(optional)</span></label>
+    <input id="name" name="name" autocomplete="name">
+  </div>
+  {{end}}
+  <button class="btn primary" type="submit" id="submit" style="width:100%;justify-content:center">{{.P.Button}}</button>
+</form>
+<p class="muted small" style="margin-bottom:0">{{.P.AltLead}} <a href="{{.P.AltHref}}">{{.P.AltText}}</a> · <a href="/docs">Docs</a></p>
+<script>
+// app.js is deferred, so nothing here may touch window.um or anything in
+// layout_end at parse time. DOMContentLoaded fires after every deferred
+// script has run and the whole document exists.
+document.addEventListener("DOMContentLoaded", function () {
+  var pw = document.getElementById("password"), t = document.getElementById("toggle");
+  t.addEventListener("click", function () {
+    var shown = pw.type === "text";
+    pw.type = shown ? "password" : "text";
+    t.textContent = shown ? "Show" : "Hide";
+    t.setAttribute("aria-pressed", String(!shown));
+    pw.focus();
+  });
+  var f = document.getElementById("auth"), b = document.getElementById("submit");
+  // The browser fires submit only once the form is valid, so disabling here
+  // cannot lock someone out of a form they still have to fix.
+  f.addEventListener("submit", function () { b.disabled = true; b.textContent = {{.P.Pending}}; });
+  // Coming back with the Back button restores the page from the bfcache with
+  // the button still disabled, which looks like a broken form.
+  window.addEventListener("pageshow", function () { b.disabled = false; b.textContent = {{.P.Button}}; });
+});
+</script>
+{{end}}
