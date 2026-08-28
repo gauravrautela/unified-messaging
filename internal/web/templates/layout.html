@@ -1,6 +1,6 @@
 {{define "layout_head"}}<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{.Shell.Title}} · Entropix</title>
+<title>{{if .Shell.Title}}{{.Shell.Title}} · {{end}}Entropix</title>
 <link rel="stylesheet" href="/static/app.css?v={{.Shell.Version}}">
 <script src="/static/app.js?v={{.Shell.Version}}" defer></script>
 </head><body>{{end}}

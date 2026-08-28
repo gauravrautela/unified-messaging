@@ -37,7 +37,7 @@ func version() string {
 
 // Shell is what every layout needs regardless of page.
 type Shell struct {
-	Title   string // "<Title> · Entropix"
+	Title   string // rendered as "<Title> · Entropix"; "" (e.g. the homepage) renders bare "Entropix"
 	Version string // web.Version, for cache-busting static URLs
 	Email   string // signed-in developer, "" when anonymous
 	CSRF    string // logout form; "" on public pages
@@ -45,7 +45,10 @@ type Shell struct {
 }
 
 // Static serves /static/{file}. Everything under it is content-addressed by
-// Version, so it is safe to cache forever.
+// Version, so it is safe to cache forever — but only once we know the file
+// actually exists: setting the immutable header unconditionally would have a
+// 404 for a missing or mistyped asset cached by the browser (and any shared
+// cache in front of it) for a year too.
 func Static() http.Handler {
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -54,6 +57,12 @@ func Static() http.Handler {
 	files := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "..") {
+			http.NotFound(w, r)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/static/")
+		info, err := fs.Stat(sub, name)
+		if err != nil || info.IsDir() {
 			http.NotFound(w, r)
 			return
 		}

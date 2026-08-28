@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -20,6 +21,23 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
+// renderPage executes the named web template into a buffer before writing
+// anything to w, so a template error (a typo'd field, a page added to
+// Templates() without every layout it needs) becomes a clean 500 instead of
+// a 200 whose body silently cuts off mid-render. Later page handlers should
+// call this rather than writing headers and executing a template by hand.
+func (s *Server) renderPage(w http.ResponseWriter, name string, data any) {
+	var buf bytes.Buffer
+	if err := web.Templates().ExecuteTemplate(&buf, name, data); err != nil {
+		s.log.Error("render page", "page", name, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
+}
+
 // handleSite is the public product website. It is the only page that
 // renders for both anonymous and signed-in visitors on the same route.
 func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
@@ -27,10 +45,10 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 	if dev, ok := s.sessionDeveloper(w, r); ok {
 		email = dev.Email
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_ = web.Templates().ExecuteTemplate(w, "site", map[string]any{
-		"Shell": web.Shell{Title: "Entropix", Version: web.Version, Email: email},
+	// Title is left blank: layout_head renders a bare "Entropix" title when
+	// Title is empty, rather than the homepage repeating the name twice.
+	s.renderPage(w, "site", map[string]any{
+		"Shell": web.Shell{Version: web.Version, Email: email},
 	})
 }
 
