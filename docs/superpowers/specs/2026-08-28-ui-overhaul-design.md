@@ -151,10 +151,12 @@ slide-over under 48rem; heights use `100dvh`), `dialog` styling.
   instead of asking for a reload. Polling uses `um.poll` (pauses when hidden,
   stops on terminal states).
 - Result pages (`renderMessage` in `handlers_connect.go`) move onto the public
-  shell: success shows the connected identity and a **Continue** button to
-  `success_redirect_url` when set, otherwise "You can return to the app";
-  the account id sits behind a `<details>` "Details" with copy. Failure pages
-  show a human title and the provider's error text only under "Details".
+  shell. When `success_redirect_url` is set the server keeps redirecting
+  (302) straight to it — that is documented contract for both providers —
+  so the success page only renders when there is no redirect: it shows the
+  connected identity, "You can return to the app now", and the account id
+  behind a `<details>` "Details" with copy. Failure pages show a human title
+  and the provider's error text only under "Details".
 
 ## 4. Mail (`/mail`) and Chat (`/chat`)
 
