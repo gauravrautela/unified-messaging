@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 )
@@ -39,7 +40,9 @@ func (c *Client) SyncMessages(ctx context.Context, accountID string, scope provi
 		}
 	}
 
-	for next != "" {
+	// component plus the one id the context cannot already know; see do().
+	log := logx.From(ctx).With("component", "outlook", "scope_id", scope.ID)
+	for pageNum := 1; next != ""; pageNum++ {
 		var page messagesPage
 		err := c.do(ctx, accountID, request{
 			method:  http.MethodGet,
@@ -50,6 +53,8 @@ func (c *Client) SyncMessages(ctx context.Context, accountID string, scope provi
 		if err != nil {
 			return res, err
 		}
+		log.Debug("delta page", "page", pageNum, "items", len(page.Value),
+			"next", page.NextLink != "", "delta", page.DeltaLink != "")
 
 		for _, m := range page.Value {
 			if m.Removed != nil {
@@ -122,7 +127,9 @@ func (c *Client) ListAttachments(ctx context.Context, accountID, messageID strin
 	err := c.do(ctx, accountID, request{
 		method: http.MethodGet,
 		url: "/me/messages/" + url.PathEscape(messageID) +
-			"/attachments?$select=id,name,contentType,size,isInline,contentId",
+			// contentId exists only on the fileAttachment subtype; selecting it on
+			// the base attachment collection is a 400 on the real service.
+			"/attachments?$select=id,name,contentType,size,isInline",
 		out: &page,
 	})
 	if err != nil {

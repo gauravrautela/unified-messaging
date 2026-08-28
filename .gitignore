@@ -2,4 +2,7 @@ bin/
 *.db
 *.db-wal
 *.db-shm
+unified-messaging.db.pre-tenancy*
 .env
+.idea/
+.superpowers/

@@ -1,0 +1,204 @@
+package notify
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/gauravrautela/unified-messaging/internal/model"
+)
+
+func capture(t *testing.T, code int, body string) (*httptest.Server, *[]map[string]any, *http.Header) {
+	t.Helper()
+	var got []map[string]any
+	var hdr http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		m["_path"] = r.URL.Path
+		got = append(got, m)
+		hdr = r.Header.Clone()
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &got, &hdr
+}
+
+var chatEv = model.Event{Type: model.EventChatReceived, AccountID: "acc_1",
+	Chat: &model.Chat{Name: "Team"}, Message: &model.ChatMessage{Sender: model.Attendee{Name: "Ada"}, Text: "hello *world*"}}
+
+func TestWebhookSenderKeepsHeadersAndSignature(t *testing.T) {
+	srv, got, hdr := capture(t, 200, "")
+	s, _ := NewRegistry(srv.Client()).For(model.WebhookKindWebhook)
+	h := model.Webhook{Kind: model.WebhookKindWebhook, URL: srv.URL, Secret: "s3"}
+	if err := s.Send(context.Background(), h, chatEv, []byte(`{"type":"chat_received"}`), 2); err != nil {
+		t.Fatal(err)
+	}
+	if (*got)[0]["type"] != "chat_received" || hdr.Get("X-Outlook-Event") != "chat_received" ||
+		hdr.Get("X-Outlook-Delivery") != "2" || !strings.HasPrefix(hdr.Get("X-Outlook-Signature"), "sha256=") {
+		t.Fatalf("got %v headers %v", *got, *hdr)
+	}
+}
+
+func TestWebhookSenderOmitsSignatureWithoutSecret(t *testing.T) {
+	srv, _, hdr := capture(t, 200, "")
+	s, _ := NewRegistry(srv.Client()).For(model.WebhookKindWebhook)
+	h := model.Webhook{Kind: model.WebhookKindWebhook, URL: srv.URL}
+	if err := s.Send(context.Background(), h, chatEv, []byte(`{"type":"chat_received"}`), 1); err != nil {
+		t.Fatal(err)
+	}
+	if sig := hdr.Get("X-Outlook-Signature"); sig != "" {
+		t.Fatalf("signature header present without secret: %q", sig)
+	}
+}
+
+func TestDiscordSenderPostsFormattedContentWithoutMentions(t *testing.T) {
+	srv, got, _ := capture(t, 204, "")
+	reg := NewRegistry(srv.Client())
+	s, _ := reg.For(model.WebhookKindDiscord)
+	err := s.Send(context.Background(), model.Webhook{Kind: model.WebhookKindDiscord, URL: srv.URL + "/api/webhooks/1/tok"}, chatEv, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := (*got)[0]
+	content, _ := m["content"].(string)
+	if !strings.Contains(content, `hello \*world\*`) || !strings.Contains(content, "**Ada**") {
+		t.Fatalf("content = %q", content)
+	}
+	am, _ := m["allowed_mentions"].(map[string]any)
+	if parse, ok := am["parse"].([]any); !ok || len(parse) != 0 {
+		t.Fatalf("allowed_mentions = %v", m["allowed_mentions"])
+	}
+}
+
+func TestDiscordSenderTreats429AsFailure(t *testing.T) {
+	srv, _, _ := capture(t, 429, `{"message":"rate limited https://discord.com/api/webhooks/1/leaked-token"}`)
+	s, _ := NewRegistry(srv.Client()).For(model.WebhookKindDiscord)
+	err := s.Send(context.Background(), model.Webhook{Kind: model.WebhookKindDiscord, URL: srv.URL + "/api/webhooks/1/s3cr3t"}, chatEv, nil, 1)
+	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "/api/webhooks/1/•••") ||
+		strings.Contains(err.Error(), "leaked-token") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// Discord caps content at 2000 runes and Telegram text at 4096, both
+// inclusive. Overshooting by even one rune is a 400 — a permanent failure that
+// still burns the whole retry schedule — so the cut has to leave room for the
+// ellipsis truncate appends.
+func TestNotificationsStayWithinTransportCaps(t *testing.T) {
+	long := model.Event{Type: model.EventChatReceived, AccountID: "acc_1",
+		Chat: &model.Chat{Name: "Team"},
+		// The formatter caps the message text at chatSnippet, but a sender name
+		// is uncapped — as are a mail subject and its recipient list — so the
+		// rendered notification can be arbitrarily long.
+		Message: &model.ChatMessage{Sender: model.Attendee{Name: strings.Repeat("n", 5000)}, Text: strings.Repeat("x", 3000)}}
+
+	dsrv, dgot, _ := capture(t, 204, "")
+	ds, _ := NewRegistry(dsrv.Client()).For(model.WebhookKindDiscord)
+	if err := ds.Send(context.Background(), model.Webhook{Kind: model.WebhookKindDiscord,
+		URL: dsrv.URL + "/api/webhooks/1/tok"}, long, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	content, _ := (*dgot)[0]["content"].(string)
+	if n := utf8.RuneCountInString(content); n > discordMax {
+		t.Errorf("discord content = %d runes, want <= %d", n, discordMax)
+	}
+
+	tsrv, tgot, _ := capture(t, 200, `{"ok":true}`)
+	reg := NewRegistry(tsrv.Client())
+	reg.SetTelegramBase(tsrv.URL)
+	ts, _ := reg.For(model.WebhookKindTelegram)
+	if err := ts.Send(context.Background(), model.Webhook{Kind: model.WebhookKindTelegram,
+		Telegram: &model.TelegramTarget{BotToken: "123:ABC", ChatID: "-100"}}, long, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	text, _ := (*tgot)[0]["text"].(string)
+	if n := utf8.RuneCountInString(text); n > telegramMax {
+		t.Errorf("telegram text = %d runes, want <= %d", n, telegramMax)
+	}
+}
+
+func TestTelegramSenderUsesBotTokenPathAndHTML(t *testing.T) {
+	srv, got, _ := capture(t, 200, `{"ok":true}`)
+	reg := NewRegistry(srv.Client())
+	reg.SetTelegramBase(srv.URL)
+	s, _ := reg.For(model.WebhookKindTelegram)
+	h := model.Webhook{Kind: model.WebhookKindTelegram, Telegram: &model.TelegramTarget{BotToken: "123:ABC", ChatID: "-100"}}
+	if err := s.Send(context.Background(), h, chatEv, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	m := (*got)[0]
+	if m["_path"] != "/bot123:ABC/sendMessage" || m["chat_id"] != "-100" || m["parse_mode"] != "HTML" ||
+		m["disable_web_page_preview"] != true || !strings.Contains(m["text"].(string), "<b>Ada</b>") {
+		t.Fatalf("request = %v", m)
+	}
+}
+
+func TestTelegramSenderErrorsCarryDescriptionNotToken(t *testing.T) {
+	srv, _, _ := capture(t, 400, `{"ok":false,"description":"Bad Request: chat not found"}`)
+	reg := NewRegistry(srv.Client())
+	reg.SetTelegramBase(srv.URL)
+	s, _ := reg.For(model.WebhookKindTelegram)
+	h := model.Webhook{Kind: model.WebhookKindTelegram, Telegram: &model.TelegramTarget{BotToken: "123:ABC", ChatID: "-100"}}
+	err := s.Send(context.Background(), h, chatEv, nil, 1)
+	if err == nil || !strings.Contains(err.Error(), "chat not found") || strings.Contains(err.Error(), "123:ABC") {
+		t.Fatalf("err = %v", err)
+	}
+	// A hook whose config could not be unsealed fails clearly, not with a panic.
+	err = s.Send(context.Background(), model.Webhook{Kind: model.WebhookKindTelegram, Telegram: &model.TelegramTarget{}}, chatEv, nil, 1)
+	if err == nil || !strings.Contains(err.Error(), "config unreadable") {
+		t.Fatalf("empty config err = %v", err)
+	}
+}
+
+func TestValidateTelegram(t *testing.T) {
+	ok, _, _ := capture(t, 200, `{"ok":true,"result":{"id":-100}}`)
+	reg := NewRegistry(ok.Client())
+	reg.SetTelegramBase(ok.URL)
+	if err := reg.ValidateTelegram(context.Background(), "1:A", "-100"); err != nil {
+		t.Fatal(err)
+	}
+	bad, _, _ := capture(t, 400, `{"ok":false,"description":"chat not found"}`)
+	reg = NewRegistry(bad.Client())
+	reg.SetTelegramBase(bad.URL)
+	err := reg.ValidateTelegram(context.Background(), "1:A", "-100")
+	if !errors.Is(err, ErrTelegramRejected) || !strings.Contains(err.Error(), "chat not found") {
+		t.Fatalf("err = %v", err)
+	}
+	reg = NewRegistry(&http.Client{})
+	reg.SetTelegramBase("http://127.0.0.1:1")
+	err = reg.ValidateTelegram(context.Background(), "1:A", "-100")
+	if err == nil || errors.Is(err, ErrTelegramRejected) {
+		t.Fatalf("unreachable must be a transport error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "1:A") {
+		t.Fatalf("err leaks bot token: %v", err)
+	}
+}
+
+func TestTelegramCallRequires2xxEvenWhenOK(t *testing.T) {
+	srv, _, _ := capture(t, 500, `{"ok":true}`)
+	reg := NewRegistry(srv.Client())
+	reg.SetTelegramBase(srv.URL)
+	err := reg.ValidateTelegram(context.Background(), "1:A", "-100")
+	if err == nil || errors.Is(err, ErrTelegramRejected) || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUnknownKind(t *testing.T) {
+	if _, ok := NewRegistry(&http.Client{}).For("slack"); ok {
+		t.Fatal("slack is not a kind")
+	}
+	if s, ok := NewRegistry(&http.Client{}).For(""); !ok || s == nil {
+		t.Fatal(`For("") should default to the webhook sender`)
+	}
+}

@@ -31,9 +31,24 @@ var (
 	// ErrNotFound is a missing message, folder, or subscription.
 	ErrNotFound = errors.New("provider: not found")
 
+	// ErrNotConnected means the account is known and healthy but has no live
+	// session to the provider right now — a chat socket in backoff, say.
+	// Deliberately distinct from ErrNotFound: the resource exists, the caller
+	// owns it, and the right answer is to retry or reconnect, not to conclude
+	// it is gone.
+	ErrNotConnected = errors.New("provider: not connected")
+
 	// ErrSubscriptionExists means an equivalent push subscription is already
 	// registered upstream, typically because our local record was lost.
 	ErrSubscriptionExists = errors.New("provider: subscription already exists")
+
+	// ErrLinkTimeout means a link session's pairing window elapsed before the
+	// end user scanned the code.
+	ErrLinkTimeout = errors.New("provider: link timed out")
+
+	// ErrLinkCancelled means the end user (or the caller) cancelled an in-flight
+	// link session.
+	ErrLinkCancelled = errors.New("provider: link cancelled")
 )
 
 // Token is an OAuth grant, stripped of provider specifics.
@@ -46,8 +61,9 @@ type Token struct {
 
 // Identity is who a freshly connected grant belongs to.
 type Identity struct {
-	Email string
-	Name  string
+	Identifier string
+	Email      string
+	Name       string
 }
 
 // TokenSource hands out a valid access token for a connected account.
@@ -215,14 +231,73 @@ type Pusher interface {
 	ValidationResponse(query url.Values) (body string, ok bool)
 }
 
-// Provider bundles one backend's capabilities.
+// Provider is one backend. Capabilities are optional: a mail provider returns
+// nil from Linker() and Chat(); a chat provider returns nil from Auth(),
+// Mailbox() and Push(). Callers test capabilities, never names.
 type Provider interface {
 	// Name is the stable identifier stored on accounts, e.g. "OUTLOOK".
 	Name() string
+	Kind() string // model.AccountKindMail | model.AccountKindChat
 	Auth() Authenticator
+	Linker() Linker
 	Mailbox() Mailbox
+	Chat() Chatter
 	// Push returns nil when this provider cannot deliver push notifications.
 	Push() Pusher
+}
+
+// ---- chat providers (linked device, live socket) ----
+
+type LinkCode struct {
+	Code      string
+	ExpiresAt time.Time
+}
+
+type LinkResult struct {
+	Identity  Identity
+	DeviceJID string
+	Err       error
+}
+
+// LinkSession is one pairing attempt. Codes stream until paired, expired or
+// closed; Result resolves exactly once.
+type LinkSession interface {
+	Codes() <-chan LinkCode
+	Result() <-chan LinkResult
+	Close()
+}
+
+type Linker interface {
+	StartLink(ctx context.Context) (LinkSession, error)
+}
+
+// EventSink receives domain events from a live connection. Implementations
+// must be safe for concurrent use; the adapter calls them from its own
+// goroutines.
+type EventSink interface {
+	Message(accountID string, m model.ChatMessage, chat model.Chat, sender model.Attendee)
+	Receipt(accountID, chatID string, messageIDs []string, status string) // delivered | read
+	Reaction(accountID, chatID, messageID string, r model.Reaction)
+	Edited(accountID, chatID, messageID, text string, at time.Time)
+	Deleted(accountID, chatID, messageID string)
+	Disconnected(accountID, reason string, loggedOut bool)
+}
+
+type ChatConn interface {
+	Close() error
+}
+
+type Chatter interface {
+	Connect(ctx context.Context, accountID, deviceJID string, sink EventSink) (ChatConn, error)
+	Forget(ctx context.Context, deviceJID string) error
+	Chats(ctx context.Context, accountID string) ([]model.Chat, []model.Attendee, []model.ChatMember, error)
+	SendText(ctx context.Context, accountID, chatID, text, quotedID string) (SendResult, error)
+	StartDirect(ctx context.Context, accountID, phoneE164 string) (chatID string, err error)
+	React(ctx context.Context, accountID, chatID, messageID, emoji string) error
+	Edit(ctx context.Context, accountID, chatID, messageID, text string) error
+	Delete(ctx context.Context, accountID, chatID, messageID string) error
+	MarkRead(ctx context.Context, accountID, chatID string, messageIDs []string) error
+	Logout(ctx context.Context, accountID string) error
 }
 
 // Registry resolves a provider by the name recorded on an account.
@@ -236,6 +311,16 @@ func NewRegistry(ps ...Provider) *Registry {
 		r.byName[p.Name()] = p
 	}
 	return r
+}
+
+// Add registers an additional provider after construction, for a backend
+// whose wiring (e.g. reading config, opening its own store handle) is
+// conditional and so cannot always go through the NewRegistry(...) call at
+// startup. Only ever called during startup, before the registry is served
+// to any request handler, so — like the rest of this type — it takes no
+// lock.
+func (r *Registry) Add(p Provider) {
+	r.byName[p.Name()] = p
 }
 
 func (r *Registry) Get(name string) (Provider, error) {

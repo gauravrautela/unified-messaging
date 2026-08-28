@@ -1,29 +1,71 @@
 package api
 
 import (
+	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 )
 
+// maxAttachmentBytes bounds the total decoded size of every attachment on a
+// single send/reply/forward/draft. Enforced server-side, in addition to
+// decodeJSONLarge's 8 MB wire-size cap, because a caller could otherwise pack
+// several base64 blobs that individually pass but together are enormous.
+const maxAttachmentBytes = 3 << 20
+
+// attachmentsTooLarge reports whether the decoded size of every attachment,
+// summed, exceeds maxAttachmentBytes. It uses DecodedLen rather than
+// actually decoding, so an oversized payload is rejected without spending the
+// work of base64-decoding it first.
+func attachmentsTooLarge(atts []model.SendAttachment) bool {
+	var total int
+	for _, a := range atts {
+		total += base64.StdEncoding.DecodedLen(len(a.Content))
+	}
+	return total > maxAttachmentBytes
+}
+
 // resolve validates the ?account_id= every mail route requires and returns the
 // mailbox implementation that owns it.
 func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (model.Account, provider.Mailbox, bool) {
-	return s.resolveID(w, r.URL.Query().Get("account_id"))
+	return s.resolveID(w, r, r.URL.Query().Get("account_id"))
 }
 
-func (s *Server) resolveID(w http.ResponseWriter, id string) (model.Account, provider.Mailbox, bool) {
+// accountID prefers the query string's account_id — the convention every
+// other {id}-in-path mail route uses — and falls back to the request body's,
+// which the documented reply/forward/send payloads also carry. Checking the
+// query first means a caller cannot bypass ownership scoping by putting a
+// different account_id in the body than the one being probed via the URL.
+func accountID(r *http.Request, fromBody string) string {
+	if q := r.URL.Query().Get("account_id"); q != "" {
+		return q
+	}
+	return fromBody
+}
+
+// resolveAccount validates ?account_id (or the given id) against the calling
+// developer and returns the owning provider, with no capability check yet.
+// It is the ownership-only core shared by resolveID (which adds the mailbox
+// check) and resolveChatAccount (which adds the chatter check) — capability
+// checks must happen after ownership so a cross-tenant probe always 404s
+// before it can learn anything about what kind of account it hit.
+func (s *Server) resolveAccount(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Provider, bool) {
+	log := logx.From(r.Context())
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing_account_id", "account_id is required")
 		return model.Account{}, nil, false
 	}
-	acct, err := s.store.GetAccount(id)
+	dev, _ := developerFrom(r.Context())
+	acct, err := s.store.GetAccount(dev.ID, id)
 	if errors.Is(err, store.ErrNotFound) {
+		log.Debug("ownership check", "account_id", id, "result", "not owned or unknown")
 		writeError(w, http.StatusNotFound, "account_not_found", "no such account: "+id)
 		return model.Account{}, nil, false
 	}
@@ -31,9 +73,29 @@ func (s *Server) resolveID(w http.ResponseWriter, id string) (model.Account, pro
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return model.Account{}, nil, false
 	}
-	mailbox, err := s.mailboxFor(acct)
+	log.Debug("ownership check", "account_id", id, "result", "ok", "provider", acct.Provider, "status", acct.Status)
+	p, err := s.registry.Get(acct.Provider)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unknown_provider", err.Error())
+		return model.Account{}, nil, false
+	}
+	return acct, p, true
+}
+
+// resolveID is resolveAccount plus the mail capability check: a chat account
+// has no Mailbox(), so without this a mail handler would dereference a nil
+// interface. Every mail route goes through this (via resolve/accountID),
+// which is what makes "chats on a mail account" and "mail on a chat account"
+// both 400 unsupported_for_kind rather than a panic or a wrong-shaped 200.
+func (s *Server) resolveID(w http.ResponseWriter, r *http.Request, id string) (model.Account, provider.Mailbox, bool) {
+	acct, p, ok := s.resolveAccount(w, r, id)
+	if !ok {
+		return model.Account{}, nil, false
+	}
+	mailbox := p.Mailbox()
+	if mailbox == nil {
+		writeError(w, http.StatusBadRequest, "unsupported_for_kind",
+			"this account is a chat account; use /api/v1/chats")
 		return model.Account{}, nil, false
 	}
 	return acct, mailbox, true
@@ -138,6 +200,7 @@ func (s *Server) handleGetEmail(w http.ResponseWriter, r *http.Request) {
 
 	email, err := s.store.GetEmail(acct.ID, id)
 	if err == nil {
+		s.complete(r.Context(), mailbox, &email)
 		writeJSON(w, http.StatusOK, email)
 		return
 	}
@@ -146,15 +209,55 @@ func (s *Server) handleGetEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A message neither in our mirror nor at the provider is going to keep
+	// answering that way until sync (or the message) catches up, so a repeat
+	// lookup within the TTL is answered from the negative cache instead of
+	// making another upstream call.
+	missKey := acct.ID + "\x00" + id
+	if s.mirrorMiss.hit(missKey) {
+		writeProviderError(w, provider.ErrNotFound)
+		return
+	}
+
 	email, perr := mailbox.GetMessage(r.Context(), acct.ID, id)
 	if perr != nil {
+		if errors.Is(perr, provider.ErrNotFound) {
+			s.mirrorMiss.remember(missKey)
+		}
 		writeProviderError(w, perr)
 		return
 	}
 	if err := s.store.UpsertEmail(email); err != nil {
 		s.log.Warn("caching fetched email", "err", err)
 	}
+	s.complete(r.Context(), mailbox, &email)
 	writeJSON(w, http.StatusOK, email)
+}
+
+// complete fills in what a single-message response should carry beyond the
+// stored row: the folder's well-known role, and attachment metadata (fetched
+// once from the provider, then cached on the row). Failures degrade to the
+// bare fields rather than failing the read.
+func (s *Server) complete(ctx context.Context, mailbox provider.Mailbox, e *model.Email) {
+	if folders, err := s.store.ListFolders(e.AccountID); err == nil {
+		for _, f := range folders {
+			if f.ID == e.FolderID {
+				e.Role = f.Role
+				break
+			}
+		}
+	}
+	if e.HasAttachments && len(e.Attachments) == 0 {
+		atts, err := mailbox.ListAttachments(ctx, e.AccountID, e.ID)
+		if err != nil {
+			s.log.Warn("listing attachments", "account_id", e.AccountID, "email_id", e.ID, "err", err)
+			return
+		}
+		e.Attachments = atts
+		if err := s.store.UpsertEmail(*e); err != nil {
+			s.log.Warn("caching attachments", "err", err)
+		}
+	}
 }
 
 type patchEmailRequest struct {
@@ -169,7 +272,7 @@ func (s *Server) handlePatchEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	var req patchEmailRequest
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+		writeDecodeError(w, err)
 		return
 	}
 	if req.Read == nil && req.Flagged == nil {
@@ -208,11 +311,15 @@ type sendPayload struct {
 
 func (s *Server) handleSendEmail(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
+		return
+	}
+	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
 	if !ok {
 		return
 	}
@@ -245,11 +352,15 @@ func (s *Server) handleSendEmail(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
+		return
+	}
+	acct, mailbox, ok := s.resolveID(w, r, accountID(r, p.AccountID))
 	if !ok {
 		return
 	}
@@ -264,11 +375,15 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
+		return
+	}
+	acct, mailbox, ok := s.resolveID(w, r, accountID(r, p.AccountID))
 	if !ok {
 		return
 	}
@@ -287,11 +402,15 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	var p sendPayload
-	if err := decodeJSON(r, &p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+	if err := decodeJSONLarge(r, &p); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
-	acct, mailbox, ok := s.resolveID(w, p.AccountID)
+	if attachmentsTooLarge(p.Attachments) {
+		writeError(w, http.StatusBadRequest, "attachment_too_large", "attachments exceed 3 MB in total")
+		return
+	}
+	acct, mailbox, ok := s.resolveID(w, r, p.AccountID)
 	if !ok {
 		return
 	}

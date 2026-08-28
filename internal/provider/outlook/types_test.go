@@ -38,6 +38,10 @@ func TestMessageToModel(t *testing.T) {
 	if len(e.To) != 1 || e.To[0].Email != "bob@example.com" {
 		t.Fatalf("to = %+v", e.To)
 	}
+	// Subscribers should not have to strip HTML themselves.
+	if e.BodyPlain != "Here they are" {
+		t.Fatalf("body_plain = %q, want plain text of the html body", e.BodyPlain)
+	}
 	if e.Read || !e.Flagged || !e.HasAttachments {
 		t.Fatalf("flags wrong: read=%v flagged=%v att=%v", e.Read, e.Flagged, e.HasAttachments)
 	}
@@ -85,8 +89,8 @@ func TestRemovedMessageIsDetected(t *testing.T) {
 	}
 }
 
-func TestSnippetFromHTMLStripsMarkupAndScripts(t *testing.T) {
-	got := snippetFrom(`<style>p{color:red}</style><p>Hello&nbsp;&amp; welcome</p><script>x()</script>`, "html")
+func TestPlainTextStripsMarkupAndScripts(t *testing.T) {
+	got := plainText(`<style>p{color:red}</style><p>Hello&nbsp;&amp; welcome</p><script>x()</script>`, "html")
 	want := "Hello & welcome"
 	if got != want {
 		t.Fatalf("snippet = %q, want %q", got, want)

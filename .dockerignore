@@ -1,0 +1,9 @@
+.git
+.superpowers
+docs/superpowers
+*.db
+*.db-wal
+*.db-shm
+unified-messaging.db.pre-tenancy*
+.env
+.idea

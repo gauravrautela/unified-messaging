@@ -1,8 +1,6 @@
 package outlook
 
 import (
-	"html"
-	"regexp"
 	"strings"
 	"time"
 
@@ -148,9 +146,10 @@ func (m graphMessage) toModel(accountID string) model.Email {
 	if m.Body != nil {
 		e.Body = m.Body.Content
 		e.BodyType = strings.ToLower(m.Body.ContentType)
+		e.BodyPlain = plainText(e.Body, e.BodyType)
 	}
-	if e.Snippet == "" && e.Body != "" {
-		e.Snippet = snippetFrom(e.Body, e.BodyType)
+	if e.Snippet == "" && e.BodyPlain != "" {
+		e.Snippet = snippetFrom(e.BodyPlain)
 	}
 	if m.IsRead != nil {
 		e.Read = *m.IsRead
@@ -202,18 +201,10 @@ func parseTime(s string) time.Time {
 
 // Go's RE2 has no backreferences, so script/style blocks are stripped by their
 // own pattern before the generic tag pass.
-var (
-	scriptStyleRE = regexp.MustCompile(`(?is)<(script|style)\b[^>]*>.*?</(script|style)\s*>`)
-	tagRE         = regexp.MustCompile(`(?s)<[^>]*>`)
-)
 
-func snippetFrom(body, bodyType string) string {
-	text := body
-	if bodyType == "html" {
-		stripped := scriptStyleRE.ReplaceAllString(body, " ")
-		text = html.UnescapeString(tagRE.ReplaceAllString(stripped, " "))
-	}
-	text = strings.Join(strings.Fields(text), " ")
+func plainText(body, bodyType string) string { return model.PlainText(body, bodyType) }
+
+func snippetFrom(text string) string {
 	if len(text) > 255 {
 		text = text[:255]
 	}

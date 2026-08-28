@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -76,8 +75,11 @@ func (m *simpleMailbox) SendDraft(context.Context, string, string) error { retur
 type simpleProvider struct{ mb *simpleMailbox }
 
 func (p *simpleProvider) Name() string                 { return "SIMPLE" }
+func (p *simpleProvider) Kind() string                 { return model.AccountKindMail }
 func (p *simpleProvider) Auth() provider.Authenticator { return nil }
+func (p *simpleProvider) Linker() provider.Linker      { return nil }
 func (p *simpleProvider) Mailbox() provider.Mailbox    { return p.mb }
+func (p *simpleProvider) Chat() provider.Chatter       { return nil }
 
 // Push returns nil: this provider has no push mechanism, so the core must fall
 // back to polling instead of erroring.
@@ -86,14 +88,13 @@ func (p *simpleProvider) Push() provider.Pusher { return nil }
 var _ provider.Provider = (*simpleProvider)(nil)
 
 func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "simple.db"))
-	if err != nil {
+	db := store.OpenForTest(t)
+
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-
 	if err := db.UpsertAccount(model.Account{
-		ID: "acc_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	disp := events.NewDispatcher(db, log)
+	disp := events.NewDispatcher(db, nil, log)
 	disp.Start(ctx)
 
 	registry := provider.NewRegistry(&simpleProvider{mb: mb})
@@ -165,21 +166,20 @@ func TestSyncWorksForAProviderWithoutFoldersOrPush(t *testing.T) {
 
 // A provider that cannot push must not break subscription reconciliation.
 func TestEnsureSubscriptionIsNoOpWithoutPush(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "nopush.db"))
-	if err != nil {
+	db := store.OpenForTest(t)
+
+	if err := db.CreateDeveloper(model.Developer{ID: "dev_1", Email: "dev@example.com"}, "hash"); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-
 	if err := db.UpsertAccount(model.Account{
-		ID: "acc_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
+		ID: "acc_1", DeveloperID: "dev_1", Provider: "SIMPLE", Email: "user@example.com", Status: model.AccountOK,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := provider.NewRegistry(&simpleProvider{mb: &simpleMailbox{}})
-	s := New(db, registry, nil, events.NewDispatcher(db, log), log,
+	s := New(db, registry, nil, events.NewDispatcher(db, nil, log), log,
 		Options{PublicBaseURL: "https://example.test"})
 
 	if err := s.EnsureSubscription(context.Background(), "acc_1"); err != nil {

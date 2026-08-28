@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 )
 
@@ -91,7 +92,7 @@ func (a *Auth) Identify(ctx context.Context, accessToken string) (provider.Ident
 	if email == "" {
 		return provider.Identity{}, fmt.Errorf("outlook: could not determine mailbox address")
 	}
-	return provider.Identity{Email: email, Name: p.DisplayName}, nil
+	return provider.Identity{Identifier: email, Email: email, Name: p.DisplayName}, nil
 }
 
 type tokenResponse struct {
@@ -117,18 +118,30 @@ func (a *Auth) token(ctx context.Context, form url.Values) (provider.Token, erro
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
+	// Only the grant type is logged. The form carries the code, the verifier,
+	// the refresh token and the client secret; none of them is loggable.
+	log := logx.From(ctx).With("component", "outlook")
+	log.Debug("token endpoint request", "grant", form.Get("grant_type"))
+
+	start := time.Now()
 	resp, err := a.http.Do(req)
 	if err != nil {
+		log.Debug("token endpoint response", "status", 0,
+			"dur", time.Since(start).Round(time.Millisecond), "err", err)
 		return provider.Token{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	log.Debug("token endpoint response", "status", resp.StatusCode,
+		"bytes", len(body), "dur", time.Since(start).Round(time.Millisecond))
 
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return provider.Token{}, fmt.Errorf("outlook: bad token response (%d): %s", resp.StatusCode, truncate(body))
 	}
 	if tr.Error != "" {
+		// error/error_description are the provider's own diagnostics, not credentials.
+		log.Debug("token endpoint error", "grant", form.Get("grant_type"), "error", tr.Error)
 		// invalid_grant is terminal: revoked, expired, or invalidated by a
 		// password change. Surfacing it as the shared sentinel is what lets the
 		// core mark the account and stop retrying.

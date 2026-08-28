@@ -12,12 +12,15 @@ package syncer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
 	"github.com/gauravrautela/unified-messaging/internal/events"
+	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
@@ -60,6 +63,7 @@ type Syncer struct {
 	accts    *accounts.Manager
 	events   *events.Dispatcher
 	log      *slog.Logger
+	base     *slog.Logger
 	opts     Options
 
 	wake chan string
@@ -75,7 +79,14 @@ func New(s *store.Store, reg *provider.Registry, a *accounts.Manager,
 		opts.PollInterval = 2 * time.Minute
 	}
 	return &Syncer{
-		store: s, registry: reg, accts: a, events: e, log: log, opts: opts,
+		// log is tagged once, so every line this package writes carries
+		// component=syncer without repeating the attribute at each call site.
+		// base is the untagged logger that goes into the context: a context
+		// logger carries correlation ids only and never a component, so a
+		// downstream package (outlook, accounts, store) can tag its own without
+		// emitting two component attributes on one line.
+		store: s, registry: reg, accts: a, events: e,
+		log: log.With("component", "syncer"), base: log, opts: opts,
 		wake:     make(chan string, 256),
 		inflight: map[string]bool{},
 		pending:  map[string]bool{},
@@ -132,8 +143,11 @@ func (s *Syncer) runOnce(ctx context.Context, accountID string) {
 	s.inflight[accountID] = true
 	s.mu.Unlock()
 
-	if err := s.SyncAccount(ctx, accountID); err != nil {
-		s.log.Error("sync failed", "account_id", accountID, "err", err)
+	// The run id is minted here rather than inside the run, so this ERROR line
+	// carries the same run_id as the run's own trail.
+	runID := newRunID()
+	if err := s.syncAccount(ctx, accountID, runID); err != nil {
+		s.log.Error("sync failed", "run_id", runID, "account_id", accountID, "err", err)
 	}
 
 	s.mu.Lock()
@@ -155,62 +169,104 @@ func (s *Syncer) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			accts, err := s.store.ListAccounts()
-			if err != nil {
-				s.log.Error("listing accounts for poll", "err", err)
-				continue
-			}
-			for _, a := range accts {
-				if a.Status == model.AccountOK {
-					s.Wake(a.ID)
-				}
-			}
+			s.pollOnce(ctx)
 		}
 	}
 }
 
-// mailboxFor resolves the provider that owns an account.
+func (s *Syncer) pollOnce(ctx context.Context) {
+	accts, err := s.store.ListAllAccounts()
+	if err != nil {
+		s.log.Error("listing accounts for poll", "err", err)
+		return
+	}
+	n := 0
+	for _, a := range accts {
+		if a.Status != model.AccountOK {
+			continue
+		}
+		p, err := s.registry.Get(a.Provider)
+		if err != nil || p.Kind() != model.AccountKindMail {
+			s.log.Debug("skipping non-mail account", "account_id", a.ID, "provider", a.Provider)
+			continue
+		}
+		n++
+		s.Wake(a.ID)
+	}
+	s.log.Debug("poll tick", "accounts", len(accts), "ok", n)
+}
+
+// mailboxFor resolves the provider that owns an account. A chat account's
+// provider has no Mailbox at all, which would otherwise leave callers to
+// dereference a nil interface — surfacing that as an error here means a
+// misrouted Wake logs and returns instead of panicking the worker goroutine.
 func (s *Syncer) mailboxFor(acct model.Account) (provider.Mailbox, error) {
 	p, err := s.registry.Get(acct.Provider)
 	if err != nil {
 		return nil, err
 	}
+	if p.Mailbox() == nil {
+		return nil, fmt.Errorf("provider %s has no mailbox", acct.Provider)
+	}
 	return p.Mailbox(), nil
+}
+
+// newRunID mints the id that ties every line of one sync run together, the way
+// request_id does for a request.
+func newRunID() string {
+	return "run_" + strings.TrimPrefix(logx.NewRequestID(), "req_")
 }
 
 // SyncAccount brings one account up to date: discover scopes, then walk each.
 func (s *Syncer) SyncAccount(ctx context.Context, accountID string) error {
-	acct, err := s.store.GetAccount(accountID)
+	return s.syncAccount(ctx, accountID, newRunID())
+}
+
+func (s *Syncer) syncAccount(ctx context.Context, accountID, runID string) error {
+	ids := []any{"run_id", runID, "account_id", accountID}
+	log := s.log.With(ids...)
+	ctx = logx.With(ctx, s.base.With(ids...))
+	start := time.Now()
+	log.Info("sync run started")
+	defer func() { log.Info("sync run finished", "dur", time.Since(start).Round(time.Millisecond)) }()
+
+	acct, err := s.store.GetAnyAccount(accountID)
 	if err != nil {
 		return err
 	}
 	if acct.Status != model.AccountOK {
-		s.log.Debug("skipping sync for non-OK account",
-			"account_id", accountID, "status", acct.Status)
+		log.Debug("skipping sync for non-OK account", "status", acct.Status)
 		return nil
 	}
+	ids = append(ids, "developer_id", acct.DeveloperID, "provider", acct.Provider)
+	log = s.log.With(ids...)
+	ctx = logx.With(ctx, s.base.With(ids...))
 	mailbox, err := s.mailboxFor(acct)
 	if err != nil {
 		return err
 	}
 	firstRun := acct.LastSyncedAt == nil
+	log.Debug("run decision", "first_run", firstRun,
+		"last_synced_at", acct.LastSyncedAt, "backfill_window", s.opts.BackfillWindow)
 
 	scopes, err := s.syncScopes(ctx, mailbox, accountID)
 	if err != nil {
 		if errors.Is(err, provider.ErrReauthRequired) {
+			log.Debug("run aborted", "reason", "reauth required")
 			return nil // status already flipped; nothing more to do
 		}
 		return err
 	}
+	log.Debug("scopes discovered", "scopes", len(scopes))
 
 	for _, scope := range scopes {
 		if err := s.syncScope(ctx, mailbox, accountID, scope, firstRun); err != nil {
 			if errors.Is(err, provider.ErrReauthRequired) {
+				log.Debug("run aborted", "reason", "reauth required", "scope", scope.Name)
 				return nil
 			}
 			// One bad scope should not stop the rest of the account.
-			s.log.Error("scope sync failed",
-				"account_id", accountID, "scope", scope.Name, "err", err)
+			log.Error("scope sync failed", "scope", scope.Name, "err", err)
 		}
 	}
 	return s.store.MarkSynced(accountID)
@@ -224,9 +280,12 @@ func (s *Syncer) syncScopes(ctx context.Context, mailbox provider.Mailbox, accou
 		return nil, err
 	}
 
+	log := logx.From(ctx).With("component", "syncer")
+	log.Debug("scope listing", "cursor_present", cursor != "")
+
 	set, err := mailbox.SyncScopes(ctx, accountID, cursor)
 	if errors.Is(err, provider.ErrCursorExpired) {
-		s.log.Info("scope cursor expired, relisting", "account_id", accountID)
+		log.Debug("scope listing decision", "decision", "cursor expired, relisting")
 		set, err = mailbox.SyncScopes(ctx, accountID, "")
 	}
 	if err != nil {
@@ -246,13 +305,17 @@ func (s *Syncer) syncScopes(ctx context.Context, mailbox provider.Mailbox, accou
 			return nil, err
 		}
 	}
+	deleted := 0
 	for _, f := range known {
 		if !live[f.ID] {
 			if err := s.store.DeleteFolder(accountID, f.ID); err != nil {
 				return nil, err
 			}
+			deleted++
 		}
 	}
+	log.Debug("folders reconciled", "known", len(known), "live", len(set.Folders),
+		"deleted", deleted, "cursor_out_present", set.Cursor != "")
 
 	if set.Cursor != "" {
 		if err := s.store.SetCursor(accountID, scopeListCursorKey, set.Cursor); err != nil {
@@ -276,16 +339,22 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 		since = time.Now().Add(-s.opts.BackfillWindow)
 	}
 
+	log := logx.From(ctx).With("component", "syncer",
+		"scope", scope.Name, "scope_id", scope.ID, "role", scope.Role)
+	log.Debug("scope decision", "cursor_present", cursor != "", "initial", initial,
+		"first_run", firstRun, "since", since)
+
 	changes, err := mailbox.SyncMessages(ctx, accountID, scope, cursor, since)
 	if errors.Is(err, provider.ErrCursorExpired) {
-		s.log.Info("sync cursor expired, resyncing scope",
-			"account_id", accountID, "scope", scope.Name)
+		log.Debug("scope decision", "decision", "cursor expired, resyncing scope")
 		initial = true
 		changes, err = mailbox.SyncMessages(ctx, accountID, scope, "", since)
 	}
 	if err != nil {
 		return err
 	}
+	log.Debug("scope changes", "changed", len(changes.Changed), "removed", len(changes.Removed),
+		"cursor_out_present", changes.Cursor != "")
 
 	// Events are suppressed on an account's very first sync and on any forced
 	// resync. Otherwise connecting an account would fire a mail_received for
@@ -300,17 +369,35 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 		if err := s.store.UpsertEmail(e); err != nil {
 			return err
 		}
+		decision := "updated"
+		switch {
+		case quiet:
+			decision = "suppressed"
+		case !existed && scope.Role == "sentitems":
+			decision = "new-sent"
+		case !existed && !e.Draft:
+			decision = "new"
+		case !existed:
+			decision = "new-draft"
+		}
+		// Body is counted, never quoted: the log says how much mail moved, not
+		// what it said.
+		log.Debug("message decision", "email_id", e.ID, "existed", existed, "draft", e.Draft,
+			"has_attachments", e.HasAttachments, "body_bytes", len(e.Body), "decision", decision)
 		if quiet {
 			continue
 		}
 		email := e
+		email.Role = scope.Role
 		switch {
 		case !existed && scope.Role == "sentitems":
-			s.events.Emit(model.Event{Type: model.EventMailSent, AccountID: accountID, Email: &email})
+			s.attachAttachments(ctx, mailbox, &email)
+			s.emit(log, model.Event{Type: model.EventMailSent, AccountID: accountID, Email: &email})
 		case !existed && !e.Draft:
-			s.events.Emit(model.Event{Type: model.EventMailReceived, AccountID: accountID, Email: &email})
+			s.attachAttachments(ctx, mailbox, &email)
+			s.emit(log, model.Event{Type: model.EventMailReceived, AccountID: accountID, Email: &email})
 		case existed:
-			s.events.Emit(model.Event{Type: model.EventMailUpdated, AccountID: accountID, Email: &email})
+			s.emit(log, model.Event{Type: model.EventMailUpdated, AccountID: accountID, Email: &email})
 		}
 	}
 
@@ -318,8 +405,13 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 		if err := s.store.DeleteEmail(accountID, id); err != nil {
 			return err
 		}
+		removal := "removed"
+		if quiet {
+			removal = "suppressed"
+		}
+		log.Debug("message decision", "email_id", id, "existed", true, "decision", removal)
 		if !quiet {
-			s.events.Emit(model.Event{
+			s.emit(log, model.Event{
 				Type: model.EventMailDeleted, AccountID: accountID, EmailID: id,
 			})
 		}
@@ -329,4 +421,34 @@ func (s *Syncer) syncScope(ctx context.Context, mailbox provider.Mailbox,
 		return s.store.SetCursor(accountID, scope.ID, changes.Cursor)
 	}
 	return nil
+}
+
+// emit hands an event to the dispatcher and records that it left the syncer, so
+// a missing webhook can be traced to either side of this boundary.
+func (s *Syncer) emit(log *slog.Logger, ev model.Event) {
+	emailID := ev.EmailID
+	if ev.Email != nil {
+		emailID = ev.Email.ID
+	}
+	log.Debug("event emitted", "event", ev.Type, "email_id", emailID)
+	s.events.Emit(ev)
+}
+
+// attachAttachments fills in the attachment list for a new-mail event, so a
+// subscriber can act on it without a second call. One provider round-trip
+// per new message that has attachments; a failure degrades to the bare
+// has_attachments flag rather than blocking the sync.
+func (s *Syncer) attachAttachments(ctx context.Context, mailbox provider.Mailbox, e *model.Email) {
+	if !e.HasAttachments || len(e.Attachments) > 0 {
+		return
+	}
+	log := logx.From(ctx).With("component", "syncer")
+	log.Debug("attachment fetch", "email_id", e.ID)
+	atts, err := mailbox.ListAttachments(ctx, e.AccountID, e.ID)
+	if err != nil {
+		log.Warn("listing attachments for event", "email_id", e.ID, "err", err)
+		return
+	}
+	log.Debug("attachments fetched", "email_id", e.ID, "attachments", len(atts))
+	e.Attachments = atts
 }

@@ -1,27 +1,68 @@
 package store
 
-const schema = `
+// sqlitePragmas are prepended to the SQLite rendering of the schema. They are
+// connection/file settings with no Postgres equivalent, so they live outside
+// the shared template.
+const sqlitePragmas = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+`
+
+// schemaTemplate is the schema both engines share. Two tokens are rendered per
+// dialect: {{BLOB}} (BLOB / BYTEA) and {{BIGINT}} for the epoch-second columns,
+// which overflow a Postgres INTEGER. Flags and counters stay INTEGER.
+const schemaTemplate = `
+-- A developer is a tenant. Everything below is owned by exactly one.
+CREATE TABLE IF NOT EXISTS developers (
+  id                    TEXT PRIMARY KEY,
+  email                 TEXT NOT NULL UNIQUE,
+  password_hash         TEXT NOT NULL,
+  name                  TEXT NOT NULL DEFAULT '',
+  created_at            {{BIGINT}} NOT NULL,
+  redirect_domains_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id           TEXT PRIMARY KEY,
+  developer_id TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  prefix       TEXT NOT NULL,
+  hash         TEXT NOT NULL UNIQUE,
+  created_at   {{BIGINT}} NOT NULL,
+  last_used_at {{BIGINT}},
+  revoked_at   {{BIGINT}}
+);
+CREATE INDEX IF NOT EXISTS api_keys_by_developer ON api_keys(developer_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id           TEXT PRIMARY KEY,
+  developer_id TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  created_at   {{BIGINT}} NOT NULL,
+  expires_at   {{BIGINT}} NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_by_developer ON sessions(developer_id);
 
 CREATE TABLE IF NOT EXISTS accounts (
   id            TEXT PRIMARY KEY,
+  developer_id  TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL DEFAULT 'mail',
   provider      TEXT NOT NULL,
   email         TEXT NOT NULL,
   name          TEXT NOT NULL DEFAULT '',
   status        TEXT NOT NULL,
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL,
-  last_synced_at INTEGER
+  created_at    {{BIGINT}} NOT NULL,
+  updated_at    {{BIGINT}} NOT NULL,
+  last_synced_at {{BIGINT}}
 );
-CREATE UNIQUE INDEX IF NOT EXISTS accounts_email ON accounts(email);
+-- The same mailbox may be connected by two developers as two accounts.
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_owner_email ON accounts(developer_id, email);
 
 -- Refresh tokens are stored sealed (AES-GCM); access tokens are short-lived and
 -- kept only to avoid a refresh round-trip on every call.
 CREATE TABLE IF NOT EXISTS tokens (
   account_id        TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   access_token      TEXT NOT NULL,
-  access_expires_at INTEGER NOT NULL,
+  access_expires_at {{BIGINT}} NOT NULL,
   refresh_token_enc TEXT NOT NULL,
   scope             TEXT NOT NULL DEFAULT ''
 );
@@ -44,7 +85,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   scope_id   TEXT NOT NULL,
   cursor     TEXT NOT NULL DEFAULT '',
-  updated_at INTEGER NOT NULL,
+  updated_at {{BIGINT}} NOT NULL,
   PRIMARY KEY (account_id, scope_id)
 );
 
@@ -60,7 +101,7 @@ CREATE TABLE IF NOT EXISTS emails (
   cc_json             TEXT NOT NULL DEFAULT '[]',
   bcc_json            TEXT NOT NULL DEFAULT '[]',
   reply_to_json       TEXT NOT NULL DEFAULT '[]',
-  date                INTEGER NOT NULL DEFAULT 0,
+  date                {{BIGINT}} NOT NULL DEFAULT 0,
   snippet             TEXT NOT NULL DEFAULT '',
   body                TEXT NOT NULL DEFAULT '',
   body_type           TEXT NOT NULL DEFAULT '',
@@ -81,28 +122,162 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   resource     TEXT NOT NULL,
   client_state TEXT NOT NULL,
-  expires_at   INTEGER NOT NULL,
-  created_at   INTEGER NOT NULL
+  expires_at   {{BIGINT}} NOT NULL,
+  created_at   {{BIGINT}} NOT NULL
 );
 CREATE INDEX IF NOT EXISTS subs_by_account ON subscriptions(account_id);
 
+-- account_id '' means every account of this developer. Account-scoped rows
+-- are removed by hand in DeleteAccount, since '' cannot reference a row.
 CREATE TABLE IF NOT EXISTS webhooks (
-  id          TEXT PRIMARY KEY,
-  url         TEXT NOT NULL,
-  secret      TEXT NOT NULL DEFAULT '',
-  events_json TEXT NOT NULL DEFAULT '[]',
-  created_at  INTEGER NOT NULL
+  id           TEXT PRIMARY KEY,
+  developer_id TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  account_id   TEXT NOT NULL DEFAULT '',
+  name         TEXT NOT NULL DEFAULT '',
+  url          TEXT NOT NULL,
+  secret       TEXT NOT NULL DEFAULT '',
+  events_json  TEXT NOT NULL DEFAULT '[]',
+  kind         TEXT NOT NULL DEFAULT 'webhook',
+  config       TEXT NOT NULL DEFAULT '',
+  created_at   {{BIGINT}} NOT NULL
 );
+CREATE INDEX IF NOT EXISTS webhooks_by_developer ON webhooks(developer_id);
+CREATE INDEX IF NOT EXISTS webhooks_by_account   ON webhooks(account_id);
 
--- Short-lived PKCE state for the connect flow.
+-- Short-lived PKCE state for the connect flow, minted by a developer.
 CREATE TABLE IF NOT EXISTS oauth_states (
   state          TEXT PRIMARY KEY,
+  developer_id   TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
   provider       TEXT NOT NULL DEFAULT '',
   verifier       TEXT NOT NULL,
   success_url    TEXT NOT NULL DEFAULT '',
   failure_url    TEXT NOT NULL DEFAULT '',
   notify_url     TEXT NOT NULL DEFAULT '',
-  created_at     INTEGER NOT NULL,
-  expires_at     INTEGER NOT NULL
+  webhook_json   TEXT NOT NULL DEFAULT '',
+  created_at     {{BIGINT}} NOT NULL,
+  expires_at     {{BIGINT}} NOT NULL,
+  consented_at   {{BIGINT}},
+  -- browser_hash is the sha256 of the um_link cookie belonging to whichever
+  -- browser first claimed this connect state (consent, normally, or a /qr
+  -- retry after a previous pairing attempt failed). Empty means unclaimed.
+  browser_hash   TEXT NOT NULL DEFAULT ''
+);
+
+-- Failed webhook deliveries waiting for a retry. A row is removed on success,
+-- rescheduled on failure, and kept with dead = 1 once the schedule is used up
+-- so the caller can see what never arrived.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id              TEXT PRIMARY KEY,
+  webhook_id      TEXT NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+  account_id      TEXT NOT NULL DEFAULT '',
+  event_type      TEXT NOT NULL,
+  payload         {{BLOB}} NOT NULL,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at {{BIGINT}} NOT NULL,
+  last_error      TEXT NOT NULL DEFAULT '',
+  dead            INTEGER NOT NULL DEFAULT 0,
+  created_at      {{BIGINT}} NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deliveries_due ON webhook_deliveries(dead, next_attempt_at);
+CREATE INDEX IF NOT EXISTS deliveries_by_webhook ON webhook_deliveries(webhook_id);
+
+-- ---- chat providers (WhatsApp) ----
+CREATE TABLE IF NOT EXISTS chats (
+  account_id      TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id              TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  name            TEXT NOT NULL DEFAULT '',
+  unread_count    INTEGER NOT NULL DEFAULT 0,
+  last_message_at {{BIGINT}},
+  archived        INTEGER NOT NULL DEFAULT 0,
+  muted           INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, id)
+);
+CREATE INDEX IF NOT EXISTS chats_by_activity ON chats(account_id, last_message_at DESC);
+
+CREATE TABLE IF NOT EXISTS attendees (
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id         TEXT NOT NULL,
+  lid        TEXT NOT NULL DEFAULT '',
+  phone      TEXT NOT NULL DEFAULT '',
+  name       TEXT NOT NULL DEFAULT '',
+  is_self    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_members (
+  account_id  TEXT NOT NULL,
+  chat_id     TEXT NOT NULL,
+  attendee_id TEXT NOT NULL,
+  role        TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (account_id, chat_id, attendee_id),
+  FOREIGN KEY (account_id, chat_id) REFERENCES chats(account_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  account_id     TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id             TEXT NOT NULL,
+  chat_id        TEXT NOT NULL,
+  sender_id      TEXT NOT NULL,
+  is_from_me     INTEGER NOT NULL DEFAULT 0,
+  kind           TEXT NOT NULL,
+  text           TEXT NOT NULL DEFAULT '',
+  quoted_id      TEXT NOT NULL DEFAULT '',
+  sent_at        {{BIGINT}} NOT NULL,
+  edited_at      {{BIGINT}},
+  deleted        INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT '',
+  reactions_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (account_id, id)
+);
+CREATE INDEX IF NOT EXISTS chat_messages_by_chat ON chat_messages(account_id, chat_id, sent_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  provider   TEXT NOT NULL,
+  device_jid TEXT NOT NULL,
+  updated_at {{BIGINT}} NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  developer_id TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
+  key          TEXT NOT NULL,
+  response     {{BLOB}} NOT NULL,
+  created_at   {{BIGINT}} NOT NULL,
+  PRIMARY KEY (developer_id, key)
 );
 `
+
+// sqliteMigrations are additive column changes for databases created before
+// the column existed. Each is safe to re-run: "duplicate column" is ignored.
+var sqliteMigrations = []string{
+	`ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'mail'`,
+	`ALTER TABLE oauth_states ADD COLUMN consented_at INTEGER`,
+	`ALTER TABLE webhooks ADD COLUMN kind TEXT NOT NULL DEFAULT 'webhook'`,
+	`ALTER TABLE webhooks ADD COLUMN config TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE developers ADD COLUMN redirect_domains_json TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE oauth_states ADD COLUMN browser_hash TEXT NOT NULL DEFAULT ''`,
+	// Sessions are now keyed by sha256 of the token — 64 hex characters. Rows
+	// written before that cut-over hold the raw token as the primary key (43
+	// characters: 32 bytes of unpadded base64url). They are inert, since every
+	// lookup hashes first, but they are precisely the "a DB read yields every
+	// live session" artefact the hashing removed, and they sit in every backup
+	// taken before the upgrade. Keyed on length rather than a blanket DELETE so
+	// an upgrade does not sign out every developer who is currently signed in.
+	`DELETE FROM sessions WHERE length(id) <> 64`,
+}
+
+// postgresMigrations are the same additive changes for Postgres, where
+// ADD COLUMN IF NOT EXISTS makes each one idempotent on its own rather than
+// relying on a "duplicate column" error being swallowed.
+var postgresMigrations = []string{
+	`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'mail'`,
+	`ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS consented_at BIGINT`,
+	`ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'webhook'`,
+	`ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS config TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE developers ADD COLUMN IF NOT EXISTS redirect_domains_json TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS browser_hash TEXT NOT NULL DEFAULT ''`,
+	// See the sqliteMigrations note: pre-hash session rows hold the raw token
+	// as the primary key (43 characters) instead of its sha256 (64).
+	`DELETE FROM sessions WHERE length(id) <> 64`,
+}
