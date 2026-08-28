@@ -1,3 +1,170 @@
-{{define "site"}}{{template "layout_site_start" .}}{{template "site_content" .}}{{template "layout_site_end" .}}{{end}}
+{{define "site"}}{{template "layout_site_start" .}}{{template "site_content" .}}{{template "site_end" .}}{{template "layout_site_end" .}}{{end}}
 
-{{define "site_content"}}<main class="page"><h1>One API for mail and chat.</h1><p class="muted">Entropix connects Outlook and WhatsApp accounts with hosted auth, delivers every message to your webhook, and sends with one endpoint.</p><p><a class="btn primary" href="/signup">Get started</a> <a class="btn" href="/docs">Read the docs</a></p></main>{{end}}
+{{/* site_tabs renders one docs.Snippet as a three-language code block. The
+     ids are fixed because the hero is the only tabbed block on the page. */}}
+{{define "site_tabs"}}<div class="codeblock" data-tabs>
+  <div class="code-head">
+    <div class="langs" role="group" aria-label="Language">
+      <button type="button" class="lang" data-tab="curl" aria-pressed="true">curl</button>
+      <button type="button" class="lang" data-tab="node" aria-pressed="false">Node</button>
+      <button type="button" class="lang" data-tab="go" aria-pressed="false">Go</button>
+    </div>
+    <button type="button" class="btn sm copy">Copy</button>
+  </div>
+  <pre data-lang="curl" tabindex="0">{{.Curl}}</pre>
+  <pre data-lang="node" tabindex="0" hidden>{{.Node}}</pre>
+  <pre data-lang="go" tabindex="0" hidden>{{.Go}}</pre>
+</div>{{end}}
+
+{{/* site_code is a single-language block: a heading row with a copy button
+     and one scrollable pre. */}}
+{{define "site_code"}}<div class="codeblock">
+  <div class="code-head"><span class="lang-label">curl</span><button type="button" class="btn sm copy">Copy</button></div>
+  <pre data-lang="curl" tabindex="0">{{.}}</pre>
+</div>{{end}}
+
+{{define "site_content"}}<main class="site">
+
+<section id="hero" class="hero">
+  <div class="hero-in">
+    <div class="hero-copy">
+      <h1 class="hero-h">One API for mail and chat.</h1>
+      <p class="hero-sub">Connect Outlook and WhatsApp accounts with hosted auth, receive every message on a webhook, send with one endpoint. Self-host in a single binary.</p>
+      <p class="hero-cta">
+        <a class="btn primary lg" href="/signup">Get started</a>
+        <a class="btn lg" href="/docs">Read the docs</a>
+      </p>
+      <p class="hero-fine">No card. Free while in beta.</p>
+    </div>
+    <div class="hero-code">{{template "site_tabs" .Send}}</div>
+  </div>
+</section>
+
+<section id="how" class="band">
+  <div class="band-in">
+    <h2 class="section-h">How it works</h2>
+    <p class="section-sub muted">Three calls end to end. Your users never see an API key, and you never store one of their passwords.</p>
+    <div class="grid-3 steps">
+      <article class="step">
+        <div class="step-head"><span class="step-n" aria-hidden="true">1</span><h3>Connect an account</h3></div>
+        <p class="muted small">Mint a hosted-auth link from your server and hand it to your user. They sign in with Microsoft, or scan a QR code for WhatsApp, on our page — you get an <code>account_id</code> back on your <code>notify_url</code>.</p>
+        {{template "site_code" .Connect.Curl}}
+      </article>
+      <article class="step">
+        <div class="step-head"><span class="step-n" aria-hidden="true">2</span><h3>Receive every message</h3></div>
+        <p class="muted small">Register a webhook once and <code>mail_received</code> and <code>chat_received</code> land on your endpoint, signed and retried with backoff until you answer 2xx.</p>
+        {{template "site_code" .Receive.Curl}}
+      </article>
+      <article class="step">
+        <div class="step-head"><span class="step-n" aria-hidden="true">3</span><h3>Send with one endpoint</h3></div>
+        <p class="muted small">The same call sends as any connected account. Pass an <code>Idempotency-Key</code> and a retry replays the first response instead of sending twice.</p>
+        {{template "site_code" .Send.Curl}}
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="providers">
+  <div class="band-in">
+    <h2 class="section-h">Providers</h2>
+    <p class="section-sub muted">What this deployment can connect today. Every provider answers the same endpoints, so adding one is a config change on our side, not a rewrite on yours.</p>
+    <div class="grid-3">
+      {{range .Providers}}<article class="card provider" data-provider="{{.Name}}">
+        <div class="card-body">
+          <div class="provider-head"><h3>{{.Name}}</h3><span class="badge">{{.Kind}}</span></div>
+          <ul class="caps">{{range .Caps}}<li>{{.}}</li>{{end}}</ul>
+          {{if .Note}}<p class="note small">{{.Note}}</p>{{end}}
+        </div>
+      </article>
+      {{end}}
+      <article class="card provider soon">
+        <div class="card-body">
+          <div class="provider-head"><h3>More providers coming</h3></div>
+          <p class="muted small">Gmail and Slack are next. They arrive behind the endpoints you already call — a new <code>provider</code> string, not a new integration.</p>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="band">
+  <div class="band-in">
+    <h2 class="section-h">Built for developers</h2>
+    <p class="section-sub muted">The parts you would otherwise build twice.</p>
+    <div class="grid-3">
+      <article class="feature">
+        <h3>Webhooks that keep trying</h3>
+        <p class="muted small">Deliver to your own HTTPS endpoint, a Discord channel, or a Telegram chat. Failures retry with backoff, and every attempt is on the record at <code>GET /api/v1/webhooks/{id}/deliveries</code>.</p>
+      </article>
+      <article class="feature">
+        <h3>Idempotency keys</h3>
+        <p class="muted small">Send with an <code>Idempotency-Key</code> and a repeat of the same key and body replays the original response. Timeouts and retries stop being a duplicate-message problem.</p>
+      </article>
+      <article class="feature">
+        <h3>Hosted auth</h3>
+        <p class="muted small">One POST returns a link. Your user signs in, or scans a QR code, on a page we host and keep working — no OAuth client, no consent screen, no QR plumbing in your app.</p>
+      </article>
+      <article class="feature">
+        <h3>llms.txt</h3>
+        <p class="muted small">The whole API in one plain-text file at <a href="/llms.txt">/llms.txt</a>, written to be pasted into a coding agent. Your assistant reads the docs so you can skip them.</p>
+      </article>
+      <article class="feature">
+        <h3>Self-hostable</h3>
+        <p class="muted small">One Go binary, SQLite by default or Postgres when you want it. No queue, no broker, no sidecar — run it next to your app and keep the mailbox tokens in your own database.</p>
+      </article>
+      <article class="feature">
+        <h3>API keys with rotation</h3>
+        <p class="muted small">Mint keys from the dashboard, hashed at rest and shown once. Rotation issues the replacement before the old key stops working, so a key can be retired with no downtime.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="events">
+  <div class="band-in">
+    <h2 class="section-h">Events</h2>
+    <p class="section-sub muted">Every type your webhook can receive. Each one links to its payload in the reference.</p>
+    <div class="chips">{{range .Events}}<a class="pill" href="/docs#event-{{.Type}}">{{.Type}}</a>{{end}}</div>
+  </div>
+</section>
+
+<footer class="site-foot">
+  <div class="band-in foot-in">
+    <a class="wordmark" href="/">Entro<b>pix</b></a>
+    <nav aria-label="Footer">
+      <a href="/docs">Docs</a>
+      <a href="/llms.txt">llms.txt</a>
+      <a href="/login">Sign in</a>
+    </nav>
+    <p class="muted small">Free while in beta · self-host any time</p>
+  </div>
+</footer>
+
+</main>{{end}}
+
+{{/* site_end carries the page's only script: language tabs and copy buttons.
+     app.js is loaded with defer, so window.um does not exist while an inline
+     script in the body is parsed. Two guards, both needed: the wiring runs on
+     DOMContentLoaded (after deferred scripts have executed), and um.copy is
+     only ever read inside a click handler, later still. */}}
+{{define "site_end"}}<script>
+document.addEventListener("DOMContentLoaded", function () {
+  document.querySelectorAll("[data-tabs]").forEach(function (block) {
+    var langs = Array.prototype.slice.call(block.querySelectorAll(".lang"));
+    var panes = Array.prototype.slice.call(block.querySelectorAll("pre[data-lang]"));
+    langs.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        langs.forEach(function (o) { o.setAttribute("aria-pressed", String(o === btn)); });
+        panes.forEach(function (p) { p.hidden = p.dataset.lang !== btn.dataset.tab; });
+      });
+    });
+  });
+  document.querySelectorAll(".codeblock .copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var block = btn.closest(".codeblock");
+      var pre = block.querySelector("pre[data-lang]:not([hidden])") || block.querySelector("pre");
+      if (pre) { window.um.copy(pre.textContent, btn); }
+    });
+  });
+});
+</script>{{end}}
