@@ -209,6 +209,44 @@ pairing codes; one live socket per account, capped process-wide by
 `WHATSAPP_MAX_ACCOUNTS`; reconnect backoff rises to 5 minutes between
 attempts.
 
+### 7. Optional: Postgres / Supabase
+
+SQLite (`DB_DRIVER=sqlite`, the default) needs nothing set up and is what
+tests run on — keep it for local dev. Point the service at Postgres instead
+for a real deployment:
+
+```bash
+DB_DRIVER=postgres
+DATABASE_URL=postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres?sslmode=require
+```
+
+`<ref>` is the project reference from the Supabase dashboard (Project
+Settings → Database → Connection string). `sslmode=require` matters: this
+connection carries sealed tokens and session ids.
+
+`DATABASE_URL` is parsed as a URL, so a password containing any of
+`@ # ? / : & % + [ ]` or a space must be percent-encoded (`@` → `%40`, `#` →
+`%23`, `?` → `%3F`, `/` → `%2F`, space → `%20`, ...) — an unescaped `#`, `?`
+or `/` is URL syntax itself and silently truncates the string there rather
+than erroring, so the server connects to the wrong host or database instead
+of refusing to start. This service also detects and repairs a not-yet-encoded
+password on the way in, but percent-encoding it yourself when you set the
+variable is the reliable way to avoid both failure modes.
+
+If you're behind Supabase's connection pooler (recommended for serverless or
+many short-lived connections), use its host/port instead: port `6543` and
+user `postgres.<ref>` (not plain `postgres`) — the pooler multiplexes by
+username, so the project ref has to be part of it.
+
+`DB_MAX_OPEN_CONNS` (default 10) caps the connection pool; it's ignored on
+SQLite, which is pinned to a single writer regardless. Keep it under whatever
+Supabase's plan and pooler allow.
+
+The store's own test suite (and this repo's `go test ./...`) runs on SQLite
+by default; setting `TEST_DATABASE_URL` to a Postgres URL runs the same tests
+against Postgres instead, each in its own throwaway schema so runs don't
+collide.
+
 ---
 
 ## UI
@@ -628,12 +666,13 @@ Kong, or an equivalent reverse proxy) to provide:**
   client-supplied value first) so the origin can trust it — the origin itself
   runs with `TRUST_PROXY=true` and `PUBLIC_BASE_URL` set to make use of that.
 
-**Storage.** The single-connection SQLite file (`internal/store`) is a
-development/POC store, sized for one process and one disk — see "Pre-tenancy
-databases are refused" below for its own migration gap. A public deployment
-is expected to move to Postgres; that migration has not shipped yet, and
-until it does this service should not be exposed to untrusted traffic without
-the gateway protections above in front of it.
+**Storage.** With `DB_DRIVER=sqlite` (the default), `internal/store` is a
+single-connection file, sized for one process and one disk — see "Pre-tenancy
+databases are refused" below for its own migration gap. Fine for local dev
+and tests; not for a public deployment, which should set `DB_DRIVER=postgres`
+(see "Setup" §7) and get a real connection pool instead. Either way, this
+service should not be exposed to untrusted traffic without the gateway
+protections above in front of it.
 
 ---
 

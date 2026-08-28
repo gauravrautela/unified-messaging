@@ -29,7 +29,7 @@ func openDB(t *testing.T) *sql.DB {
 // migrations run against the same file as the rest of the service.
 func TestNewUpgradesDeviceStore(t *testing.T) {
 	db := openDB(t)
-	p, err := New(db, "unified-messaging-test", nil)
+	p, err := New(db, "sqlite3", "unified-messaging-test", nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestNewUpgradesDeviceStore(t *testing.T) {
 // A device whose credentials are gone can only be fixed by relinking, so
 // Connect must say so rather than returning a retryable error.
 func TestConnectWithoutDeviceNeedsReauth(t *testing.T) {
-	p, err := New(openDB(t), "unified-messaging-test", nil)
+	p, err := New(openDB(t), "sqlite3", "unified-messaging-test", nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestConnectWithoutDeviceNeedsReauth(t *testing.T) {
 // Forgetting an unknown device is a no-op, not a failure: the caller's goal —
 // no credentials on disk — is already true.
 func TestForgetUnknownDevice(t *testing.T) {
-	p, err := New(openDB(t), "unified-messaging-test", nil)
+	p, err := New(openDB(t), "sqlite3", "unified-messaging-test", nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestForgetUnknownDevice(t *testing.T) {
 // Commands and the roster need a live connection; without one the account is
 // simply not there as far as the adapter is concerned.
 func TestCommandsWithoutConnection(t *testing.T) {
-	p, err := New(openDB(t), "unified-messaging-test", nil)
+	p, err := New(openDB(t), "sqlite3", "unified-messaging-test", nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestCommandsWithoutConnection(t *testing.T) {
 // The library's own reconnect loop must stay off: the chat runtime owns
 // reconnection and builds a new client for each attempt.
 func TestNewClientDisablesAutoReconnect(t *testing.T) {
-	p, err := New(openDB(t), "unified-messaging-test", nil)
+	p, err := New(openDB(t), "sqlite3", "unified-messaging-test", nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

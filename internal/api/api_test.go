@@ -2609,6 +2609,25 @@ func TestHealthzReportsDroppedEvents(t *testing.T) {
 	}
 }
 
+// healthz's "db" field is the one place an operator can tell the database
+// itself (not just the process) is reachable — separate from dropped_events,
+// which only ever reflects the in-process dispatcher.
+func TestHealthzReportsDB(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz = %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["db"] != "ok" {
+		t.Fatalf("healthz body = %v, want db:ok", body)
+	}
+}
+
 // --- request-log scrubbing (I3) ---
 
 func TestScrubPathReducesConnectState(t *testing.T) {

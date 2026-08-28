@@ -169,13 +169,33 @@ func (s *Server) browserHandlers() map[string]http.HandlerFunc {
 	return map[string]http.HandlerFunc{
 		// dropped_events is the one place a lost webhook notification is
 		// visible: an event discarded by a saturated dispatcher never reaches
-		// webhook_deliveries, so nothing else in the API can report it.
+		// webhook_deliveries, so nothing else in the API can report it. db is
+		// a live reachability check against the database itself — a process
+		// that's up but whose database has fallen over (connection exhaustion,
+		// the Postgres instance restarting, ...) is not actually healthy.
 		"GET /healthz": func(w http.ResponseWriter, r *http.Request) {
 			var dropped int64
 			if s.dispatcher != nil {
 				dropped = s.dispatcher.Dropped()
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "dropped_events": dropped})
+			dbStatus := "ok"
+			status := http.StatusOK
+			if s.store != nil {
+				ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+				defer cancel()
+				if err := s.store.Ping(ctx); err != nil {
+					s.log.Warn("healthz: database ping failed", "error", notify.ScrubErr(err))
+					dbStatus = "error"
+					status = http.StatusServiceUnavailable
+				}
+			}
+			body := map[string]any{"dropped_events": dropped, "db": dbStatus}
+			if status == http.StatusOK {
+				body["status"] = "ok"
+			} else {
+				body["status"] = "error"
+			}
+			writeJSON(w, status, body)
 		},
 
 		// --- connection flow (browser-facing; no API key) ---
