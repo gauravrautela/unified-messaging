@@ -1,11 +1,13 @@
 package whatsapp
 
 import (
+	"fmt"
 	"strings"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -16,8 +18,16 @@ import (
 // path testable without a phone.
 
 func chatKind(jid types.JID) string {
-	if jid.Server == types.GroupServer {
+	switch {
+	case jid.Server == types.GroupServer:
 		return "group"
+	case jid.Server == types.NewsletterServer:
+		return "channel"
+	case jid.Server == types.BroadcastServer:
+		// status@broadcast is a Status post; any other broadcast list is a
+		// one-to-many send from the phone, which readers still think of as
+		// a status-like feed rather than a conversation.
+		return "status"
 	}
 	return "direct"
 }
@@ -147,26 +157,89 @@ func textOf(msg *waE2E.Message) string {
 // Media download is deliberately out of scope, so the API reports the shape of
 // the message rather than pretending it was empty.
 func mediaLabel(msg *waE2E.Message) string {
+	withCaption := func(label, caption string) string {
+		if caption = strings.TrimSpace(caption); caption != "" {
+			return label + " " + caption
+		}
+		return label
+	}
 	switch {
 	case msg.GetImageMessage() != nil:
-		return "[image]"
+		return withCaption("[image]", msg.GetImageMessage().GetCaption())
 	case msg.GetVideoMessage() != nil:
-		return "[video]"
+		if msg.GetVideoMessage().GetGifPlayback() {
+			return withCaption("[gif]", msg.GetVideoMessage().GetCaption())
+		}
+		return withCaption("[video]", msg.GetVideoMessage().GetCaption())
+	case msg.GetPtvMessage() != nil:
+		return "[video note]"
 	case msg.GetAudioMessage() != nil:
+		if msg.GetAudioMessage().GetPTT() {
+			return "[voice note]"
+		}
 		return "[audio]"
 	case msg.GetDocumentMessage() != nil:
-		return "[document]"
-	case msg.GetStickerMessage() != nil:
+		d := msg.GetDocumentMessage()
+		return withCaption(withCaption("[document]", d.GetFileName()), d.GetCaption())
+	case msg.GetStickerMessage() != nil, msg.GetLottieStickerMessage() != nil:
 		return "[sticker]"
+	case msg.GetAlbumMessage() != nil:
+		a := msg.GetAlbumMessage()
+		n := a.GetExpectedImageCount() + a.GetExpectedVideoCount()
+		switch {
+		case n == 0:
+			return "[album]"
+		case a.GetExpectedVideoCount() == 0:
+			return fmt.Sprintf("[album: %d photos]", n)
+		default:
+			return fmt.Sprintf("[album: %d items]", n)
+		}
 	case msg.GetLocationMessage() != nil, msg.GetLiveLocationMessage() != nil:
 		return "[location]"
 	case msg.GetContactMessage() != nil, msg.GetContactsArrayMessage() != nil:
 		return "[contact]"
 	case msg.GetPollCreationMessage() != nil:
-		return "[poll]"
-	default:
-		return "[unsupported]"
+		return withCaption("[poll]", msg.GetPollCreationMessage().GetName())
+	case msg.GetPollUpdateMessage() != nil:
+		return "[poll vote]"
+	case msg.GetEventMessage() != nil:
+		return withCaption("[event]", msg.GetEventMessage().GetName())
+	case msg.GetGroupInviteMessage() != nil:
+		return withCaption("[group invite]", msg.GetGroupInviteMessage().GetGroupName())
+	case msg.GetBcallMessage() != nil, msg.GetScheduledCallCreationMessage() != nil:
+		return "[call]"
+	case msg.GetOrderMessage() != nil, msg.GetProductMessage() != nil:
+		return "[catalog item]"
+	case msg.GetListMessage() != nil, msg.GetButtonsMessage() != nil, msg.GetTemplateMessage() != nil,
+		msg.GetInteractiveMessage() != nil:
+		return "[interactive message]"
+	case msg.GetListResponseMessage() != nil, msg.GetButtonsResponseMessage() != nil,
+		msg.GetTemplateButtonReplyMessage() != nil, msg.GetInteractiveResponseMessage() != nil:
+		return "[button reply]"
 	}
+	// Name the field so an operator can tell from the row or the log what
+	// WhatsApp sent, instead of a bare "[unsupported]".
+	if name := firstFieldName(msg); name != "" {
+		return "[unsupported: " + name + "]"
+	}
+	return "[unsupported]"
+}
+
+// firstFieldName is the JSON name of the first populated field of a message,
+// e.g. "keepInChatMessage" — the wire type we did not translate.
+func firstFieldName(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	var name string
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if fd.Name() == "messageContextInfo" {
+			return true
+		}
+		name = fd.JSONName()
+		return false
+	})
+	return name
 }
 
 // receiptStatus maps a WhatsApp receipt to the status we record, reporting

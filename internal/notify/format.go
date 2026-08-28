@@ -111,14 +111,41 @@ func by(who string) string {
 	return " by " + who
 }
 
+// chatName says where a chat event happened. A group is named as a group, a
+// Status post and a Channel are labelled as such — the sender's name alone
+// would make a Status update read like a direct message from that person.
 func chatName(ev model.Event) string {
-	if ev.Chat != nil && ev.Chat.Name != "" {
-		return ev.Chat.Name
+	name := ""
+	if ev.Chat != nil {
+		name = ev.Chat.Name
 	}
-	if ev.Message != nil {
-		return attendee(ev.Message.Sender)
+	if name == "" && ev.Message != nil {
+		name = attendee(ev.Message.Sender)
+	}
+	if ev.Chat != nil {
+		switch ev.Chat.Kind {
+		case "group":
+			return "Group: " + firstNonEmpty(ev.Chat.Name, name, "unnamed")
+		case "status":
+			return "Status · " + firstNonEmpty(name, "unknown")
+		case "channel":
+			id := strings.TrimSuffix(ev.Chat.ID, "@newsletter")
+			return "Channel · " + firstNonEmpty(ev.Chat.Name, id, name)
+		}
+	}
+	if name != "" {
+		return name
 	}
 	return ev.AccountID
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func attendee(a model.Attendee) string {

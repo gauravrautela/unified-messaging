@@ -21,7 +21,7 @@ type Connection struct {
 type Chat struct {
 	ID            string     `json:"id"`
 	AccountID     string     `json:"account_id"`
-	Kind          string     `json:"kind"` // direct | group
+	Kind          string     `json:"kind"` // direct | group | status | channel
 	Name          string     `json:"name"`
 	UnreadCount   int        `json:"unread_count"`
 	LastMessageAt *time.Time `json:"last_message_at,omitempty"`

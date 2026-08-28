@@ -60,3 +60,24 @@ func TestFormatOtherEvents(t *testing.T) {
 		}
 	}
 }
+
+// The header says where a chat message came from: a group, a Status post,
+// a Channel, or a direct chat — the same sender name is not enough.
+func TestFormatChatHeaderShowsWhere(t *testing.T) {
+	msg := &model.ChatMessage{Sender: model.Attendee{Name: "Vatsal"}, Text: "[image]"}
+	cases := []struct {
+		chat *model.Chat
+		want string
+	}{
+		{&model.Chat{Kind: "status", Name: "Vatsal"}, "WhatsApp** · Status · Vatsal"},
+		{&model.Chat{Kind: "group", Name: "Founders"}, "WhatsApp** · Group: Founders"},
+		{&model.Chat{Kind: "channel", ID: "120363179221369609@newsletter"}, "WhatsApp** · Channel · 120363179221369609"},
+		{&model.Chat{Kind: "direct", Name: "Vatsal"}, "WhatsApp** · Vatsal"},
+	}
+	for _, c := range cases {
+		md := Format(model.Event{Type: model.EventChatReceived, AccountID: "acc_1", Chat: c.chat, Message: msg}, Markdown)
+		if !strings.Contains(md, c.want) {
+			t.Errorf("kind %s: want %q in\n%s", c.chat.Kind, c.want, md)
+		}
+	}
+}
