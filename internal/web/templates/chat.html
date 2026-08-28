@@ -168,9 +168,15 @@ document.addEventListener("DOMContentLoaded", () => {
     return el;
   }
 
+  // What a bubble actually shows. A poll that re-filled every bubble every
+  // five seconds would drop the reader's text selection each round, so the
+  // signature is stashed on the element and an unchanged message is left alone.
+  const sigOf = (m) => [m.text, m.status, m.edited_at, m.deleted, m.sent_at].join("\u0000");
+
   // Every value here goes in as text, never as markup: a message body is the
   // most attacker-controlled string on the page.
   function fill(el, m) {
+    el.dataset.sig = sigOf(m);
     el.className = "bubble" + (m.is_from_me ? " me" : "") + (m.deleted ? " deleted" : "") +
       (m.status === "sending" ? " sending" : "") + (m.status === "failed" ? " failed" : "");
     el.dataset.id = m.id;
@@ -221,7 +227,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (items.length && first && first.classList.contains("empty")) first.remove();
     for (const m of items) {
       const el = nodes.get(m.id);
-      if (el) { fill(el, m); continue; }
+      if (el) {
+        if (el.dataset.sig !== sigOf(m)) fill(el, m);
+        continue;
+      }
       const n = bubble(m);
       nodes.set(m.id, n);
       place(n, m);
@@ -279,6 +288,9 @@ document.addEventListener("DOMContentLoaded", () => {
     $("newmsgs").classList.add("hidden");
     setReading(false);
     emptyBox(box, "Select a chat", "");
+    // On a narrow screen the thread pane with nothing in it is a dead end:
+    // the list is the only thing worth showing until a chat is picked.
+    if (narrow()) openSide(true);
   }
 
   async function openChat(id, name) {
@@ -398,6 +410,7 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
       }
       await loadChats();
+      if (narrow() && !state.chat) openSide(true);
       // One poll, started once: a second um.poll for the same thread would
       // double every request and race its own merges.
       if (stopPoll) stopPoll();

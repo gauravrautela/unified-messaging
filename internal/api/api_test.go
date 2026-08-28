@@ -726,7 +726,7 @@ func TestDashboardShowsProviderPickerAndChatCards(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest("GET", "/dashboard", nil), dev.ID))
 	body := rec.Body.String()
-	for _, want := range []string{`id="connect-dialog"`, `um.accountState(`, `data-action="reconnect"`, `/chat?account_id=`, `maskPhone(`} {
+	for _, want := range []string{`id="connect-dialog"`, `um.accountState(`, `data-action="reconnect"`, `/chat?account_id=`, `um.maskPhone(`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)
 		}

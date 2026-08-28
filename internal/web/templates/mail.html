@@ -117,12 +117,37 @@ document.addEventListener("DOMContentLoaded", () => {
     return true;
   }
 
+  // A load that fails must not leave the skeletons shimmering for ever: say
+  // what went wrong where the rows would have been, and offer the one action
+  // that helps.
+  function errorRow(host, e, retry) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn sm";
+    btn.textContent = "Retry";
+    btn.addEventListener("click", retry);
+    const detail = document.createElement("span");
+    detail.append(((e && e.message) ? e.message : String(e)) + " ", btn);
+    emptyRow(host, "Could not load", detail);
+  }
+
   // ---- folders ----
 
+  // loadFolders and loadMessages report their own failures inline and never
+  // reject: an account switch or a second search can land while a request is
+  // in flight, and the answer to a stale one is to drop it, not to paint it
+  // over the account the reader is actually looking at.
   async function loadFolders() {
-    const host = $("folders");
+    const host = $("folders"), account = state.account;
     skeleton(host, 5);
-    const data = await api("/api/v1/folders?account_id=" + encodeURIComponent(state.account));
+    let data;
+    try {
+      data = await api("/api/v1/folders?account_id=" + encodeURIComponent(account));
+    } catch (e) {
+      if (state.account === account) errorRow(host, e, loadFolders);
+      return;
+    }
+    if (state.account !== account) return; // the account changed under this request
     const items = (data.items || []).slice().sort((a, b) => {
       const ra = a.role in ROLE_ORDER ? ROLE_ORDER[a.role] : 99;
       const rb = b.role in ROLE_ORDER ? ROLE_ORDER[b.role] : 99;
@@ -154,16 +179,27 @@ document.addEventListener("DOMContentLoaded", () => {
       '</button></li>';
   }
 
+  let listSeq = 0;
+
   async function loadMessages() {
-    const host = $("list");
+    const host = $("list"), account = state.account, seq = ++listSeq;
     skeleton(host, 8);
-    const p = new URLSearchParams({ account_id: state.account, limit: String(PAGE), offset: String(state.offset) });
+    const p = new URLSearchParams({ account_id: account, limit: String(PAGE), offset: String(state.offset) });
     // A search runs across the whole account; folder scoping applies otherwise.
     if (state.q) p.set("q", state.q);
     else if (state.folder) p.set("folder_id", state.folder);
     if (state.unread) p.set("unread", "true");
 
-    const data = await api("/api/v1/emails?" + p.toString());
+    let data;
+    try {
+      data = await api("/api/v1/emails?" + p.toString());
+    } catch (e) {
+      // Only the newest request owns the pane; an older one that failed says
+      // nothing, because its answer is no longer what is being asked.
+      if (seq === listSeq && state.account === account) errorRow(host, e, loadMessages);
+      return;
+    }
+    if (seq !== listSeq || state.account !== account) return;
     const items = data.items || [];
     if (items.length) host.innerHTML = items.map(listRow).join("");
     else if (state.q) emptyRow(host, "No results", "Nothing in this account matches that search.");
@@ -176,7 +212,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function reload() {
     state.offset = 0;
-    loadMessages().catch(fail);
+    loadMessages();
   }
 
   // ---- reader ----
@@ -243,8 +279,13 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   async function loadAttachments(id) {
+    const account = state.account;
     const data = await api("/api/v1/emails/" + encodeURIComponent(id) +
-      "/attachments?account_id=" + encodeURIComponent(state.account));
+      "/attachments?account_id=" + encodeURIComponent(account));
+    // The reader can have moved on while this was in flight, and #atts is
+    // whatever the reader holds *now* — hanging one message's attachments (and
+    // its download handler) under another one is how you send the wrong file.
+    if (state.selected !== id || state.account !== account) return;
     const atts = (data.items || []).filter((a) => !a.is_inline);
     const host = $("atts");
     if (!host || !atts.length) return;
@@ -262,7 +303,7 @@ document.addEventListener("DOMContentLoaded", () => {
         // reaches the disk as a blob rather than as a bare navigation.
         const res = await api.raw("/api/v1/emails/" + encodeURIComponent(id) +
           "/attachments/" + encodeURIComponent(att.id) +
-          "?account_id=" + encodeURIComponent(state.account));
+          "?account_id=" + encodeURIComponent(account));
         if (!res.ok) throw new Error("download failed (" + res.status + ")");
         const url = URL.createObjectURL(await res.blob());
         const a = document.createElement("a");
@@ -314,7 +355,7 @@ document.addEventListener("DOMContentLoaded", () => {
     setReading(false);
     $("reader-body").innerHTML = '<div class="empty">Select a message</div>';
     history.replaceState(null, "", "?account_id=" + encodeURIComponent(state.account));
-    try { await loadFolders(); } catch (e) { fail(e); }
+    await loadFolders();
     reload();
   });
 
@@ -334,11 +375,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
   $("newer").addEventListener("click", () => {
     state.offset = Math.max(0, state.offset - PAGE);
-    loadMessages().catch(fail);
+    loadMessages();
   });
   $("older").addEventListener("click", () => {
     state.offset += PAGE;
-    loadMessages().catch(fail);
+    loadMessages();
   });
 
   // ---- boot ----
