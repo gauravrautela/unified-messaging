@@ -26,9 +26,16 @@ import (
 // renderPage executes the named web template into a buffer before writing
 // anything to w, so a template error (a typo'd field, a page added to
 // Templates() without every layout it needs) becomes a clean 500 instead of
-// a 200 whose body silently cuts off mid-render. Later page handlers should
-// call this rather than writing headers and executing a template by hand.
-func (s *Server) renderPage(w http.ResponseWriter, name string, data any) {
+// a 200 whose body silently cuts off mid-render. Every HTML page in the
+// server goes through here rather than writing headers and executing a
+// template by hand.
+//
+// status is a parameter because not every page is a 200: an auth form
+// re-renders under 400/401/403/500 and a connect result under 404/410, and
+// "this link expired" must not answer OK. Anything the handler wants on the
+// response (Cache-Control, Vary) must be set before the call — the buffer is
+// only written out once the template has succeeded.
+func (s *Server) renderPage(w http.ResponseWriter, status int, name string, data any) {
 	var buf bytes.Buffer
 	if err := web.Templates().ExecuteTemplate(&buf, name, data); err != nil {
 		s.log.Error("render page", "page", name, "err", err)
@@ -36,7 +43,7 @@ func (s *Server) renderPage(w http.ResponseWriter, name string, data any) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	_, _ = buf.WriteTo(w)
 }
 
@@ -98,11 +105,15 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 	email := ""
 	if dev, ok := s.sessionDeveloper(w, r); ok {
 		email = dev.Email
+		// Signed in, the homepage names the developer and swaps the CTAs for
+		// a Dashboard link, so it is no longer one document a shared cache
+		// may hand to the next visitor.
+		markSessionVaried(w)
 	}
 	// Title is left blank: layout_head renders a bare "Entropix" title when
 	// Title is empty, rather than the homepage repeating the name twice.
-	s.renderPage(w, "site", map[string]any{
-		"Shell":     web.Shell{Version: web.Version, Email: email},
+	s.renderPage(w, http.StatusOK, "site", map[string]any{
+		"Shell":     web.Shell{Version: web.Version, Email: email, Styles: []string{"site.css"}},
 		"Providers": s.siteProviders(),
 		"Events":    docs.Events,
 		"Send":      docs.SendMessage,

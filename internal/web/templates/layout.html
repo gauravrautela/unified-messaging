@@ -2,7 +2,8 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{if .Shell.Title}}{{.Shell.Title}} · {{end}}Entropix</title>
 <link rel="stylesheet" href="/static/app.css?v={{.Shell.Version}}">
-<script src="/static/app.js?v={{.Shell.Version}}" defer></script>
+{{range .Shell.Styles}}<link rel="stylesheet" href="/static/{{.}}?v={{$.Shell.Version}}">
+{{end}}<script src="/static/app.js?v={{.Shell.Version}}" defer></script>
 </head><body>{{end}}
 
 {{define "layout_start"}}{{template "layout_head" .}}

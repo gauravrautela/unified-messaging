@@ -655,28 +655,68 @@ var nativeDialogCalls = []*regexp.Regexp{
 // being evaluated: window.um does not exist yet, and #notice (in layout_end)
 // has not been parsed either. Everything the page does therefore has to wait
 // for DOMContentLoaded — reading um at the top level would throw a
-// ReferenceError and leave the whole dashboard inert.
-func TestDashboardScriptWaitsForDeferredHelpers(t *testing.T) {
-	s, _ := newTestServer(t)
+// ReferenceError and leave the page inert.
+//
+// Every page with an inline script is checked, not just the dashboard: the
+// rule is a property of the shared layout, so a new page inheriting it is
+// exactly where the mistake would reappear.
+func TestPageScriptsWaitForDeferredHelpers(t *testing.T) {
+	s, db := newTestServer(t)
 	dev, _ := seedDev(t, s, "a@x.com")
-	rec := httptest.NewRecorder()
-	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
-	body := rec.Body.String()
+	// The QR connect page needs a live link state to render; nothing else
+	// here needs any setup at all.
+	if err := db.SaveOAuthState(store.OAuthState{
+		State: "st_defer", DeveloperID: dev.ID, Provider: "FAKECHAT",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	if !strings.Contains(body, `src="/static/app.js?v=`) || !strings.Contains(body, "defer") {
-		t.Fatal("dashboard does not load app.js with defer; this test's premise no longer holds")
-	}
-	start := strings.Index(body, "<script>")
-	if start < 0 {
-		t.Fatal("dashboard has no inline script")
-	}
-	script := body[start:]
-	ready := strings.Index(script, "DOMContentLoaded")
-	if ready < 0 {
-		t.Fatal("dashboard script never waits for DOMContentLoaded, so it runs before the deferred app.js")
-	}
-	if strings.Contains(script[:ready], "= um") {
-		t.Fatal("dashboard script reads um before DOMContentLoaded, when app.js has not run yet")
+	for _, tc := range []struct {
+		path    string
+		session bool
+	}{
+		{"/dashboard", true},
+		{"/mail", true},
+		{"/chat", true},
+		{"/docs", true},
+		{"/docs", false},
+		{"/login", false},
+		{"/", false},
+		{"/connect/st_defer", false},
+	} {
+		name := tc.path
+		if tc.session {
+			name += " (signed in)"
+		}
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.session {
+				req = withSession(t, s, req, dev.ID)
+			}
+			rec := httptest.NewRecorder()
+			s.Routes().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			body := rec.Body.String()
+
+			if !strings.Contains(body, `src="/static/app.js?v=`) || !strings.Contains(body, "defer") {
+				t.Fatal("page does not load app.js with defer; this test's premise no longer holds")
+			}
+			start := strings.Index(body, "<script>")
+			if start < 0 {
+				t.Skip("page has no inline script")
+			}
+			script := body[start:]
+			ready := strings.Index(script, "DOMContentLoaded")
+			if ready < 0 {
+				t.Fatal("page script never waits for DOMContentLoaded, so it runs before the deferred app.js")
+			}
+			if strings.Contains(script[:ready], "= um") {
+				t.Fatal("page script reads um before DOMContentLoaded, when app.js has not run yet")
+			}
+		})
 	}
 }
 

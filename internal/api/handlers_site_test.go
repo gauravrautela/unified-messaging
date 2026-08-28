@@ -4,6 +4,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -125,5 +126,38 @@ func TestSiteHeroShowsTheSendSnippetInThreeLanguages(t *testing.T) {
 			!strings.Contains(body, want) {
 			t.Fatalf("hero missing snippet line %q", want)
 		}
+	}
+}
+
+// The homepage is left out of noStorePrefixes so an anonymous visitor's
+// browser (and any cache in front of it) may keep it. That only holds while
+// it is the same document for everyone: signed in it names the developer and
+// swaps the CTAs for a Dashboard link, so it turns private and varies by
+// cookie for that request only.
+func TestSiteIsCacheableAnonymouslyAndPrivateWhenSignedIn(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/", nil), dev.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signed-in GET / = %d", rec.Code)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "private, no-store" {
+		t.Errorf("signed-in cache-control = %q, want %q", cc, "private, no-store")
+	}
+	if v := rec.Header().Values("Vary"); !slices.Contains(v, "Cookie") {
+		t.Errorf("signed-in Vary = %v, want it to include Cookie", v)
+	}
+	// The page really did render the signed-in variant, so the header is
+	// guarding something.
+	if !strings.Contains(rec.Body.String(), `href="/dashboard"`) {
+		t.Error("signed-in homepage does not show the Dashboard link")
+	}
+
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if cc := rec.Header().Get("Cache-Control"); strings.Contains(cc, "no-store") {
+		t.Errorf("anonymous cache-control = %q, want it cacheable", cc)
 	}
 }

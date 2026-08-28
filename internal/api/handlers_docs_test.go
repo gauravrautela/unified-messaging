@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -74,5 +75,66 @@ func TestDocsListsEveryRouteWithAnchors(t *testing.T) {
 	}
 	if !strings.Contains(body, `id="toc-filter"`) {
 		t.Error("docs missing the table-of-contents filter")
+	}
+}
+
+// getDocs renders GET /docs, optionally with a session, and returns the
+// recorder so a caller can look at headers as well as the body.
+func getDocs(t *testing.T, signedIn bool) *httptest.ResponseRecorder {
+	t.Helper()
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/docs", nil)
+	if signedIn {
+		dev, _ := seedDev(t, s, "a@x.com")
+		req = withSession(t, s, req, dev.ID)
+	}
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /docs (signedIn=%v) = %d", signedIn, rec.Code)
+	}
+	return rec
+}
+
+// /docs is public and cacheable — that is the point of leaving it out of
+// noStorePrefixes — but only while it is the same document for everyone.
+// Once a session resolves it carries an email and a live CSRF token, so that
+// response must not be parked in any shared cache, and it varies by cookie.
+func TestDocsIsCacheableAnonymouslyAndPrivateWhenSignedIn(t *testing.T) {
+	rec := getDocs(t, true)
+	if cc := rec.Header().Get("Cache-Control"); cc != "private, no-store" {
+		t.Errorf("signed-in cache-control = %q, want %q", cc, "private, no-store")
+	}
+	if v := rec.Header().Values("Vary"); !slices.Contains(v, "Cookie") {
+		t.Errorf("signed-in Vary = %v, want it to include Cookie", v)
+	}
+
+	rec = getDocs(t, false)
+	if cc := rec.Header().Get("Cache-Control"); strings.Contains(cc, "no-store") {
+		t.Errorf("anonymous cache-control = %q, want it cacheable", cc)
+	}
+}
+
+// The reference renders on both shells (spec §5): an anonymous reader has no
+// console to navigate, so they get the site chrome — wordmark to the
+// homepage, Sign in — rather than a Mail/Chat nav that would bounce them
+// straight to a login form.
+func TestDocsUsesTheSiteShellWhenAnonymous(t *testing.T) {
+	body := getDocs(t, false).Body.String()
+	if !strings.Contains(body, `href="/"`) {
+		t.Error("anonymous docs has no wordmark link to the homepage")
+	}
+	if strings.Contains(body, `href="/mail"`) {
+		t.Error("anonymous docs renders the console nav, which needs a session")
+	}
+	if !strings.Contains(body, `href="/login"`) {
+		t.Error("anonymous docs offers no way to sign in")
+	}
+
+	body = getDocs(t, true).Body.String()
+	for _, want := range []string{`href="/dashboard"`, `href="/mail"`, `href="/chat"`, "Sign out"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("signed-in docs missing console nav %q", want)
+		}
 	}
 }

@@ -90,7 +90,7 @@ func TestTemplatesParseAndLayoutsRender(t *testing.T) {
 		for _, tc := range titles {
 			var sb strings.Builder
 			err := Templates().ExecuteTemplate(&sb, name, map[string]any{
-				"Shell": Shell{Title: tc.title, Version: Version},
+				"Shell": Shell{Title: tc.title, Version: Version, Styles: []string{"site.css"}},
 			})
 			if err != nil {
 				t.Fatalf("%s: %v", name, err)
@@ -102,5 +102,49 @@ func TestTemplatesParseAndLayoutsRender(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A page's extra stylesheets belong in <head>, after app.css so they can
+// override it — not linked from inside <body>, which is invalid HTML and
+// costs the browser a re-render when the sheet lands. Shell.Styles is how a
+// handler asks for one; an empty Styles must add nothing at all.
+func TestLayoutHeadEmitsShellStylesInHead(t *testing.T) {
+	render := func(t *testing.T, styles []string) string {
+		t.Helper()
+		var sb strings.Builder
+		if err := Templates().ExecuteTemplate(&sb, "site", map[string]any{
+			"Shell": Shell{Version: Version, Styles: styles},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return sb.String()
+	}
+
+	out := render(t, []string{"site.css", "docs.css"})
+	head, _, ok := strings.Cut(out, "<body>")
+	if !ok {
+		t.Fatal("rendered page has no <body>")
+	}
+	for _, want := range []string{
+		`<link rel="stylesheet" href="/static/site.css?v=` + Version + `">`,
+		`<link rel="stylesheet" href="/static/docs.css?v=` + Version + `">`,
+	} {
+		if !strings.Contains(head, want) {
+			t.Errorf("head missing %q", want)
+		}
+	}
+	// After app.css, so a page sheet wins on equal specificity.
+	if strings.Index(head, "app.css") > strings.Index(head, "site.css") {
+		t.Error("page stylesheet is linked before app.css")
+	}
+	// $ inside the range must resolve to the outer Shell; a mis-scoped
+	// {{.Shell.Version}} would render an empty ?v=.
+	if strings.Contains(out, "?v=\"") || strings.Contains(out, "?v=>") {
+		t.Error("stylesheet link lost its cache-busting version")
+	}
+
+	if out := render(t, nil); strings.Contains(out, "/static/site.css") {
+		t.Error("empty Shell.Styles still emitted a stylesheet link")
 	}
 }

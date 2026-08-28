@@ -48,16 +48,17 @@ import (
 	"os"
 )
 
+// Set BASE, API_KEY, CHAT_ID and ACCOUNT_ID in the environment, then go run.
 func main() {
-	body, _ := json.Marshal(map[string]string{
-		"text": "Hi Grace — following up on the roadmap.",
-	})
-	url := os.Getenv("BASE") + "/api/v1/chats/" + chatID + "/messages?account_id=" + accountID
+	url := os.Getenv("BASE") + "/api/v1/chats/" + os.Getenv("CHAT_ID") +
+		"/messages?account_id=" + os.Getenv("ACCOUNT_ID")
+	body, _ := json.Marshal(map[string]string{"text": "Hi Grace — following up."})
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+os.Getenv("API_KEY"))
 	req.Header.Set("Content-Type", "application/json")
-	// Optional, but the cheapest way to make a retry safe.
-	req.Header.Set("Idempotency-Key", idempotencyKey)
+	// Same key + same body on a retry replays the first response
+	// instead of sending the message twice.
+	req.Header.Set("Idempotency-Key", os.Getenv("IDEMPOTENCY_KEY"))
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -65,10 +66,7 @@ func main() {
 	}
 	defer res.Body.Close()
 
-	var msg struct {
-		ID     string ` + "`json:\"id\"`" + `
-		Status string ` + "`json:\"status\"`" + `
-	}
+	var msg struct{ ID, Status string }
 	if err := json.NewDecoder(res.Body).Decode(&msg); err != nil {
 		panic(err)
 	}

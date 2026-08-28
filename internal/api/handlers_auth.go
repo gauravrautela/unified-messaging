@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
@@ -142,14 +141,17 @@ func loginPage(next, email, errMsg string) authPage {
 	if next != "" {
 		action += "?next=" + url.QueryEscape(next)
 	}
-	return authPage{Title: "Sign in to Entropix", Lead: "Manage connected accounts, webhooks and API keys.",
+	// Title is the page title as well as the form's heading, and layout_head
+	// already appends "· Entropix" — naming the brand here too would render
+	// "Sign in to Entropix · Entropix".
+	return authPage{Title: "Sign in", Lead: "Manage connected accounts, webhooks and API keys.",
 		Action: action, Button: "Sign in", Pending: "Signing in…",
 		AltLead: "New here?", AltHref: "/signup", AltText: "Create an account",
 		Email: email, Error: errMsg}
 }
 
 func signupPage(email, errMsg string) authPage {
-	return authPage{Title: "Create your Entropix account", Lead: "One account per developer. You will get API keys next.",
+	return authPage{Title: "Create account", Lead: "One account per developer. You will get API keys next.",
 		Action: "/signup", Button: "Create account", Pending: "Creating account…",
 		AltLead: "Already have one?", AltHref: "/login", AltText: "Sign in",
 		Email: email, Error: errMsg, Signup: true}
@@ -159,24 +161,15 @@ func signupPage(email, errMsg string) authPage {
 // and all six error paths — mints or refreshes the CSRF cookie and embeds the
 // matching field. A page rendered without one would 403 on submit.
 //
-// It buffers like renderPage, for the same reason, but cannot use it: an
-// auth form renders under five different statuses (200, 400, 401, 403, 500)
-// and renderPage always writes 200.
+// Everything past the token — buffering, the Content-Type, the status — is
+// renderPage's job: an auth form renders under five different statuses (200,
+// 400, 401, 403, 500) and renderPage takes the status as a parameter.
 func (s *Server) renderAuth(w http.ResponseWriter, r *http.Request, status int, p authPage) {
 	p.CSRF = s.csrfToken(w, r)
-	data := map[string]any{
+	s.renderPage(w, status, "login", map[string]any{
 		"Shell": web.Shell{Title: p.Title, Version: web.Version},
 		"P":     p,
-	}
-	var buf bytes.Buffer
-	if err := web.Templates().ExecuteTemplate(&buf, "login", data); err != nil {
-		s.log.Error("render page", "page", "login", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = buf.WriteTo(w)
+	})
 }
 
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {

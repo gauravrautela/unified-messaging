@@ -241,14 +241,14 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	state := r.PathValue("state")
 	pending, err := s.store.PeekOAuthState(state)
 	if err != nil {
-		renderResult(w, http.StatusNotFound, resultPage{
+		s.renderResult(w, http.StatusNotFound, resultPage{
 			Title: "Link not valid",
 			Body:  "This connection link is unknown or has already been used. Ask the app you came from for a new one.",
 		})
 		return
 	}
 	if time.Now().After(pending.ExpiresAt) {
-		renderResult(w, http.StatusGone, resultPage{
+		s.renderResult(w, http.StatusGone, resultPage{
 			Title: "Link expired",
 			Body:  "This connection link has expired. Ask the app you came from for a new one.",
 		})
@@ -257,7 +257,7 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 
 	p, err := s.resolveProvider(pending.Provider)
 	if err != nil {
-		renderResult(w, http.StatusInternalServerError, resultPage{
+		s.renderResult(w, http.StatusInternalServerError, resultPage{
 			Title:  "We can't connect that account right now",
 			Body:   "This connection link refers to a backend that is no longer configured. Nothing was shared.",
 			Detail: err.Error(),
@@ -313,7 +313,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			}), http.StatusFound)
 			return
 		}
-		renderResult(w, http.StatusBadRequest, resultPage{
+		s.renderResult(w, http.StatusBadRequest, resultPage{
 			Title:  "Connection cancelled",
 			Body:   "The account was not connected, and nothing was shared.",
 			Detail: errorDetail(errCode, desc),
@@ -323,7 +323,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	pending, err := s.store.TakeOAuthState(state)
 	if err != nil {
-		renderResult(w, http.StatusBadRequest, resultPage{
+		s.renderResult(w, http.StatusBadRequest, resultPage{
 			Title: "Link not valid",
 			Body:  "This connection link is unknown, expired, or has already been used. Ask the app you came from for a new one.",
 		})
@@ -378,10 +378,11 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// already redirected above — so this page is where the flow ends. The
 	// account id still rides along, behind Details with a copy button, because
 	// an integrator without notify_url has no other way to learn it.
-	renderResult(w, http.StatusOK, resultPage{
-		Title: "Account connected",
-		Body:  acct.Email + " is now connected.",
-		Copy:  acct.ID,
+	s.renderResult(w, http.StatusOK, resultPage{
+		Title:   "Account connected",
+		Body:    acct.Email + " is now connected.",
+		Copy:    acct.ID,
+		Success: true,
 	})
 }
 
@@ -407,7 +408,7 @@ func (s *Server) failConnect(w http.ResponseWriter, r *http.Request, pending sto
 		}), http.StatusFound)
 		return
 	}
-	renderResult(w, http.StatusBadRequest, resultPage{
+	s.renderResult(w, http.StatusBadRequest, resultPage{
 		Title:  "We couldn't finish connecting",
 		Body:   "The account was not connected, and nothing was shared. You can try again from the app you came from.",
 		Detail: errorDetail(code, msg),
@@ -541,30 +542,23 @@ func appendQuery(raw string, extra url.Values) string {
 type resultPage struct {
 	Title, Body, Detail string
 	Copy                string
+	// Success marks the one outcome the person can walk away from. Only that
+	// page says "you can return to the app now" — telling someone whose
+	// connection just failed to go back to the app would be telling them the
+	// wrong thing.
+	Success bool
 }
 
 // renderResult writes one outcome through the same public layout the rest of
-// the connect flow uses, at the status code the outcome actually deserves.
-//
-// It buffers before writing, so a template error becomes a clean 500 rather
-// than a half-rendered page under a 200 — the same contract as
-// Server.renderPage, which cannot be used here because it always writes 200
-// and "this link expired" must not answer OK. Worth folding a status
-// parameter into renderPage and deleting this once handlers_misc.go is free
-// to change.
-func renderResult(w http.ResponseWriter, status int, p resultPage) {
-	var buf bytes.Buffer
-	if err := web.Templates().ExecuteTemplate(&buf, "connect_result", map[string]any{
-		"Shell":  web.Shell{Title: p.Title, Version: web.Version},
-		"Title":  p.Title,
-		"Body":   p.Body,
-		"Detail": p.Detail,
-		"Copy":   p.Copy,
-	}); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = buf.WriteTo(w)
+// the connect flow uses, at the status code the outcome actually deserves —
+// "this link expired" must not answer OK.
+func (s *Server) renderResult(w http.ResponseWriter, status int, p resultPage) {
+	s.renderPage(w, status, "connect_result", map[string]any{
+		"Shell":   web.Shell{Title: p.Title, Version: web.Version, Styles: []string{"connect.css"}},
+		"Title":   p.Title,
+		"Body":    p.Body,
+		"Detail":  p.Detail,
+		"Copy":    p.Copy,
+		"Success": p.Success,
+	})
 }

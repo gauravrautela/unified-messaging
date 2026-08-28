@@ -64,10 +64,11 @@ main.page.docs{max-width:88rem;display:grid;gap:var(--s6);grid-template-columns:
 .docs .pane:hover .copy,.docs .copy:focus-visible{opacity:1}
 .docs .snippet{margin:var(--s2) 0 var(--s4)}
 .docs .snippet .tabs{margin:0 0 var(--s1);border-bottom:0;align-items:center}
-.docs .snippet .tabs button{background:none;border:0;font:inherit;font-size:13px;color:var(--muted);cursor:pointer;
+.docs .snippet .tabs .langs{display:flex;gap:var(--s1)}
+.docs .snippet .tabs .lang{background:none;border:0;font:inherit;font-size:13px;color:var(--muted);cursor:pointer;
   padding:var(--s2) var(--s3);border-bottom:2px solid transparent;border-radius:var(--r1) var(--r1) 0 0}
-.docs .snippet .tabs button:hover{color:var(--text)}
-.docs .snippet .tabs button[aria-selected=true]{color:var(--text);border-bottom-color:var(--accent)}
+.docs .snippet .tabs .lang:hover{color:var(--text)}
+.docs .snippet .tabs .lang[aria-pressed=true]{color:var(--text);border-bottom-color:var(--accent)}
 .docs .snippet .tabs .spacer{flex:1}
 
 /* --- events and errors --- */

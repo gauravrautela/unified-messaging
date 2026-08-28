@@ -2,6 +2,9 @@ package docs
 
 import (
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -206,5 +209,37 @@ func TestDeliveryFormatSamplesParse(t *testing.T) {
 		if strings.TrimSpace(n) == "" {
 			t.Errorf("KindNotes[%d] is blank", i)
 		}
+	}
+}
+
+// The Go snippet is advertised as runnable, so it has to be a real program:
+// it once referenced chatID, accountID and idempotencyKey without declaring
+// them anywhere, which no reader could have compiled. go vet type-checks, so
+// an undeclared name or an unused import fails here rather than in someone's
+// editor.
+func TestGoSnippetCompiles(t *testing.T) {
+	gobin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("no go binary on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module snippet\n\ngo 1.24\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(SendMessage.Go+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(gobin, "vet", "./...")
+	cmd.Dir = dir
+	// A sandboxed or offline builder must not fail the suite over a module
+	// cache it cannot write; the snippet uses stdlib only, so nothing needs
+	// to be downloaded.
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOPROXY=off")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go vet on the Go snippet failed: %v\n%s\n--- snippet ---\n%s", err, out, SendMessage.Go)
+	}
+	// Short enough to read on the page without scrolling past the point.
+	if n := strings.Count(SendMessage.Go, "\n") + 1; n > 35 {
+		t.Errorf("Go snippet is %d lines; keep it short enough to read in a code pane", n)
 	}
 }

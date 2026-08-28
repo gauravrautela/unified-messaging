@@ -22,7 +22,7 @@ func (s *Server) handleMailPage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Minted before anything is written; the layout's Sign out form carries it.
 	csrf := s.csrfToken(w, r)
-	s.renderPage(w, "mail", map[string]any{
+	s.renderPage(w, http.StatusOK, "mail", map[string]any{
 		"Shell": web.Shell{Title: "Mail", Version: web.Version, Email: dev.Email, CSRF: csrf, Nav: "mail"},
 	})
 }

@@ -77,8 +77,8 @@ func scopeSentences(scopes []string) []string {
 // is nowhere honest to send someone who changed their mind, so the page says
 // so instead of offering a button that goes nowhere.
 func (s *Server) renderConnectOAuth(w http.ResponseWriter, display, authorizeURL, cancel string) {
-	s.renderPage(w, "connect_oauth", map[string]any{
-		"Shell":        web.Shell{Title: "Connect " + display, Version: web.Version},
+	s.renderPage(w, http.StatusOK, "connect_oauth", map[string]any{
+		"Shell":        web.Shell{Title: "Connect " + display, Version: web.Version, Styles: []string{"connect.css"}},
 		"Provider":     display,
 		"AuthorizeURL": authorizeURL,
 		"Scopes":       scopeSentences(s.cfg.Scopes),
@@ -110,7 +110,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// The token has to be minted before anything is written, and the layout's
 	// logout form carries it as a hidden field.
 	csrf := s.csrfToken(w, r)
-	s.renderPage(w, "dashboard", map[string]any{
+	s.renderPage(w, http.StatusOK, "dashboard", map[string]any{
 		"Shell":  web.Shell{Title: "Dashboard", Version: web.Version, Email: dev.Email, CSRF: csrf, Nav: "dashboard"},
 		"Events": webhookEvents,
 	})

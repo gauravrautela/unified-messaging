@@ -116,9 +116,18 @@
     let timer = null, stopped = false;
     const tick = async () => { if (stopped || document.hidden) return; try { await fn(); } catch (_) { /* fn reports */ } };
     const start = () => { if (timer) clearInterval(timer); timer = setInterval(tick, ms); };
-    document.addEventListener("visibilitychange", () => { if (!document.hidden && !stopped) { tick(); start(); } });
+    // Named so stop() can take it back off document: a page that re-polls on
+    // every selection change (the mail and chat viewers do) would otherwise
+    // leave one live listener per call behind, each one still ticking its own
+    // closure every time the tab is revealed.
+    const onVisible = () => { if (!document.hidden && !stopped) { tick(); start(); } };
+    document.addEventListener("visibilitychange", onVisible);
     start();
-    return () => { stopped = true; clearInterval(timer); };
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }
 
   function listNav(container) {

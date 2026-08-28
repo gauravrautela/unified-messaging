@@ -19,8 +19,8 @@ func TestAuthPagesRenderOnThePublicShell(t *testing.T) {
 		path, title string
 		fields      []string
 	}{
-		{"/login", "Sign in to Entropix", []string{`autocomplete="current-password"`}},
-		{"/signup", "Create your Entropix account", []string{`autocomplete="new-password"`, `minlength="10"`, `for="name"`}},
+		{"/login", "<title>Sign in · Entropix</title>", []string{`autocomplete="current-password"`}},
+		{"/signup", "<title>Create account · Entropix</title>", []string{`autocomplete="new-password"`, `minlength="10"`, `for="name"`}},
 	} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))

@@ -10,7 +10,6 @@
      when the developer configured a success_redirect_url the callback 302s to
      it and this page never renders at all. */}}
 {{define "connect_result_content"}}
-<link rel="stylesheet" href="/static/connect.css?v={{.Shell.Version}}">
 <h1>{{.Title}}</h1>
 <p class="muted" style="margin:var(--s2) 0 0">{{.Body}}</p>
 {{if or .Copy .Detail}}
@@ -25,7 +24,10 @@
   {{if .Detail}}<pre>{{.Detail}}</pre>{{end}}
 </details>
 {{end}}
-<p class="muted small" style="margin-top:var(--s5)">You can return to the app now.</p>
+{{/* Only a connected account is something to walk away from; on a cancelled,
+     expired or failed link there is nothing waiting back in the app, so that
+     page says the honest thing instead. */}}
+<p class="muted small" style="margin-top:var(--s5)">{{if .Success}}You can return to the app now.{{else}}You can close this page.{{end}}</p>
 <script>
 // app.js is deferred; um only exists once DOMContentLoaded fires.
 document.addEventListener("DOMContentLoaded", function () {

@@ -25,9 +25,14 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	email, csrf := "", ""
 	if dev, ok := s.sessionDeveloper(w, r); ok {
 		email, csrf = dev.Email, s.csrfToken(w, r)
+		// Signed in, the page is no longer the same document for everyone:
+		// it carries this developer's email and a live CSRF token. Neither
+		// may be parked in a shared cache and handed to the next reader, and
+		// the response varies by the session cookie.
+		markSessionVaried(w)
 	}
-	s.renderPage(w, "docs", map[string]any{
-		"Shell":  web.Shell{Title: "API reference", Version: web.Version, Email: email, CSRF: csrf, Nav: "docs"},
+	s.renderPage(w, http.StatusOK, "docs", map[string]any{
+		"Shell":  web.Shell{Title: "API reference", Version: web.Version, Email: email, CSRF: csrf, Nav: "docs", Styles: []string{"docs.css"}},
 		"Groups": docs.Grouped(),
 		"Events": docs.Events,
 		"Errors": docs.Errors,

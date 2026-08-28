@@ -695,8 +695,8 @@ func (s *Server) forgetDeviceOnFailure(ctx context.Context, log *slog.Logger, pr
 // linkRegistry.claim) — a cross-site POST carries no such cookie at all.
 func (s *Server) renderConnectQR(w http.ResponseWriter, providerName, state string) {
 	display := provider.DisplayName(providerName)
-	s.renderPage(w, "connect_qr", map[string]any{
-		"Shell":    web.Shell{Title: "Connect " + display, Version: web.Version},
+	s.renderPage(w, http.StatusOK, "connect_qr", map[string]any{
+		"Shell":    web.Shell{Title: "Connect " + display, Version: web.Version, Styles: []string{"connect.css"}},
 		"Provider": display,
 		"State":    state,
 	})

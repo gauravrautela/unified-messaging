@@ -28,8 +28,27 @@ func (s *Server) requestIsHTTPS(r *http.Request) bool {
 }
 
 // noStorePrefixes are tenant- or credential-bearing surfaces a shared cache
-// must never keep. /docs, /llms.txt and /healthz are deliberately absent.
+// must never keep. /llms.txt and /healthz are deliberately absent: they are
+// the same bytes for everyone.
+//
+// /docs and / are absent too, but for a narrower reason — they are cacheable
+// only while nobody is signed in. Both render a different document once a
+// session resolves (an email, a sign-out CSRF token, different CTAs), so
+// those handlers call markSessionVaried themselves rather than being pinned
+// no-store here for the anonymous readers who are most of their traffic.
 var noStorePrefixes = []string{"/api/", "/dashboard", "/mail", "/chat", "/connect/", "/oauth/", "/login", "/signup", "/logout"}
+
+// markSessionVaried marks a response that is public by default but became
+// session-specific on this request. It must be called before any body is
+// written — renderPage buffers, so calling it just before the render is fine.
+//
+// private (not just no-store) keeps a CDN or corporate proxy from holding one
+// developer's page at all, and Vary: Cookie keeps the browser's own cache
+// from replaying it after sign-out.
+func markSessionVaried(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Add("Vary", "Cookie")
+}
 
 func (s *Server) secureHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

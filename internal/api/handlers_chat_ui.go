@@ -22,7 +22,7 @@ func (s *Server) handleChatPage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Minted before anything is written; the layout's Sign out form carries it.
 	csrf := s.csrfToken(w, r)
-	s.renderPage(w, "chat", map[string]any{
+	s.renderPage(w, http.StatusOK, "chat", map[string]any{
 		"Shell": web.Shell{Title: "Chat", Version: web.Version, Email: dev.Email, CSRF: csrf, Nav: "chat"},
 	})
 }

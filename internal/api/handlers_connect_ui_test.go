@@ -126,11 +126,13 @@ func TestConnectResultPageKeepsStatusAndUsesLayout(t *testing.T) {
 // above it. And there is no Continue button on any result page — a developer
 // who configured success_redirect_url was already 302'd and never sees this.
 func TestConnectResultPageKeepsTheAccountIDInsideDetails(t *testing.T) {
+	s, _ := newTestServer(t)
 	rec := httptest.NewRecorder()
-	renderResult(rec, http.StatusOK, resultPage{
-		Title: "Account connected",
-		Body:  "a@x.com is now connected.",
-		Copy:  "acc_123abc",
+	s.renderResult(rec, http.StatusOK, resultPage{
+		Title:   "Account connected",
+		Body:    "a@x.com is now connected.",
+		Copy:    "acc_123abc",
+		Success: true,
 	})
 	body := rec.Body.String()
 
@@ -154,7 +156,7 @@ func TestConnectResultPageKeepsTheAccountIDInsideDetails(t *testing.T) {
 
 	// A provider error shares that one block; a page with neither has none.
 	rec = httptest.NewRecorder()
-	renderResult(rec, http.StatusBadRequest, resultPage{
+	s.renderResult(rec, http.StatusBadRequest, resultPage{
 		Title: "Connection cancelled", Body: "The account was not connected, and nothing was shared.",
 		Detail: "access_denied: the user declined",
 	})
@@ -164,7 +166,7 @@ func TestConnectResultPageKeepsTheAccountIDInsideDetails(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	renderResult(rec, http.StatusGone, resultPage{Title: "Link expired", Body: "This connection link has expired."})
+	s.renderResult(rec, http.StatusGone, resultPage{Title: "Link expired", Body: "This connection link has expired."})
 	if strings.Contains(rec.Body.String(), "<details") {
 		t.Fatal("empty Details block rendered with nothing to put in it")
 	}

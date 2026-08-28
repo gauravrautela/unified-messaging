@@ -42,6 +42,11 @@ type Shell struct {
 	Email   string // signed-in developer, "" when anonymous
 	CSRF    string // logout form; "" on public pages
 	Nav     string // "dashboard" | "mail" | "chat" | "docs" | "" for aria-current
+	// Styles are extra stylesheets this page needs, as bare file names under
+	// /static ("site.css"). layout_head emits them after app.css, in <head>
+	// where a stylesheet belongs: linking one from inside <body> is invalid
+	// HTML and costs a re-render once it arrives.
+	Styles []string
 }
 
 // Static serves /static/{file}. Everything under it is content-addressed by

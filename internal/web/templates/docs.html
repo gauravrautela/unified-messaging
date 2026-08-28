@@ -1,21 +1,27 @@
-{{define "docs"}}{{template "layout_start" .}}{{template "docs_content" .}}{{template "layout_end" .}}{{end}}
+{{/* The reference is the one page that renders on both shells. A signed-in
+     developer gets the console chrome (Dashboard / Mail / Chat / Docs and a
+     working Sign out); an anonymous reader — who has no console to go back
+     to — gets the site chrome instead, so the wordmark leads to the homepage
+     and there is a Sign in / Get API key to act on. */}}
+{{define "docs"}}{{if .Shell.Email}}{{template "layout_start" .}}{{template "docs_content" .}}{{template "layout_end" .}}{{else}}{{template "layout_site_start" .}}{{template "docs_content" .}}{{template "layout_site_end" .}}{{end}}{{end}}
 
 {{/* snippet renders one operation three ways. The tabs and the copy button
      are wired by the page script; with JavaScript off the curl pane — the one
      that is runnable as written — is still there. */}}
 {{define "snippet"}}<div class="snippet">
-  <div class="tabs sm" role="tablist" aria-label="Language">
-    <button type="button" role="tab" aria-selected="true" data-lang="curl">curl</button>
-    <button type="button" role="tab" aria-selected="false" data-lang="node">Node</button>
-    <button type="button" role="tab" aria-selected="false" data-lang="go">Go</button>
+  <div class="tabs sm">
+    <div class="langs" role="group" aria-label="Language">
+      <button type="button" class="lang" aria-pressed="true" data-lang="curl">curl</button>
+      <button type="button" class="lang" aria-pressed="false" data-lang="node">Node</button>
+      <button type="button" class="lang" aria-pressed="false" data-lang="go">Go</button>
+    </div>
     <span class="spacer"></span>
     <button class="btn ghost sm" type="button" data-copy>Copy</button>
   </div>
   <div class="pane"><pre data-lang="curl">{{.Curl}}</pre><pre data-lang="node" hidden>{{.Node}}</pre><pre data-lang="go" hidden>{{.Go}}</pre></div>
 </div>{{end}}
 
-{{define "docs_content"}}<link rel="stylesheet" href="/static/docs.css?v={{.Shell.Version}}">
-<main class="page docs">
+{{define "docs_content"}}<main class="page docs">
 
 <details class="toc-wrap" open>
 <summary>Contents</summary>
@@ -254,10 +260,10 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // --- snippet tabs: one visible pane per block ---
   document.querySelectorAll(".snippet").forEach(function (block) {
-    var tabs = [].slice.call(block.querySelectorAll("[role=tab]"));
+    var tabs = [].slice.call(block.querySelectorAll(".langs .lang"));
     var panes = [].slice.call(block.querySelectorAll("pre[data-lang]"));
     function show(lang) {
-      tabs.forEach(function (t) { t.setAttribute("aria-selected", String(t.dataset.lang === lang)); });
+      tabs.forEach(function (t) { t.setAttribute("aria-pressed", String(t.dataset.lang === lang)); });
       panes.forEach(function (p) { p.hidden = p.dataset.lang !== lang; });
     }
     tabs.forEach(function (t, i) {
