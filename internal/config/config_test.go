@@ -178,3 +178,32 @@ func TestLoadWhatsAppDefaultsAndParsing(t *testing.T) {
 		})
 	}
 }
+
+// PaaS hosts (Vercel, Railway, Render, Heroku, Cloud Run) assign the listen
+// port at runtime through PORT and health-check exactly that port; a server
+// that ignores it comes up on :8080, is never probed successfully, and is
+// killed as "failed to start". A platform-assigned PORT therefore wins over
+// LISTEN_ADDR: when it is set, nothing else can work anyway.
+func TestLoadHonorsPlatformPort(t *testing.T) {
+	t.Setenv("MS_CLIENT_ID", "client-id")
+	t.Setenv("TOKEN_ENCRYPTION_KEY", validKey)
+	t.Setenv("PUBLIC_BASE_URL", "http://localhost:8080")
+
+	cases := []struct{ port, listen, want string }{
+		{"", "", ":8080"},
+		{"", ":9090", ":9090"},
+		{"35543", "", ":35543"},
+		{"35543", ":9090", ":35543"},
+	}
+	for _, tc := range cases {
+		t.Setenv("PORT", tc.port)
+		t.Setenv("LISTEN_ADDR", tc.listen)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() PORT=%q LISTEN_ADDR=%q: %v", tc.port, tc.listen, err)
+		}
+		if cfg.ListenAddr != tc.want {
+			t.Errorf("PORT=%q LISTEN_ADDR=%q: ListenAddr = %q, want %q", tc.port, tc.listen, cfg.ListenAddr, tc.want)
+		}
+	}
+}

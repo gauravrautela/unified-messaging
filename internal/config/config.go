@@ -92,7 +92,7 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr: env("LISTEN_ADDR", ":8080"),
+		ListenAddr: listenAddr(),
 		DBPath:     env("DB_PATH", "./unified-messaging.db"),
 		DBDriver:   env("DB_DRIVER", "sqlite"),
 
@@ -240,6 +240,17 @@ func percentEncodeUserinfo(s string) string {
 // Without a public HTTPS origin the service still works, on polling alone.
 func (c *Config) PushEnabled() bool {
 	return strings.HasPrefix(c.PublicBaseURL, "https://")
+}
+
+// listenAddr is LISTEN_ADDR (default :8080), unless the host has assigned a
+// port through PORT — the convention on Vercel, Railway, Render, Heroku and
+// Cloud Run, all of which health-check exactly that port and kill a server
+// that comes up anywhere else. A platform-assigned PORT therefore wins.
+func listenAddr() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return ":" + p
+	}
+	return env("LISTEN_ADDR", ":8080")
 }
 
 func env(k, def string) string {
