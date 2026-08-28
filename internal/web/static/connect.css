@@ -1,0 +1,60 @@
+/* Hosted-auth pages (/connect/*). Loaded after app.css, and only by the three
+   connect templates: nothing else needs a step indicator or an expiry ring,
+   and the end user of a developer's app pays for exactly what their page uses.
+   Every colour here is an app.css token, so light and dark come for free. */
+
+/* ---- step indicator ---- */
+
+/* A progress rail rather than a list of numbers: the coloured top border is
+   what carries "where am I" at a glance, and the counter is the fallback for
+   anyone who cannot see the colour. */
+.steps{display:flex;list-style:none;margin:0 0 var(--s5);padding:0;gap:var(--s2);counter-reset:step}
+.steps li{flex:1;counter-increment:step;display:flex;align-items:center;gap:6px;
+  border-top:3px solid var(--border);padding-top:var(--s2);color:var(--muted);font-size:12px}
+.steps li::before{content:counter(step);flex:none;width:18px;height:18px;border-radius:50%;
+  background:var(--surface-2);color:var(--muted);display:grid;place-items:center;font-size:11px;font-weight:700}
+.steps li[aria-current=step]{color:var(--text);border-top-color:var(--accent);font-weight:600}
+.steps li[aria-current=step]::before{background:var(--accent);color:var(--accent-text)}
+.steps li[data-done]{color:var(--text);border-top-color:var(--ok)}
+.steps li[data-done]::before{content:"✓";background:var(--ok);color:var(--surface)}
+
+/* ---- OAuth landing ---- */
+
+.scopes{margin:0;padding-left:1.1rem;color:var(--muted)}
+.scopes li{margin-bottom:var(--s1)}
+
+/* ---- QR pane ---- */
+
+.qr-pane{margin-top:var(--s5)}
+/* The frame keeps its size before the first code arrives, so the pane does not
+   jump when the image lands, and stays white in dark mode: a QR code inverted
+   by a dark surface is one a phone camera will not read. */
+.qr-frame{width:236px;height:236px;margin:0 auto;display:grid;place-items:center;
+  background:#fff;border:1px solid var(--border);border-radius:var(--r2);padding:8px}
+.qr-frame > *{grid-area:1/1}
+#qr{width:220px;height:220px;display:block;image-rendering:pixelated}
+.qr-wait{width:200px;height:200px;border-radius:var(--r1)}
+
+.countdown{display:flex;align-items:center;justify-content:center;gap:var(--s2);
+  margin:var(--s3) 0 0;color:var(--muted);font-size:13px}
+#countdown{width:30px;height:30px;flex:none;transform:rotate(-90deg)}
+#countdown .track{fill:none;stroke:var(--border);stroke-width:3}
+/* r=13 → circumference 81.68, which is the stroke-dasharray in the markup. */
+#countdown .bar{fill:none;stroke:var(--accent);stroke-width:3;stroke-linecap:round;transition:stroke-dashoffset .3s linear}
+#countdown .bar.low{stroke:var(--warn)}
+@media (prefers-reduced-motion:reduce){#countdown .bar{transition:none}}
+
+#status{margin:var(--s3) 0 0;text-align:center;min-height:1.5em}
+
+.qr-how{margin:var(--s4) 0 0;padding-left:1.2rem;color:var(--muted);font-size:13px}
+.qr-how li{margin-bottom:var(--s1)}
+
+.qr-pane .actions{justify-content:center;margin-top:var(--s4)}
+
+/* ---- result pages ---- */
+
+.copy-row{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+.copy-row code{background:var(--code-bg);border:1px solid var(--border);border-radius:var(--r1);padding:2px 6px;word-break:break-all}
+.detail{margin-top:var(--s4);color:var(--muted);font-size:13px}
+.detail summary{cursor:pointer}
+.detail pre{margin-top:var(--s2);white-space:pre-wrap;word-break:break-word;font-size:12px}

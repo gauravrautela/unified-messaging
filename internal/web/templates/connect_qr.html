@@ -1,0 +1,215 @@
+{{define "connect_qr"}}{{template "layout_public_start" .}}{{template "connect_qr_content" .}}{{template "layout_public_end" .}}{{end}}
+
+{{/* The QR counterpart of connect_oauth: a Linker provider has no consent
+     screen of its own, so the disclosure and the explicit accept live here.
+     The code itself is never embedded server-side — the browser fetches it
+     from /qr only after consent, so a link nobody has accepted never starts a
+     pairing session. */}}
+{{define "connect_qr_content"}}
+<link rel="stylesheet" href="/static/connect.css?v={{.Shell.Version}}">
+<ol class="steps" id="steps" aria-label="Progress">
+  <li aria-current="step">Review</li><li>Scan</li><li>Done</li>
+</ol>
+<h1>Connect your {{.Provider}} account</h1>
+<p class="muted" style="margin:var(--s2) 0 var(--s4)">Entropix is connecting your {{.Provider}} account.
+Scanning the code below links your phone number to this app. We can see the
+chats and contacts you give it access to, and we store your messages so the
+app can show them to you. You can disconnect at any time.</p>
+
+<label class="check" for="consent">
+  <input type="checkbox" name="consent" id="consent">
+  <span>I understand and agree to share my {{.Provider}} data with this app.</span>
+</label>
+
+<div class="actions" style="margin-top:var(--s4)">
+  <button class="btn primary" type="button" id="show" disabled>Show QR code</button>
+</div>
+
+<div class="qr-pane hidden" id="qr-pane">
+  <div class="qr-frame">
+    <div class="skeleton qr-wait" id="qr-wait"></div>
+    <img id="qr" class="hidden" alt="QR code to scan with {{.Provider}}">
+  </div>
+  <p class="countdown hidden" id="countdown-row">
+    <svg id="countdown" viewBox="0 0 30 30" aria-hidden="true">
+      <circle class="track" cx="15" cy="15" r="13"></circle>
+      <circle class="bar" cx="15" cy="15" r="13" stroke-dasharray="81.68" stroke-dashoffset="0"></circle>
+    </svg>
+    <span id="countdown-label"></span>
+  </p>
+  <p id="status" class="muted small" role="status" aria-live="polite"></p>
+  <ol class="qr-how" id="qr-how">
+    <li>Open {{.Provider}} on your phone.</li>
+    <li>Find linked devices in its settings.</li>
+    <li>Point your phone at the code above.</li>
+  </ol>
+  <div class="actions">
+    <button class="btn hidden" type="button" id="try-again">Try again</button>
+  </div>
+</div>
+
+<script>
+// app.js is deferred, so it has not run yet while this inline script is being
+// parsed; everything that touches um waits for DOMContentLoaded, which fires
+// after every deferred script has executed.
+document.addEventListener("DOMContentLoaded", function () {
+  var state = {{.State}}, providerName = {{.Provider}};
+  var $ = um.$;
+  var consent = $("consent"), show = $("show"), pane = $("qr-pane"), img = $("qr"),
+      wait = $("qr-wait"), status = $("status"), tryAgain = $("try-again"),
+      row = $("countdown-row"), label = $("countdown-label"),
+      bar = document.querySelector("#countdown .bar"),
+      steps = document.querySelectorAll("#steps li");
+
+  // The dasharray in the markup: 2πr for r=13. Kept in one place so the ring
+  // and the stylesheet cannot drift apart.
+  var RING = 81.68;
+  var stop = null, ticker = null, total = 0, deadline = 0, lastCode = "";
+
+  function say(text) { status.textContent = text; }
+
+  // setStep moves the rail: everything before n is done, n is current.
+  function setStep(n) {
+    steps.forEach(function (li, i) {
+      li.removeAttribute("aria-current");
+      li.removeAttribute("data-done");
+      if (i + 1 < n) { li.setAttribute("data-done", ""); }
+      else if (i + 1 === n) { li.setAttribute("aria-current", "step"); }
+    });
+  }
+
+  // ---- the expiry ring ----
+  //
+  // Each code the provider mints has its own lifetime, and /qr reports what is
+  // left of it on every poll. The ring is restarted only when the code itself
+  // changes: re-reading expires_in for the same code would reset the total and
+  // make the ring jump backwards every two seconds.
+
+  function startCountdown(seconds) {
+    total = Math.max(1, seconds || 0);
+    deadline = Date.now() + total * 1000;
+    row.classList.remove("hidden");
+    if (!ticker) { ticker = setInterval(paint, 500); }
+    paint();
+  }
+
+  function paint() {
+    var left = Math.max(0, (deadline - Date.now()) / 1000);
+    bar.style.strokeDashoffset = (RING * (1 - left / total)).toFixed(2);
+    bar.classList.toggle("low", left <= 15);
+    label.textContent = left >= 1 ? "Code expires in " + Math.ceil(left) + "s" : "Code expired";
+  }
+
+  function stopCountdown() {
+    if (ticker) { clearInterval(ticker); ticker = null; }
+  }
+
+  function halt() {
+    if (stop) { stop(); stop = null; }
+    stopCountdown();
+  }
+
+  // offerRetry ends the attempt and lets the user start a fresh one, rather
+  // than asking a non-technical person to reload a page they were sent. The
+  // code on screen is dead by now, so it goes too: leaving it up invites
+  // someone to keep pointing a phone at something that will never resolve.
+  function offerRetry(message) {
+    halt();
+    img.classList.add("hidden");
+    img.removeAttribute("src");
+    wait.classList.add("hidden");
+    row.classList.add("hidden");
+    lastCode = "";
+    say(message);
+    tryAgain.classList.remove("hidden");
+    setStep(1);
+  }
+
+  // dead ends the attempt for good: the connect link itself is gone, so no
+  // amount of retrying from this page can produce a new pairing session.
+  function dead(message) {
+    halt();
+    say(message);
+    tryAgain.classList.add("hidden");
+    row.classList.add("hidden");
+  }
+
+  consent.addEventListener("change", function () { show.disabled = !consent.checked; });
+  show.addEventListener("click", start);
+  tryAgain.addEventListener("click", start);
+
+  async function start() {
+    show.disabled = true;
+    tryAgain.classList.add("hidden");
+    pane.classList.remove("hidden");
+    img.classList.add("hidden");
+    img.removeAttribute("src");
+    wait.classList.remove("hidden");
+    row.classList.add("hidden");
+    lastCode = "";
+    setStep(2);
+    say("Starting…");
+    try {
+      await um.api("/connect/" + state + "/consent", { method: "POST" });
+    } catch (err) {
+      // 404/410 mean the connect link is unknown, already used or expired:
+      // consent will never succeed for it again, so do not offer a retry that
+      // cannot work.
+      if (err.status === 404 || err.status === 410) {
+        dead("This connection link is no longer valid. Ask the app you came from for a new one.");
+      } else {
+        offerRetry(err.message || "Could not start the connection.");
+      }
+      return;
+    }
+    say("Preparing your code…");
+    halt();
+    stop = um.poll(fetchQR, 2000);
+    fetchQR();
+  }
+
+  async function fetchQR() {
+    var data;
+    try {
+      data = await um.api("/connect/" + state + "/qr");
+    } catch (err) {
+      // A non-2xx /qr response means the pairing attempt itself failed
+      // server-side — terminal, like "failed"/"expired" below, not something
+      // another poll will resolve.
+      offerRetry(err.message || "Could not connect.");
+      return;
+    }
+    if (data.png_base64 && data.png_base64 !== lastCode) {
+      lastCode = data.png_base64;
+      img.src = "data:image/png;base64," + data.png_base64;
+      img.classList.remove("hidden");
+      wait.classList.add("hidden");
+      startCountdown(data.expires_in);
+    }
+    // Every status string the server emits is handled here; see
+    // link.statusResponse in internal/api/handlers_link.go.
+    if (data.status === "paired") {
+      halt();
+      setStep(3);
+      row.classList.add("hidden");
+      if (data.redirect) {
+        say("Connected. Taking you back to the app…");
+        location.href = data.redirect;
+        return;
+      }
+      say("Connected. You can close this page.");
+      return;
+    }
+    if (data.status === "expired") {
+      offerRetry("The code expired before it was scanned.");
+      return;
+    }
+    if (data.status === "failed") {
+      offerRetry("We could not finish connecting.");
+      return;
+    }
+    say(lastCode ? "Scan the code with " + providerName + " on your phone." : "Preparing your code…");
+  }
+});
+</script>
+{{end}}

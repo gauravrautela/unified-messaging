@@ -1,9 +1,9 @@
 package api
 
 import (
-	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/web"
@@ -13,8 +13,9 @@ import (
 //
 // The landing page is end-user facing: it appears once, mid-OAuth, and has no
 // login of its own — its only authority is the single-use state token already
-// embedded in its URL. It is still self-contained here because it renders on
-// its own, outside the signed-in shell. The dashboard is operator/developer
+// embedded in its URL. It renders through the public layout (no nav, no
+// session), so an end user of somebody else's app sees a page that belongs to
+// the same product as the rest of it. The dashboard is operator/developer
 // facing: it requires a signed-in browser session (the um_session cookie), its
 // markup lives with the rest of the console in internal/web/templates, and its
 // own fetches ride that same cookie, so account data stays gated by the API
@@ -23,47 +24,66 @@ import (
 // Both are plain html/template + vanilla JS. No build step, no framework, no
 // external assets — this ships inside the Go binary.
 
-// ---------- landing page ----------
+// ---------- hosted-auth landing page ----------
 
-type landingData struct {
-	Provider     string
-	AuthorizeURL string
+// scopeText turns a provider's scope vocabulary into a sentence the person
+// clicking Continue can actually act on. A scope string is an identifier the
+// provider chose for its own API surface, not copy: "Mail.ReadWrite" tells an
+// end user nothing about what an app is asking to do to their mailbox.
+//
+// It is keyed on the bare scope name, so a fully-qualified scope
+// ("https://graph.microsoft.com/Mail.Read") resolves through the same entry
+// as its short form — see scopeSentences.
+var scopeText = map[string]string{
+	"Mail.Read":      "Read your mail",
+	"Mail.ReadWrite": "Read, move and mark your mail",
+	"Mail.Send":      "Send mail as you",
+	"User.Read":      "See your name and email address",
+	"openid":         "See your name and email address",
+	"profile":        "See your name and email address",
+	"email":          "See your name and email address",
+	"offline_access": "Stay connected without asking again",
 }
 
-var landingTmpl = template.Must(template.New("landing").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect your {{.Provider}} account</title>
-<style>
-:root{--bg:#f7f7f8;--card:#fff;--text:#1a1a1a;--muted:#6b6b76;--border:#e6e6ea;--accent:#2563eb;--accent-text:#fff}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--text:#f0f0f2;--muted:#9a9aa5;--border:#2a2d36;--accent:#3b82f6;--accent-text:#fff}}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-  background:var(--bg);color:var(--text);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:1.5rem}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem 2rem;
-  max-width:26rem;width:100%;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-.badge{width:56px;height:56px;border-radius:14px;background:var(--accent);color:var(--accent-text);
-  display:flex;align-items:center;justify-content:center;margin:0 auto 1.25rem;font-size:1.5rem;font-weight:600}
-h1{font-size:1.25rem;margin:0 0 .5rem}
-p{color:var(--muted);margin:0 0 1.75rem;font-size:.95rem}
-.btn{display:inline-block;width:100%;padding:.75rem 1rem;border-radius:10px;background:var(--accent);
-  color:var(--accent-text);text-decoration:none;font-weight:600;font-size:.95rem}
-.btn:hover{opacity:.92}
-.fine{margin-top:1.25rem;font-size:.8rem;color:var(--muted)}
-</style></head>
-<body>
-  <div class="card">
-    <div class="badge">{{slice .Provider 0 1}}</div>
-    <h1>Connect your {{.Provider}} account</h1>
-    <p>You'll sign in on Microsoft's own page and choose what to share. We never see your password.</p>
-    <a class="btn" href="{{.AuthorizeURL}}">Continue with {{.Provider}}</a>
-    <p class="fine">You can disconnect this at any time.</p>
-  </div>
-</body></html>`))
+// scopeSentences renders scopes for the landing page: known scopes as
+// sentences, unknown ones verbatim rather than silently dropped — an end user
+// consenting to something we have no copy for should still see that it is
+// being asked for. Duplicates collapse, because several scopes routinely map
+// to the same sentence (openid/profile/User.Read all mean "who you are").
+func scopeSentences(scopes []string) []string {
+	out := make([]string, 0, len(scopes))
+	seen := make(map[string]bool, len(scopes))
+	for _, raw := range scopes {
+		name := raw
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		text, ok := scopeText[name]
+		if !ok {
+			text = raw
+		}
+		if seen[text] {
+			continue
+		}
+		seen[text] = true
+		out = append(out, text)
+	}
+	return out
+}
 
-func renderLanding(w http.ResponseWriter, d landingData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_ = landingTmpl.Execute(w, d)
+// renderConnectOAuth is the branded confirmation screen an end user sees
+// before being handed to the provider's own consent page. cancel is the
+// developer's failure redirect when they supplied one; with no such URL there
+// is nowhere honest to send someone who changed their mind, so the page says
+// so instead of offering a button that goes nowhere.
+func (s *Server) renderConnectOAuth(w http.ResponseWriter, display, authorizeURL, cancel string) {
+	s.renderPage(w, "connect_oauth", map[string]any{
+		"Shell":        web.Shell{Title: "Connect " + display, Version: web.Version},
+		"Provider":     display,
+		"AuthorizeURL": authorizeURL,
+		"Scopes":       scopeSentences(s.cfg.Scopes),
+		"CancelURL":    cancel,
+	})
 }
 
 // ---------- dashboard ----------
