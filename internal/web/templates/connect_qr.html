@@ -26,7 +26,7 @@ app can show them to you. You can disconnect at any time.</p>
 </div>
 
 <div class="qr-pane hidden" id="qr-pane">
-  <div class="qr-frame">
+  <div class="qr-frame" id="qr-frame">
     <div class="skeleton qr-wait" id="qr-wait"></div>
     <img id="qr" class="hidden" alt="QR code to scan with {{.Provider}}">
   </div>
@@ -43,6 +43,10 @@ app can show them to you. You can disconnect at any time.</p>
     <li>Find linked devices in its settings.</li>
     <li>Point your phone at the code above.</li>
   </ol>
+  <details class="detail hidden" id="result-detail">
+    <summary>Details</summary>
+    <p class="copy-row"><code id="account-id"></code> <button class="btn sm" type="button" id="copy-id">Copy</button></p>
+  </details>
   <div class="actions">
     <button class="btn hidden" type="button" id="try-again">Try again</button>
   </div>
@@ -58,6 +62,8 @@ document.addEventListener("DOMContentLoaded", function () {
   var consent = $("consent"), show = $("show"), pane = $("qr-pane"), img = $("qr"),
       wait = $("qr-wait"), status = $("status"), tryAgain = $("try-again"),
       row = $("countdown-row"), label = $("countdown-label"),
+      frame = $("qr-frame"), how = $("qr-how"),
+      resultDetail = $("result-detail"), accountID = $("account-id"), copyID = $("copy-id"),
       bar = document.querySelector("#countdown .bar"),
       steps = document.querySelectorAll("#steps li");
 
@@ -134,6 +140,21 @@ document.addEventListener("DOMContentLoaded", function () {
     row.classList.add("hidden");
   }
 
+  // failFrom routes a failed request to the right ending. A 403 is
+  // link_browser_mismatch: this state is bound to the browser that claimed it
+  // and no retry from this one can ever succeed. A 404 or 410 means the connect
+  // link itself is unknown, used or expired. All three are permanent, so none
+  // of them offers a Try again that could only fail the same way again.
+  function failFrom(err, fallback) {
+    if (err.status === 403) { dead(err.message || fallback); return; }
+    if (err.status === 404 || err.status === 410) {
+      dead("This connection link is no longer valid. Ask the app you came from for a new one.");
+      return;
+    }
+    offerRetry(err.message || fallback);
+  }
+
+  copyID.addEventListener("click", function () { um.copy(accountID.textContent, copyID); });
   consent.addEventListener("change", function () { show.disabled = !consent.checked; });
   show.addEventListener("click", start);
   tryAgain.addEventListener("click", start);
@@ -152,14 +173,7 @@ document.addEventListener("DOMContentLoaded", function () {
     try {
       await um.api("/connect/" + state + "/consent", { method: "POST" });
     } catch (err) {
-      // 404/410 mean the connect link is unknown, already used or expired:
-      // consent will never succeed for it again, so do not offer a retry that
-      // cannot work.
-      if (err.status === 404 || err.status === 410) {
-        dead("This connection link is no longer valid. Ask the app you came from for a new one.");
-      } else {
-        offerRetry(err.message || "Could not start the connection.");
-      }
+      failFrom(err, "Could not start the connection.");
       return;
     }
     say("Preparing your code…");
@@ -173,10 +187,10 @@ document.addEventListener("DOMContentLoaded", function () {
     try {
       data = await um.api("/connect/" + state + "/qr");
     } catch (err) {
-      // A non-2xx /qr response means the pairing attempt itself failed
-      // server-side — terminal, like "failed"/"expired" below, not something
-      // another poll will resolve.
-      offerRetry(err.message || "Could not connect.");
+      // A non-2xx /qr response means this poll will never resolve on its own —
+      // the pairing dial failed server-side, or the link/browser binding is
+      // refusing us. Either way it is terminal for this attempt.
+      failFrom(err, "Could not connect.");
       return;
     }
     if (data.png_base64 && data.png_base64 !== lastCode) {
@@ -191,13 +205,24 @@ document.addEventListener("DOMContentLoaded", function () {
     if (data.status === "paired") {
       halt();
       setStep(3);
+      // The code on screen is spent, and so are the instructions for scanning
+      // it; leaving either up under "Connected" invites a pointless scan.
       row.classList.add("hidden");
+      frame.classList.add("hidden");
+      how.classList.add("hidden");
       if (data.redirect) {
         say("Connected. Taking you back to the app…");
         location.href = data.redirect;
         return;
       }
       say("Connected. You can close this page.");
+      // Same shape as the OAuth result page: the id an integrator may need,
+      // behind Details with a copy button, out of the way of everyone else.
+      // textContent, never innerHTML — this value comes off the wire.
+      if (data.account_id) {
+        accountID.textContent = data.account_id;
+        resultDetail.classList.remove("hidden");
+      }
       return;
     }
     if (data.status === "expired") {

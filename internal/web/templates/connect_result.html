@@ -1,27 +1,31 @@
 {{define "connect_result"}}{{template "layout_public_start" .}}{{template "connect_result_content" .}}{{template "layout_public_end" .}}{{end}}
 
 {{/* Every terminal outcome of a connect flow — connected, cancelled, expired,
-     unknown link, provider error — ends on this one page. The provider's own
-     error text goes under <details> rather than into the sentence a
-     non-technical person reads first. */}}
+     unknown link, provider error — ends on this one page.
+
+     Both the account id and the provider's own error text live under a single
+     "Details" disclosure, never in the sentence a non-technical end user reads
+     first: they are there for whoever is integrating (or debugging) the app,
+     and nobody else has to step around them. There is no Continue button —
+     when the developer configured a success_redirect_url the callback 302s to
+     it and this page never renders at all. */}}
 {{define "connect_result_content"}}
 <link rel="stylesheet" href="/static/connect.css?v={{.Shell.Version}}">
 <h1>{{.Title}}</h1>
 <p class="muted" style="margin:var(--s2) 0 0">{{.Body}}</p>
-{{if .Copy}}
-<p class="copy-row" style="margin-top:var(--s4)">
-  <code>{{.Copy}}</code>
-  <button class="btn sm" type="button" data-copy="{{.Copy}}">Copy</button>
-</p>
+{{if or .Copy .Detail}}
+<details class="detail">
+  <summary>Details</summary>
+  {{if .Copy}}
+  <p class="copy-row">
+    <code>{{.Copy}}</code>
+    <button class="btn sm" type="button" data-copy="{{.Copy}}">Copy</button>
+  </p>
+  {{end}}
+  {{if .Detail}}<pre>{{.Detail}}</pre>{{end}}
+</details>
 {{end}}
-{{if .Detail}}
-<details class="detail"><summary>Details</summary><pre>{{.Detail}}</pre></details>
-{{end}}
-{{if .NextURL}}
-<div class="actions" style="margin-top:var(--s5)"><a class="btn primary" href="{{.NextURL}}">{{.NextLabel}}</a></div>
-{{else}}
 <p class="muted small" style="margin-top:var(--s5)">You can return to the app now.</p>
-{{end}}
 <script>
 // app.js is deferred; um only exists once DOMContentLoaded fires.
 document.addEventListener("DOMContentLoaded", function () {

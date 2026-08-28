@@ -51,7 +51,12 @@ func TestConnectPagesNameProviderFromRegistry(t *testing.T) {
 			t.Fatalf("connect page still says %q", never)
 		}
 	}
-	for _, want := range []string{`aria-live`, `id="try-again"`, `id="countdown"`, "Entropix"} {
+	for _, want := range []string{
+		`aria-live`, `id="try-again"`, `id="countdown"`, "Entropix",
+		// the paired-without-redirect account id lands in this block, which is
+		// the same Details/Copy shape the OAuth result page uses
+		`id="result-detail"`, `id="account-id"`, `id="copy-id"`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("connect page missing %q", want)
 		}
@@ -112,5 +117,55 @@ func TestConnectResultPageKeepsStatusAndUsesLayout(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("result page missing %q: %s", want, body)
 		}
+	}
+}
+
+// The account id is an integrator's value, not something the end user who just
+// connected their mailbox has to read past: it belongs inside the same single
+// "Details" disclosure that carries a provider error, never in the sentence
+// above it. And there is no Continue button on any result page — a developer
+// who configured success_redirect_url was already 302'd and never sees this.
+func TestConnectResultPageKeepsTheAccountIDInsideDetails(t *testing.T) {
+	rec := httptest.NewRecorder()
+	renderResult(rec, http.StatusOK, resultPage{
+		Title: "Account connected",
+		Body:  "a@x.com is now connected.",
+		Copy:  "acc_123abc",
+	})
+	body := rec.Body.String()
+
+	start, end := strings.Index(body, "<details"), strings.Index(body, "</details>")
+	if start == -1 || end == -1 {
+		t.Fatalf("no <details> on a page carrying an account id: %s", body)
+	}
+	if n := strings.Count(body, "<details"); n != 1 {
+		t.Fatalf("%d <details> elements, want exactly one", n)
+	}
+	id := strings.Index(body, "acc_123abc")
+	if id < start || id > end {
+		t.Fatalf("account id is outside <details> (id=%d, details=%d..%d)", id, start, end)
+	}
+	if !strings.Contains(body[start:end], `data-copy="acc_123abc"`) {
+		t.Fatal("no copy button next to the account id")
+	}
+	if strings.Contains(body, "btn primary") {
+		t.Fatal("result page still renders a Continue button")
+	}
+
+	// A provider error shares that one block; a page with neither has none.
+	rec = httptest.NewRecorder()
+	renderResult(rec, http.StatusBadRequest, resultPage{
+		Title: "Connection cancelled", Body: "The account was not connected, and nothing was shared.",
+		Detail: "access_denied: the user declined",
+	})
+	body = rec.Body.String()
+	if !strings.Contains(body, "<details") || !strings.Contains(body, "access_denied: the user declined") {
+		t.Fatalf("provider error is not under Details: %s", body)
+	}
+
+	rec = httptest.NewRecorder()
+	renderResult(rec, http.StatusGone, resultPage{Title: "Link expired", Body: "This connection link has expired."})
+	if strings.Contains(rec.Body.String(), "<details") {
+		t.Fatal("empty Details block rendered with nothing to put in it")
 	}
 }

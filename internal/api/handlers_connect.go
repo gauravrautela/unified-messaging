@@ -374,11 +374,10 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}), http.StatusFound)
 		return
 	}
-	// No success_redirect_url was configured, so there is nowhere to send this
-	// browser next: NextURL stays empty and the page says so, rather than
-	// offering a Continue button that goes nowhere. The account id is still
-	// surfaced — with a copy button — because a caller integrating without
-	// notify_url has no other way to learn it.
+	// No success_redirect_url was configured — a caller that supplied one was
+	// already redirected above — so this page is where the flow ends. The
+	// account id still rides along, behind Details with a copy button, because
+	// an integrator without notify_url has no other way to learn it.
 	renderResult(w, http.StatusOK, resultPage{
 		Title: "Account connected",
 		Body:  acct.Email + " is now connected.",
@@ -531,13 +530,16 @@ func appendQuery(raw string, extra url.Values) string {
 }
 
 // resultPage is a terminal outcome of a connect flow, in the shape the page
-// renders it: one sentence a non-technical person can act on, and the
-// provider's own error text tucked under a disclosure rather than dropped into
-// that sentence. Copy is a value worth carrying away (an account id); NextURL
-// is where the flow continues when the developer gave us somewhere to send it.
+// renders it: one sentence a non-technical person can act on, plus whatever an
+// integrator needs, which the page keeps under a "Details" disclosure rather
+// than in that sentence. Copy is a value worth carrying away (an account id);
+// Detail is the provider's own error text.
+//
+// There is no "continue here next" field: when the developer configured a
+// success_redirect_url the callback 302s to it and this page never renders,
+// which is the documented contract and matches what the QR page does.
 type resultPage struct {
 	Title, Body, Detail string
-	NextURL, NextLabel  string
 	Copy                string
 }
 
@@ -553,13 +555,11 @@ type resultPage struct {
 func renderResult(w http.ResponseWriter, status int, p resultPage) {
 	var buf bytes.Buffer
 	if err := web.Templates().ExecuteTemplate(&buf, "connect_result", map[string]any{
-		"Shell":     web.Shell{Title: p.Title, Version: web.Version},
-		"Title":     p.Title,
-		"Body":      p.Body,
-		"Detail":    p.Detail,
-		"NextURL":   p.NextURL,
-		"NextLabel": p.NextLabel,
-		"Copy":      p.Copy,
+		"Shell":  web.Shell{Title: p.Title, Version: web.Version},
+		"Title":  p.Title,
+		"Body":   p.Body,
+		"Detail": p.Detail,
+		"Copy":   p.Copy,
 	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -567,10 +567,4 @@ func renderResult(w http.ResponseWriter, status int, p resultPage) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = buf.WriteTo(w)
-}
-
-// renderMessage is the title-and-body shorthand for renderResult, kept so a
-// call site with nothing else to say does not have to spell out a struct.
-func renderMessage(w http.ResponseWriter, status int, title, body string) {
-	renderResult(w, status, resultPage{Title: title, Body: body})
 }
