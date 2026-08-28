@@ -93,6 +93,25 @@
     return { cls: "ok", label: "Connected", sub: a.last_synced_at ? "synced " + relTime(a.last_synced_at) : "first sync pending" };
   }
 
+  // maskPhone keeps the country code plus the first two and last three digits
+  // of a phone number, masking the rest — e.g. "+91 88••• •855". The account
+  // JSON carries the real identifier; this function's whole job is making sure
+  // a console page in a screenshot or a screen share never shows it in full.
+  function maskPhone(p) {
+    if (!p) return "";
+    const s = String(p);
+    if (s.indexOf("@") > -1) return s; // an email address, not a phone number
+    const m = /^(\+\d{1,3})(\d+)$/.exec(s.replace(/[^\d+]/g, ""));
+    if (!m || m[2].length < 5) {
+      const n = s.length;
+      if (n <= 4) return s;
+      const keep = Math.max(1, Math.floor(n / 4));
+      return s.slice(0, keep) + "•".repeat(Math.max(3, n - keep * 2)) + s.slice(n - keep);
+    }
+    const rest = m[2], midLen = Math.min(3, Math.max(1, rest.length - 5));
+    return m[1] + " " + rest.slice(0, 2) + "•".repeat(midLen) + " •" + rest.slice(-3);
+  }
+
   function poll(fn, ms) {
     let timer = null, stopped = false;
     const tick = async () => { if (stopped || document.hidden) return; try { await fn(); } catch (_) { /* fn reports */ } };
@@ -115,5 +134,5 @@
     });
   }
 
-  window.um = { $, esc, api, notice, confirm, copy, relTime, accountState, poll, listNav };
+  window.um = { $, esc, api, notice, confirm, copy, relTime, accountState, maskPhone, poll, listNav };
 })();

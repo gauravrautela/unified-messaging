@@ -111,3 +111,55 @@ dialog .dlg-body{padding:var(--s4)} dialog .dlg-foot{padding:var(--s3) var(--s4)
   .split .side.open{transform:none} .menu-btn,.back-btn{display:inline-flex}
   .topbar{padding:0 var(--s3)} .topbar nav{gap:0} .topbar .who{display:none} main.page{padding:var(--s4)}
 }
+
+/* viewers: shared chrome (mail + chat) */
+.split .main{position:relative}
+.split .main > .side-head{padding:var(--s3);border-bottom:1px solid var(--border);background:var(--surface);flex:none}
+.side .side-head{display:grid;gap:var(--s2)}
+.actions .spacer{flex:1}
+.list [role=option] .top{display:flex;gap:var(--s3);align-items:baseline;justify-content:space-between}
+.list [role=option] .title,.list [role=option] .sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.list [role=option] .sub{color:var(--muted);font-size:13px}
+.list [role=option] .when{flex:none}
+.list .sk{padding:var(--s3) var(--s4);border-bottom:1px solid var(--border)}
+.list .empty{padding:var(--s6) var(--s4)}
+
+/* mail: message list beside the reader */
+#panes{display:grid;grid-template-columns:22rem minmax(0,1fr);min-height:0;flex:1}
+#panes > #messages{overflow:auto;min-height:0;border-right:1px solid var(--border)}
+#reader{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--surface)}
+#reader-body{display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto}
+.reader-bar{display:none;padding:var(--s2) var(--s3);border-bottom:1px solid var(--border)}
+.reader-head{padding:var(--s4) var(--s5);border-bottom:1px solid var(--border)}
+.reader-head h2{font-size:17px;margin:0 0 var(--s2)}
+.addr{color:var(--muted);font-size:13px} .addr b{color:var(--text);font-weight:600}
+.atts{margin-top:var(--s3)}
+/* HTML mail is authored for a white page; the frame keeps its own ground. */
+#body-frame{flex:1;min-height:20rem;width:100%;border:0;background:#fff}
+
+/* chat: thread, bubbles, composer */
+#chat-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+#thread{flex:1;overflow:auto;min-height:0;padding:var(--s4)}
+#thread .thread-top{display:flex;justify-content:center;padding-bottom:var(--s3)}
+#thread > #messages{display:flex;flex-direction:column;gap:var(--s2)}
+.bubble{max-width:min(70%,34rem);padding:var(--s2) var(--s3);border-radius:var(--r2);background:var(--surface-2);align-self:flex-start}
+.bubble.me{background:var(--accent-bg);align-self:flex-end}
+.bubble .text{white-space:pre-wrap;overflow-wrap:anywhere}
+.bubble .when{font-size:11px;color:var(--muted);margin-top:2px;text-align:right}
+.bubble.deleted .text{font-style:italic;color:var(--muted)}
+.bubble.sending{opacity:.6}
+.bubble.failed{border:1px solid var(--danger)} .bubble.failed .when{color:var(--danger)}
+#newmsgs{position:absolute;left:50%;transform:translateX(-50%);bottom:4.5rem;z-index:5;box-shadow:0 4px 14px rgba(0,0,0,.22)}
+#composer{display:flex;gap:var(--s2);padding:var(--s3);border-top:1px solid var(--border);background:var(--surface);flex:none}
+#composer[hidden]{display:none} #composer input{flex:1}
+
+@media (max-width:48rem){
+  #panes{grid-template-columns:1fr}
+  #panes.reading > #messages{display:none}
+  #panes:not(.reading) #reader{display:none}
+  .reader-bar{display:flex}
+  .split .main.reading .menu-btn{display:none}
+  .split .main:not(.reading) .back-btn{display:none}
+  .reader-head{padding:var(--s4)}
+  #body-frame{min-height:12rem}
+}

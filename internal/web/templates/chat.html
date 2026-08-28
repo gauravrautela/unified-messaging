@@ -1,0 +1,411 @@
+{{define "chat"}}{{template "layout_start" .}}{{template "chat_content" .}}{{template "layout_end" .}}{{end}}
+
+{{define "chat_content"}}
+<main class="page wide">
+  <div class="split">
+    <aside class="side" id="side">
+      <div class="side-head">
+        <label class="sr-only" for="acct">Account</label>
+        <select id="acct"></select>
+      </div>
+      <div class="side-list">
+        <ul class="list" role="listbox" id="chats" aria-label="Chats"></ul>
+      </div>
+    </aside>
+
+    <section class="main" id="main">
+      <div class="side-head actions">
+        <button class="menu-btn btn ghost sm" type="button" id="menu" aria-label="Chats" aria-expanded="false">☰</button>
+        <button class="back-btn btn ghost sm" type="button" id="back">← Chats</button>
+        <span class="title" id="chat-name">Select a chat</span>
+        <span class="spacer"></span>
+        <span id="conn" class="pill"></span>
+        <span id="conn-sub" class="muted small"></span>
+      </div>
+
+      <div id="thread" tabindex="0" aria-label="Messages">
+        <div class="thread-top">
+          <button id="older" class="btn sm hidden" type="button">Load older</button>
+        </div>
+        <div id="messages"><div class="empty">Select a chat</div></div>
+      </div>
+      <button id="newmsgs" class="btn sm hidden" type="button">New messages ↓</button>
+
+      <form id="composer" hidden>
+        <label class="sr-only" for="text">Message</label>
+        <input id="text" autocomplete="off" placeholder="Type a message">
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+    </section>
+  </div>
+</main>
+
+<script>
+// The chat viewer is live where the mail viewer is static: it polls gently,
+// merges what changed into the thread instead of rebuilding it, and never
+// yanks the scroll position out from under someone reading back.
+//
+// app.js is loaded with defer, so window.um does not exist while this script
+// is being parsed — every reference to it lives inside DOMContentLoaded.
+document.addEventListener("DOMContentLoaded", () => {
+  const { $, esc, api, notice, relTime, maskPhone } = um;
+
+  const PAGE = 50;
+  const REFRESH_MS = 5000;
+  // 80px of slack: a thread that is within a bubble's height of the bottom
+  // still counts as "at the bottom", so a stray pixel does not suppress
+  // autoscroll for someone who is plainly following along.
+  const BOTTOM_SLACK = 80;
+
+  const state = { account: "", chat: "", before: "", offline: false };
+  const accounts = new Map();   // id -> account, for the connection pill
+  const nodes = new Map();      // message id -> its bubble element
+  let chatsKey = "";            // signature of the rendered sidebar
+  let stopPoll = null;
+
+  const fail = (e) => notice("error", (e && e.message) ? e.message : String(e));
+  const narrow = () => window.matchMedia("(max-width: 48rem)").matches;
+  const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+    : "k-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+  const side = $("side"), main = $("main"), thread = $("thread"), box = $("messages");
+
+  function setReading(on) { main.classList.toggle("reading", on); }
+  function openSide(on) {
+    side.classList.toggle("open", on);
+    $("menu").setAttribute("aria-expanded", String(on));
+  }
+
+  function emptyBox(host, title, detail) {
+    const div = document.createElement("div");
+    div.className = "empty";
+    const h = document.createElement("div");
+    h.className = "title";
+    h.textContent = title;
+    div.append(h);
+    if (detail) { const p = document.createElement("div"); p.append(detail); div.append(p); }
+    if (host.tagName === "UL") {
+      const li = document.createElement("li");
+      li.append(div);
+      host.replaceChildren(li);
+    } else {
+      host.replaceChildren(div);
+    }
+  }
+
+  // ---- accounts and the connection pill ----
+
+  const accountLabel = (a) => a.name || maskPhone(a.identifier) || a.id;
+
+  // The pill is the section-2 mapping, not the raw socket state: um.accountState
+  // is the single place that turns a connection into words, so the dashboard and
+  // this page can never describe the same account differently.
+  function renderConn() {
+    const a = accounts.get(state.account);
+    const pill = $("conn"), sub = $("conn-sub");
+    if (!a) { pill.className = "pill"; pill.textContent = ""; sub.textContent = ""; return; }
+    const st = um.accountState(a);
+    pill.className = "pill " + st.cls;
+    pill.textContent = st.label;
+    // A failed poll is a browser-side fact, not an account status: it says
+    // "offline" under the pill and clears itself on the next good round.
+    sub.textContent = state.offline ? "offline" : (st.sub || "");
+  }
+
+  async function loadAccounts(first) {
+    const data = await api("/api/v1/accounts");
+    const items = (data.items || []).filter((a) => a.kind === "chat");
+    accounts.clear();
+    items.forEach((a) => accounts.set(a.id, a));
+    const sel = $("acct");
+    const key = items.map((a) => a.id + ":" + accountLabel(a)).join("|");
+    if (sel.dataset.key !== key) {
+      sel.dataset.key = key;
+      sel.replaceChildren(...items.map((a) => {
+        const o = document.createElement("option");
+        o.value = a.id;
+        o.textContent = accountLabel(a);
+        return o;
+      }));
+    }
+    if (!items.length) return false;
+    if (first) {
+      const wanted = new URLSearchParams(location.search).get("account_id");
+      state.account = items.some((a) => a.id === wanted) ? wanted : items[0].id;
+    } else if (!accounts.has(state.account)) {
+      state.account = items[0].id;
+    }
+    sel.value = state.account;
+    renderConn();
+    return true;
+  }
+
+  // ---- chat list ----
+
+  const chatTitle = (c) => c.name || (c.kind === "group" ? "Group" : "Chat");
+
+  async function loadChats() {
+    const data = await api("/api/v1/chats?account_id=" + encodeURIComponent(state.account));
+    const items = data.items || [];
+    if (state.chat && !items.some((c) => c.id === state.chat)) closeChat();
+    const key = items.map((c) => c.id + ":" + chatTitle(c) + ":" + c.unread_count).join("|") + "#" + state.chat;
+    // Re-rendering a list that has not changed would steal keyboard focus from
+    // whoever is arrowing through it, every five seconds.
+    if (key === chatsKey) return;
+    chatsKey = key;
+    if (!items.length) { emptyBox($("chats"), "No chats yet", "Messages appear here as they sync."); return; }
+    $("chats").innerHTML = items.map((c) =>
+      '<li><button type="button" role="option" data-id="' + esc(c.id) + '" aria-selected="' + (c.id === state.chat) + '">' +
+        '<span class="top"><span class="title">' + esc(chatTitle(c)) + '</span>' +
+        (c.unread_count ? '<span class="pill info">' + esc(c.unread_count) + '</span>' : '') +
+        '</span></button></li>').join("");
+  }
+
+  // ---- thread ----
+
+  function bubble(m) {
+    const el = document.createElement("div");
+    fill(el, m);
+    return el;
+  }
+
+  // Every value here goes in as text, never as markup: a message body is the
+  // most attacker-controlled string on the page.
+  function fill(el, m) {
+    el.className = "bubble" + (m.is_from_me ? " me" : "") + (m.deleted ? " deleted" : "") +
+      (m.status === "sending" ? " sending" : "") + (m.status === "failed" ? " failed" : "");
+    el.dataset.id = m.id;
+    el.dataset.sent = m.sent_at || "";
+    const text = document.createElement("div");
+    text.className = "text";
+    text.textContent = m.deleted ? "This message was deleted" : (m.text || "");
+    const when = document.createElement("div");
+    when.className = "when";
+    when.textContent = m.status === "sending" ? "Sending…"
+      : m.status === "failed" ? "Not sent"
+      : relTime(m.sent_at) + (m.edited_at ? " · edited" : "");
+    el.replaceChildren(text, when);
+    if (m.status === "failed") {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "btn sm";
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => deliver(m));
+      el.append(retry);
+    }
+  }
+
+  // Bubbles are kept in send order, so an older page prepends and a poll
+  // appends without either one rebuilding the thread.
+  function place(el, m) {
+    const t = Date.parse(m.sent_at || "") || Date.now();
+    let ref = null;
+    for (const child of box.children) {
+      if ((Date.parse(child.dataset.sent || "") || 0) > t) { ref = child; break; }
+    }
+    box.insertBefore(el, ref);
+  }
+
+  const atBottom = () => thread.scrollHeight - thread.scrollTop - thread.clientHeight < BOTTOM_SLACK;
+  function toBottom() {
+    thread.scrollTop = thread.scrollHeight;
+    $("newmsgs").classList.add("hidden");
+  }
+
+  // merge returns how many messages were new, so the caller can decide between
+  // following the thread down and offering the "New messages" chip.
+  function merge(items) {
+    let added = 0;
+    // The "no messages yet" placeholder is not a bubble; the first real
+    // message evicts it.
+    const first = box.firstElementChild;
+    if (items.length && first && first.classList.contains("empty")) first.remove();
+    for (const m of items) {
+      const el = nodes.get(m.id);
+      if (el) { fill(el, m); continue; }
+      const n = bubble(m);
+      nodes.set(m.id, n);
+      place(n, m);
+      added++;
+    }
+    return added;
+  }
+
+  async function loadLatest(initial) {
+    const chat = state.chat;
+    const data = await api("/api/v1/chats/" + encodeURIComponent(chat) +
+      "/messages?account_id=" + encodeURIComponent(state.account) + "&limit=" + PAGE);
+    if (state.chat !== chat) return; // someone opened another chat mid-flight
+    const items = (data.items || []).slice().reverse(); // the API returns newest first
+    if (initial) {
+      state.before = data.next_before || "";
+      $("older").classList.toggle("hidden", !state.before);
+      if (!items.length) { emptyBox(box, "No messages yet", "Say something below."); return; }
+      box.replaceChildren();
+    }
+    // Captured before the DOM changes: whether the reader was following along.
+    const follow = initial || atBottom();
+    const added = merge(items);
+    if (follow) toBottom();
+    else if (added) $("newmsgs").classList.remove("hidden");
+  }
+
+  async function loadOlder() {
+    if (!state.before) return;
+    const chat = state.chat, before = state.before, height = thread.scrollHeight;
+    $("older").disabled = true;
+    try {
+      const data = await api("/api/v1/chats/" + encodeURIComponent(chat) +
+        "/messages?account_id=" + encodeURIComponent(state.account) +
+        "&before=" + encodeURIComponent(before) + "&limit=" + PAGE);
+      if (state.chat !== chat) return;
+      merge((data.items || []).slice().reverse());
+      state.before = data.next_before || "";
+      $("older").classList.toggle("hidden", !state.before);
+      // Keep the message the reader was looking at exactly where it was.
+      thread.scrollTop += thread.scrollHeight - height;
+    } catch (e) {
+      fail(e);
+    }
+    $("older").disabled = false;
+  }
+
+  function closeChat() {
+    state.chat = "";
+    state.before = "";
+    nodes.clear();
+    $("chat-name").textContent = "Select a chat";
+    $("composer").hidden = true;
+    $("older").classList.add("hidden");
+    $("newmsgs").classList.add("hidden");
+    setReading(false);
+    emptyBox(box, "Select a chat", "");
+  }
+
+  async function openChat(id, name) {
+    state.chat = id;
+    state.before = "";
+    nodes.clear();
+    box.replaceChildren();
+    $("chat-name").textContent = name || "Chat";
+    $("composer").hidden = false;
+    $("newmsgs").classList.add("hidden");
+    [...$("chats").querySelectorAll("[role=option]")].forEach((b) => b.setAttribute("aria-selected", String(b.dataset.id === id)));
+    if (narrow()) { setReading(true); openSide(false); }
+    try { await loadLatest(true); } catch (e) { fail(e); }
+  }
+
+  // ---- sending ----
+
+  // A send shows up immediately as a "sending" bubble, is replaced by the
+  // server's own message on 201, or stays put marked "Not sent" with a Retry
+  // that reuses the same Idempotency-Key — so a retry after a response we
+  // never saw cannot send the message twice.
+  function send(e) {
+    e.preventDefault();
+    const input = $("text");
+    const text = input.value.trim();
+    if (!text || !state.chat) return;
+    input.value = "";
+    const draft = {
+      id: "tmp-" + Date.now(), chat: state.chat, text, is_from_me: true,
+      sent_at: new Date().toISOString(), status: "sending", key: uuid(),
+    };
+    const el = bubble(draft);
+    nodes.set(draft.id, el);
+    place(el, draft);
+    toBottom();
+    deliver(draft);
+  }
+
+  async function deliver(draft) {
+    const el = nodes.get(draft.id);
+    draft.status = "sending";
+    if (el) fill(el, draft);
+    try {
+      const m = await api("/api/v1/chats/" + encodeURIComponent(draft.chat) +
+        "/messages?account_id=" + encodeURIComponent(state.account),
+        { method: "POST", headers: { "Idempotency-Key": draft.key }, body: { text: draft.text } });
+      if (!el) return;
+      nodes.delete(draft.id);
+      if (state.chat !== draft.chat || !m || !m.id) { el.remove(); return; }
+      if (nodes.has(m.id)) { el.remove(); return; } // a poll already brought it in
+      nodes.set(m.id, el);
+      fill(el, m);
+      if (atBottom()) toBottom();
+    } catch (err) {
+      notice("error", "Could not send: " + ((err && err.message) || err));
+      draft.status = "failed";
+      if (el) fill(el, draft);
+    }
+  }
+
+  // ---- polling ----
+
+  async function refresh() {
+    if (!state.account) return;
+    try {
+      await loadAccounts(false);
+      await loadChats();
+      if (state.chat) await loadLatest(false);
+      if (state.offline) { state.offline = false; renderConn(); }
+    } catch (e) {
+      // A poll that cannot reach the server says so in one word under the
+      // pill. No banner, no toast: the next good round clears it.
+      if (!state.offline) { state.offline = true; renderConn(); }
+    }
+  }
+
+  // ---- wiring ----
+
+  um.listNav($("chats"));
+
+  $("menu").addEventListener("click", () => openSide(!side.classList.contains("open")));
+  $("back").addEventListener("click", () => { setReading(false); openSide(true); });
+
+  $("chats").addEventListener("click", (e) => {
+    const b = e.target.closest("[role=option]");
+    if (!b) return;
+    const name = b.querySelector(".title");
+    openChat(b.dataset.id, name ? name.textContent : "Chat");
+  });
+
+  $("acct").addEventListener("change", async () => {
+    state.account = $("acct").value;
+    chatsKey = "";
+    closeChat();
+    history.replaceState(null, "", "?account_id=" + encodeURIComponent(state.account));
+    renderConn();
+    try { await loadChats(); } catch (e) { fail(e); }
+  });
+
+  $("older").addEventListener("click", () => loadOlder());
+  $("newmsgs").addEventListener("click", toBottom);
+  thread.addEventListener("scroll", () => { if (atBottom()) $("newmsgs").classList.add("hidden"); });
+  $("composer").addEventListener("submit", send);
+
+  // ---- boot ----
+
+  (async function init() {
+    try {
+      if (!(await loadAccounts(true))) {
+        const detail = document.createElement("span");
+        const a = document.createElement("a");
+        a.href = "/dashboard";
+        a.textContent = "dashboard";
+        detail.append("Link one on the ", a, ".");
+        emptyBox($("chats"), "No chat accounts", detail);
+        emptyBox(box, "No chat accounts", "");
+        return;
+      }
+      await loadChats();
+      // One poll, started once: a second um.poll for the same thread would
+      // double every request and race its own merges.
+      if (stopPoll) stopPoll();
+      stopPoll = um.poll(refresh, REFRESH_MS);
+    } catch (e) {
+      fail(e);
+    }
+  })();
+});
+</script>
+{{end}}
