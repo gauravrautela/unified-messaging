@@ -57,7 +57,7 @@ h1{font-size:24px;margin:0;letter-spacing:-.01em} h2{font-size:18px;margin:0 0 v
 .card > .card-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);padding:var(--s3) var(--s4);border-bottom:1px solid var(--border)}
 .card > .card-body{padding:var(--s4)}
 .table{width:100%;border-collapse:collapse} .table th{text-align:left;color:var(--muted);font-weight:500;font-size:13px;padding:var(--s2) var(--s4);border-bottom:1px solid var(--border)}
-.table td{padding:var(--s3) var(--s4);border-bottom:1px solid var(--border);vertical-align:middle} .table tr:last-child td{border-bottom:0}
+.table td{padding:var(--s3) var(--s4);border-bottom:1px solid var(--border);vertical-align:middle;overflow-wrap:anywhere} .table tr:last-child td{border-bottom:0}
 .row{display:flex;align-items:center;gap:var(--s3);padding:var(--s3) var(--s4);border-bottom:1px solid var(--border)} .row:last-child{border-bottom:0}
 .row .grow{flex:1;min-width:0} .row .title{font-weight:600} .row .sub{color:var(--muted);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .avatar{width:32px;height:32px;border-radius:50%;background:var(--accent-bg);color:var(--accent);display:grid;place-items:center;font-weight:700;flex:none}
@@ -109,7 +109,13 @@ dialog .dlg-body{padding:var(--s4)} dialog .dlg-foot{padding:var(--s3) var(--s4)
 @media (max-width:48rem){
   .split{grid-template-columns:1fr} .split .side{position:fixed;inset:52px 0 0 0;z-index:20;transform:translateX(-100%);transition:transform .2s}
   .split .side.open{transform:none} .menu-btn,.back-btn{display:inline-flex}
-  .topbar{padding:0 var(--s3)} .topbar nav{gap:0} .topbar .who{display:none} main.page{padding:var(--s4)}
+  .topbar{padding:0 var(--s3);gap:var(--s2)}
+  .topbar .wordmark,.topbar>form,.topbar>a.btn{flex:none}
+  .topbar nav{flex:1 1 auto;min-width:0;gap:2px;margin-left:0;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+  .topbar nav::-webkit-scrollbar{display:none}
+  .topbar nav a{padding:var(--s1) var(--s2);white-space:nowrap}
+  .topbar .spacer{flex:none}
+  .topbar .who{display:none} main.page{padding:var(--s4)}
 }
 
 /* viewers: shared chrome (mail + chat) */
