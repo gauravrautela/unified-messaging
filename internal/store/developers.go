@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrConflict is returned when a unique constraint rejects a write.
@@ -19,13 +20,29 @@ func (s *Store) CreateDeveloper(d model.Developer, passwordHash string) error {
 	if d.CreatedAt.IsZero() {
 		d.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.db.Exec(`
-		INSERT INTO developers (id, email, password_hash, name, created_at) VALUES (?,?,?,?,?)`,
+	_, err := s.db.Exec(s.q(`
+		INSERT INTO developers (id, email, password_hash, name, created_at) VALUES (?,?,?,?,?)`),
 		d.ID, strings.ToLower(strings.TrimSpace(d.Email)), passwordHash, d.Name, d.CreatedAt.Unix())
-	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+	if isUniqueViolation(err) {
 		return ErrConflict
 	}
 	return err
+}
+
+// isUniqueViolation reports whether err is a unique/primary-key constraint
+// rejection, on either engine: SQLite's modernc driver returns a plain
+// "UNIQUE constraint failed" error string, while Postgres (via pgx) returns
+// a *pgconn.PgError with SQLSTATE 23505 and its own, differently-worded
+// message ("duplicate key value violates unique constraint ...").
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 // DeveloperByEmail returns the developer and their password hash. The hash
@@ -35,8 +52,8 @@ func (s *Store) DeveloperByEmail(email string) (model.Developer, string, error) 
 	var hash string
 	var created int64
 	var rdJSON string
-	err := s.db.QueryRow(`
-		SELECT id, email, name, password_hash, created_at, redirect_domains_json FROM developers WHERE email = ?`,
+	err := s.db.QueryRow(s.q(`
+		SELECT id, email, name, password_hash, created_at, redirect_domains_json FROM developers WHERE email = ?`),
 		strings.ToLower(strings.TrimSpace(email))).Scan(&d.ID, &d.Email, &d.Name, &hash, &created, &rdJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, "", ErrNotFound
@@ -53,7 +70,7 @@ func (s *Store) GetDeveloper(id string) (model.Developer, error) {
 	var d model.Developer
 	var created int64
 	var rdJSON string
-	err := s.db.QueryRow(`SELECT id, email, name, created_at, redirect_domains_json FROM developers WHERE id = ?`, id).
+	err := s.db.QueryRow(s.q(`SELECT id, email, name, created_at, redirect_domains_json FROM developers WHERE id = ?`), id).
 		Scan(&d.ID, &d.Email, &d.Name, &created, &rdJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
@@ -71,7 +88,7 @@ func (s *Store) GetDeveloper(id string) (model.Developer, error) {
 // non-nil slice.
 func (s *Store) GetRedirectDomains(developerID string) ([]string, error) {
 	var rdJSON string
-	err := s.db.QueryRow(`SELECT redirect_domains_json FROM developers WHERE id = ?`, developerID).Scan(&rdJSON)
+	err := s.db.QueryRow(s.q(`SELECT redirect_domains_json FROM developers WHERE id = ?`), developerID).Scan(&rdJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -92,7 +109,7 @@ func (s *Store) SetRedirectDomains(developerID string, domains []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.db.Exec(`UPDATE developers SET redirect_domains_json = ? WHERE id = ?`, string(raw), developerID)
+	res, err := s.db.Exec(s.q(`UPDATE developers SET redirect_domains_json = ? WHERE id = ?`), string(raw), developerID)
 	if err != nil {
 		return err
 	}
@@ -120,7 +137,7 @@ func decodeRedirectDomains(raw string) []string {
 // DeveloperByEmail, the hash leaves the store only to internal/auth.
 func (s *Store) DeveloperPasswordHash(developerID string) (string, error) {
 	var hash string
-	err := s.db.QueryRow(`SELECT password_hash FROM developers WHERE id = ?`, developerID).Scan(&hash)
+	err := s.db.QueryRow(s.q(`SELECT password_hash FROM developers WHERE id = ?`), developerID).Scan(&hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -130,7 +147,7 @@ func (s *Store) DeveloperPasswordHash(developerID string) (string, error) {
 // UpdatePassword replaces the stored hash. Callers are responsible for
 // invalidating sessions afterwards; see DeleteSessionsExcept.
 func (s *Store) UpdatePassword(developerID, hash string) error {
-	_, err := s.db.Exec(`UPDATE developers SET password_hash = ? WHERE id = ?`, hash, developerID)
+	_, err := s.db.Exec(s.q(`UPDATE developers SET password_hash = ? WHERE id = ?`), hash, developerID)
 	return err
 }
 
@@ -143,8 +160,8 @@ func (s *Store) UpdatePassword(developerID, hash string) error {
 // the contract visible at every call site.
 
 func (s *Store) CreateSession(hash, developerID string, expiresAt time.Time) error {
-	_, err := s.db.Exec(`
-		INSERT INTO sessions (id, developer_id, created_at, expires_at) VALUES (?,?,?,?)`,
+	_, err := s.db.Exec(s.q(`
+		INSERT INTO sessions (id, developer_id, created_at, expires_at) VALUES (?,?,?,?)`),
 		hash, developerID, time.Now().Unix(), expiresAt.Unix())
 	return err
 }
@@ -159,10 +176,10 @@ func (s *Store) SessionDeveloper(hash string, now time.Time) (model.Developer, t
 	var d model.Developer
 	var devCreated, sessCreated, exp int64
 	var rdJSON string
-	err := s.db.QueryRow(`
+	err := s.db.QueryRow(s.q(`
 		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, s.expires_at, s.created_at
 		FROM sessions s JOIN developers d ON d.id = s.developer_id
-		WHERE s.id = ? AND s.expires_at > ?`, hash, now.Unix()).
+		WHERE s.id = ? AND s.expires_at > ?`), hash, now.Unix()).
 		Scan(&d.ID, &d.Email, &d.Name, &devCreated, &rdJSON, &exp, &sessCreated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, time.Time{}, time.Time{}, ErrNotFound
@@ -175,13 +192,36 @@ func (s *Store) SessionDeveloper(hash string, now time.Time) (model.Developer, t
 	return d, time.Unix(exp, 0).UTC(), time.Unix(sessCreated, 0).UTC(), nil
 }
 
+// SetSessionCreatedAt backdates (or moves forward) a session's created_at.
+// Production code never needs to move a session's creation time once
+// minted; this exists so tests can simulate a session aging past the
+// absolute lifetime rule without reaching into the database directly (see
+// SetOAuthStateExpiry for the same pattern applied to connect state).
+func (s *Store) SetSessionCreatedAt(hash string, at time.Time) error {
+	_, err := s.db.Exec(s.q(`UPDATE sessions SET created_at = ? WHERE id = ?`), at.Unix(), hash)
+	return err
+}
+
+// SessionRowExists reports whether a row with exactly this id exists in the
+// sessions table. Production code only ever looks a session up by its hash
+// (see the package doc above); this exists so a test can assert on the
+// storage shape itself — that a session cookie's raw value is never present
+// as a row id, only its hash — without reaching into the database directly.
+func (s *Store) SessionRowExists(id string) (bool, error) {
+	var n int
+	if err := s.db.QueryRow(s.q(`SELECT COUNT(*) FROM sessions WHERE id = ?`), id).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (s *Store) ExtendSession(hash string, expiresAt time.Time) error {
-	_, err := s.db.Exec(`UPDATE sessions SET expires_at = ? WHERE id = ?`, expiresAt.Unix(), hash)
+	_, err := s.db.Exec(s.q(`UPDATE sessions SET expires_at = ? WHERE id = ?`), expiresAt.Unix(), hash)
 	return err
 }
 
 func (s *Store) DeleteSession(hash string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, hash)
+	_, err := s.db.Exec(s.q(`DELETE FROM sessions WHERE id = ?`), hash)
 	return err
 }
 
@@ -189,15 +229,15 @@ func (s *Store) DeleteSession(hash string) error {
 // this developer holds but the one identified by keepHash. Passing a hash
 // that matches nothing (or "") signs them out everywhere, full stop.
 func (s *Store) DeleteSessionsExcept(developerID, keepHash string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE developer_id = ? AND id <> ?`, developerID, keepHash)
+	_, err := s.db.Exec(s.q(`DELETE FROM sessions WHERE developer_id = ? AND id <> ?`), developerID, keepHash)
 	return err
 }
 
 // ---------- API keys ----------
 
 func (s *Store) CreateAPIKey(k model.APIKey, developerID, hash string) error {
-	_, err := s.db.Exec(`
-		INSERT INTO api_keys (id, developer_id, name, prefix, hash, created_at) VALUES (?,?,?,?,?,?)`,
+	_, err := s.db.Exec(s.q(`
+		INSERT INTO api_keys (id, developer_id, name, prefix, hash, created_at) VALUES (?,?,?,?,?,?)`),
 		k.ID, developerID, k.Name, k.Prefix, hash, k.CreatedAt.Unix())
 	return err
 }
@@ -209,10 +249,10 @@ func (s *Store) DeveloperByKeyHash(hash string) (model.Developer, model.APIKey, 
 	var dCreated, kCreated int64
 	var rdJSON string
 	var last, revoked sql.NullInt64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRow(s.q(`
 		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, k.id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at
 		FROM api_keys k JOIN developers d ON d.id = k.developer_id
-		WHERE k.hash = ? AND k.revoked_at IS NULL`, hash).
+		WHERE k.hash = ? AND k.revoked_at IS NULL`), hash).
 		Scan(&d.ID, &d.Email, &d.Name, &dCreated, &rdJSON, &k.ID, &k.Name, &k.Prefix, &kCreated, &last, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, k, ErrNotFound
@@ -229,14 +269,14 @@ func (s *Store) DeveloperByKeyHash(hash string) (model.Developer, model.APIKey, 
 }
 
 func (s *Store) TouchAPIKey(id string, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`, at.Unix(), id)
+	_, err := s.db.Exec(s.q(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`), at.Unix(), id)
 	return err
 }
 
 func (s *Store) ListAPIKeys(developerID string) ([]model.APIKey, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.db.Query(s.q(`
 		SELECT id, name, prefix, created_at, last_used_at, revoked_at
-		FROM api_keys WHERE developer_id = ? ORDER BY created_at`, developerID)
+		FROM api_keys WHERE developer_id = ? ORDER BY created_at`), developerID)
 	if err != nil {
 		return nil, err
 	}
@@ -260,8 +300,8 @@ func (s *Store) ListAPIKeys(developerID string) ([]model.APIKey, error) {
 // RevokeAPIKey soft-revokes a key the developer owns. Revoking twice is a
 // no-op that still succeeds.
 func (s *Store) RevokeAPIKey(developerID, id string, at time.Time) error {
-	res, err := s.db.Exec(`
-		UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND developer_id = ?`,
+	res, err := s.db.Exec(s.q(`
+		UPDATE api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND developer_id = ?`),
 		at.Unix(), id, developerID)
 	if err != nil {
 		return err

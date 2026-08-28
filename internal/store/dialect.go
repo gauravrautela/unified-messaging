@@ -15,6 +15,17 @@ type dialect struct {
 	migrate []string // additive column migrations
 	likeCI  func(col string) string
 	rebind  func(q string) string
+	// forUpdate suffixes a SELECT that reads a row in order to read-modify-
+	// write it inside a transaction. On SQLite this is the empty string: the
+	// connection pool is pinned to one connection (see Open), so a
+	// transaction already holds the database's only connection for its
+	// whole lifetime and no concurrent transaction can interleave with it.
+	// Postgres has no such accidental serialization — its pool routinely
+	// hands out several connections at once — so the same read there must
+	// take a row lock (SELECT ... FOR UPDATE) or two concurrent
+	// transactions can each read the same starting value and one's write
+	// clobbers the other's.
+	forUpdate string
 }
 
 func sqliteDialect() *dialect {
@@ -30,10 +41,11 @@ func sqliteDialect() *dialect {
 func postgresDialect() *dialect {
 	return &dialect{
 		name: "postgres", wmName: "postgres",
-		schema:  render(schemaTemplate, "BYTEA", "BIGINT"),
-		migrate: postgresMigrations,
-		likeCI:  func(col string) string { return col + " ILIKE ? ESCAPE '\\'" },
-		rebind:  rebindDollar,
+		schema:    render(schemaTemplate, "BYTEA", "BIGINT"),
+		migrate:   postgresMigrations,
+		likeCI:    func(col string) string { return col + " ILIKE ? ESCAPE '\\'" },
+		rebind:    rebindDollar,
+		forUpdate: " FOR UPDATE",
 	}
 }
 
@@ -41,25 +53,38 @@ func render(tmpl, blob, bigint string) string {
 	return strings.NewReplacer("{{BLOB}}", blob, "{{BIGINT}}", bigint).Replace(tmpl)
 }
 
-// rebindDollar turns ? placeholders into $1, $2, … skipping quoted strings.
+// rebindDollar turns ? placeholders into $1, $2, … skipping quoted strings and
+// -- line comments (mirroring splitStatements' comment handling: the schema
+// and hand-written queries alike may carry a comment with a literal ? or ;
+// in it, and neither is a placeholder).
 func rebindDollar(q string) string {
 	var b strings.Builder
 	b.Grow(len(q) + 8)
 	n := 0
 	inStr := false
+	inLine := false
 	for i := 0; i < len(q); i++ {
 		c := q[i]
 		switch {
+		case inLine:
+			if c == '\n' {
+				inLine = false
+			}
+		case inStr:
+			if c == '\'' {
+				inStr = false
+			}
 		case c == '\'':
-			inStr = !inStr
-			b.WriteByte(c)
-		case c == '?' && !inStr:
+			inStr = true
+		case c == '-' && i+1 < len(q) && q[i+1] == '-':
+			inLine = true
+		case c == '?':
 			n++
 			b.WriteByte('$')
 			b.WriteString(strconv.Itoa(n))
-		default:
-			b.WriteByte(c)
+			continue
 		}
+		b.WriteByte(c)
 	}
 	return b.String()
 }

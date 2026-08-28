@@ -45,6 +45,8 @@ func OpenForTest(t testing.TB) *Store {
 	}
 	u, err := url.Parse(dsn)
 	if err != nil {
+		_, _ = admin.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`)
+		admin.Close()
 		t.Fatal(err)
 	}
 	qv := u.Query()

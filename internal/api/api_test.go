@@ -203,9 +203,17 @@ func (m mailStub) Push() provider.Pusher        { return nil }
 // waitFor polls cond until it is true or the deadline passes, for assertions
 // against state a background goroutine (the link pump, the chat actor)
 // updates asynchronously.
+// waitForTimeout is generous enough to cover the async pipeline it polls
+// even when every store write in it is a real network round trip (running
+// against TEST_DATABASE_URL) rather than SQLite's effectively-free local
+// ones. It only bounds how long a test waits before failing — the fast
+// (SQLite) path still returns as soon as cond() is true, typically within a
+// poll or two.
+const waitForTimeout = 20 * time.Second
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(waitForTimeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		if cond() {
 			return
 		}
@@ -2041,9 +2049,22 @@ func TestResolveProviderRequiresNameWithoutExactlyOneMailProvider(t *testing.T) 
 // network dial — so one slow dial serialized every other state's poll (and
 // the sweeper) behind it.
 func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, db := newTestServer(t)
 	_, key := seedDev(t, s, "a@x.com")
 	h := s.Routes()
+
+	// The margin below only needs to be tight enough to catch the registry
+	// holding its lock across the full StartLink call; against a real
+	// network database (TEST_DATABASE_URL) every store round trip on the
+	// fast path costs real time too, so both the simulated delay and the
+	// pass/fail threshold scale up to keep that margin meaningful instead of
+	// flaking on round-trip latency that has nothing to do with the lock.
+	slowDelay := time.Second
+	threshold := 400 * time.Millisecond
+	if db.DriverName() != "sqlite" {
+		slowDelay = 8 * time.Second
+		threshold = 4 * time.Second
+	}
 
 	mint := func() (string, *http.Cookie) {
 		req := withKey(httptest.NewRequest(http.MethodPost, "/api/v1/hosted-auth", strings.NewReader(`{"provider":"FAKECHAT"}`)), key)
@@ -2060,7 +2081,7 @@ func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
 	slowState, slowCookie := mint()
 	fastState, fastCookie := mint()
 
-	s.fake().SetStartLinkDelay(time.Second)
+	s.fake().SetStartLinkDelay(slowDelay)
 
 	done := make(chan struct{})
 	go func() {
@@ -2069,7 +2090,7 @@ func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
 	}()
 	// Give the slow poll time to actually enter StartLink (past the delay
 	// read) before the fast one races it.
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(slowDelay / 10)
 	s.fake().SetStartLinkDelay(0)
 
 	start := time.Now()
@@ -2079,7 +2100,7 @@ func TestLinkQRSlowStartLinkDoesNotBlockOtherStates(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("fast state poll: %d %s", rec.Code, rec.Body.String())
 	}
-	if elapsed > 400*time.Millisecond {
+	if elapsed > threshold {
 		t.Fatalf("fast state's /qr took %v while a different state's StartLink was in flight; the registry lock is still held across StartLink", elapsed)
 	}
 
@@ -3176,15 +3197,15 @@ func TestSessionTokenIsHashedAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, tok).Scan(&n); err != nil {
+	exists, err := db.SessionRowExists(tok)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
+	if exists {
 		t.Fatal("raw token stored")
 	}
-	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, auth.HashKey(tok)).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("hashed row missing: %d %v", n, err)
+	if exists, err = db.SessionRowExists(auth.HashKey(tok)); err != nil || !exists {
+		t.Fatalf("hashed row missing: %v", err)
 	}
 	if _, _, err := s.auth.SessionDeveloper(context.Background(), tok); err != nil {
 		t.Fatal("token must still resolve")
@@ -3197,8 +3218,7 @@ func TestSessionAbsoluteLifetime(t *testing.T) {
 	tok, _, _ := s.auth.NewSession(context.Background(), dev.ID)
 	// Age the row past the absolute limit while keeping it unexpired by the
 	// sliding rule.
-	if _, err := db.DB().Exec(`UPDATE sessions SET created_at = ? WHERE id = ?`,
-		time.Now().Add(-91*24*time.Hour).Unix(), auth.HashKey(tok)); err != nil {
+	if err := db.SetSessionCreatedAt(auth.HashKey(tok), time.Now().Add(-91*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.auth.SessionDeveloper(context.Background(), tok); err == nil {

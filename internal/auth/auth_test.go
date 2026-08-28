@@ -205,8 +205,7 @@ func TestSessionAbsoluteMaxAge(t *testing.T) {
 	tok, _, _ := svc.NewSession(ctx, d.ID)
 	// Age the row past the absolute limit while keeping it unexpired by the
 	// sliding rule.
-	if _, err := db.DB().Exec(`UPDATE sessions SET created_at = ? WHERE id = ?`,
-		time.Now().Add(-91*24*time.Hour).Unix(), HashKey(tok)); err != nil {
+	if err := db.SetSessionCreatedAt(HashKey(tok), time.Now().Add(-91*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := svc.SessionDeveloper(ctx, tok); !errors.Is(err, ErrInvalidCredentials) {

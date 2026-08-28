@@ -219,11 +219,11 @@ func (s *Store) UpsertAccount(a model.Account) error {
 	if kind == "" {
 		kind = model.AccountKindMail
 	}
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO accounts (id, developer_id, kind, provider, email, name, status, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(developer_id, email) DO UPDATE SET
-		  name = excluded.name, status = excluded.status, updated_at = excluded.updated_at`,
+		  name = excluded.name, status = excluded.status, updated_at = excluded.updated_at`),
 		a.ID, a.DeveloperID, kind, a.Provider, a.Email, a.Name, a.Status, now, now)
 	return err
 }
@@ -232,7 +232,7 @@ func (s *Store) UpsertAccount(a model.Account) error {
 // instead of creating a duplicate account row — within one developer.
 func (s *Store) AccountIDByEmail(developerID, email string) (string, error) {
 	var id string
-	err := s.db.QueryRow(`SELECT id FROM accounts WHERE developer_id = ? AND email = ?`,
+	err := s.db.QueryRow(s.q(`SELECT id FROM accounts WHERE developer_id = ? AND email = ?`),
 		developerID, email).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
@@ -249,13 +249,13 @@ const accountSelect = `
 // cannot be probed across tenants.
 func (s *Store) GetAccount(developerID, id string) (model.Account, error) {
 	defer s.trace("GetAccount", time.Now(), "developer_id", developerID, "account_id", id)
-	return scanAccount(s.db.QueryRow(accountSelect+` WHERE developer_id = ? AND id = ?`, developerID, id))
+	return scanAccount(s.db.QueryRow(s.q(accountSelect+` WHERE developer_id = ? AND id = ?`), developerID, id))
 }
 
 // GetAnyAccount is UNSCOPED: for internal callers (sync, token custody,
 // push) that hold an account id and no tenant. Never call from a handler.
 func (s *Store) GetAnyAccount(id string) (model.Account, error) {
-	return scanAccount(s.db.QueryRow(accountSelect+` WHERE id = ?`, id))
+	return scanAccount(s.db.QueryRow(s.q(accountSelect+` WHERE id = ?`), id))
 }
 
 func (s *Store) ListAccounts(developerID string) ([]model.Account, error) {
@@ -268,7 +268,7 @@ func (s *Store) ListAllAccounts() ([]model.Account, error) {
 }
 
 func (s *Store) queryAccounts(q string, args ...any) ([]model.Account, error) {
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.Query(s.q(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -285,13 +285,13 @@ func (s *Store) queryAccounts(q string, args ...any) ([]model.Account, error) {
 }
 
 func (s *Store) SetAccountStatus(id, status string) error {
-	_, err := s.db.Exec(`UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?`,
+	_, err := s.db.Exec(s.q(`UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?`),
 		status, time.Now().Unix(), id)
 	return err
 }
 
 func (s *Store) MarkSynced(id string) error {
-	_, err := s.db.Exec(`UPDATE accounts SET last_synced_at = ? WHERE id = ?`, time.Now().Unix(), id)
+	_, err := s.db.Exec(s.q(`UPDATE accounts SET last_synced_at = ? WHERE id = ?`), time.Now().Unix(), id)
 	return err
 }
 
@@ -303,13 +303,13 @@ func (s *Store) MarkSynced(id string) error {
 // deliveries or webhooks orphaned from a half-deleted account.
 func (s *Store) DeleteAccount(id string) error {
 	return s.inTx(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM webhook_deliveries WHERE account_id = ?`, id); err != nil {
+		if _, err := tx.Exec(s.q(`DELETE FROM webhook_deliveries WHERE account_id = ?`), id); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM webhooks WHERE account_id = ?`, id); err != nil {
+		if _, err := tx.Exec(s.q(`DELETE FROM webhooks WHERE account_id = ?`), id); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id)
+		_, err := tx.Exec(s.q(`DELETE FROM accounts WHERE id = ?`), id)
 		return err
 	})
 }
@@ -353,14 +353,14 @@ type TokenRecord struct {
 }
 
 func (s *Store) SaveTokens(accountID string, t TokenRecord) error {
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO tokens (account_id, access_token, access_expires_at, refresh_token_enc, scope)
 		VALUES (?,?,?,?,?)
 		ON CONFLICT(account_id) DO UPDATE SET
 		  access_token = excluded.access_token,
 		  access_expires_at = excluded.access_expires_at,
 		  refresh_token_enc = excluded.refresh_token_enc,
-		  scope = excluded.scope`,
+		  scope = excluded.scope`),
 		accountID, t.AccessToken, t.AccessExpiresAt.Unix(), t.RefreshTokenEnc, t.Scope)
 	return err
 }
@@ -368,9 +368,9 @@ func (s *Store) SaveTokens(accountID string, t TokenRecord) error {
 func (s *Store) GetTokens(accountID string) (TokenRecord, error) {
 	var t TokenRecord
 	var exp int64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRow(s.q(`
 		SELECT access_token, access_expires_at, refresh_token_enc, scope
-		FROM tokens WHERE account_id = ?`, accountID).
+		FROM tokens WHERE account_id = ?`), accountID).
 		Scan(&t.AccessToken, &exp, &t.RefreshTokenEnc, &t.Scope)
 	if errors.Is(err, sql.ErrNoRows) {
 		return t, ErrNotFound
@@ -382,20 +382,20 @@ func (s *Store) GetTokens(accountID string) (TokenRecord, error) {
 // ---------- folders ----------
 
 func (s *Store) UpsertFolder(f model.Folder) error {
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO folders (account_id, id, name, parent_id, role, total_count, unread_count)
 		VALUES (?,?,?,?,?,?,?)
 		ON CONFLICT(account_id, id) DO UPDATE SET
 		  name = excluded.name, parent_id = excluded.parent_id, role = excluded.role,
-		  total_count = excluded.total_count, unread_count = excluded.unread_count`,
+		  total_count = excluded.total_count, unread_count = excluded.unread_count`),
 		f.AccountID, f.ID, f.Name, f.ParentID, f.Role, f.TotalCount, f.UnreadCount)
 	return err
 }
 
 func (s *Store) ListFolders(accountID string) ([]model.Folder, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.db.Query(s.q(`
 		SELECT account_id, id, name, parent_id, role, total_count, unread_count
-		FROM folders WHERE account_id = ? ORDER BY name`, accountID)
+		FROM folders WHERE account_id = ? ORDER BY name`), accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +413,7 @@ func (s *Store) ListFolders(accountID string) ([]model.Folder, error) {
 }
 
 func (s *Store) DeleteFolder(accountID, folderID string) error {
-	_, err := s.db.Exec(`DELETE FROM folders WHERE account_id = ? AND id = ?`, accountID, folderID)
+	_, err := s.db.Exec(s.q(`DELETE FROM folders WHERE account_id = ? AND id = ?`), accountID, folderID)
 	return err
 }
 
@@ -423,7 +423,7 @@ func (s *Store) DeleteFolder(accountID, folderID string) error {
 // error: it means "never synced", which is exactly the empty cursor.
 func (s *Store) GetCursor(accountID, scopeID string) (string, error) {
 	var cursor string
-	err := s.db.QueryRow(`SELECT cursor FROM sync_state WHERE account_id = ? AND scope_id = ?`,
+	err := s.db.QueryRow(s.q(`SELECT cursor FROM sync_state WHERE account_id = ? AND scope_id = ?`),
 		accountID, scopeID).Scan(&cursor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -432,11 +432,11 @@ func (s *Store) GetCursor(accountID, scopeID string) (string, error) {
 }
 
 func (s *Store) SetCursor(accountID, scopeID, cursor string) error {
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO sync_state (account_id, scope_id, cursor, updated_at)
 		VALUES (?,?,?,?)
 		ON CONFLICT(account_id, scope_id) DO UPDATE SET
-		  cursor = excluded.cursor, updated_at = excluded.updated_at`,
+		  cursor = excluded.cursor, updated_at = excluded.updated_at`),
 		accountID, scopeID, cursor, time.Now().Unix())
 	return err
 }
@@ -452,7 +452,7 @@ func (s *Store) UpsertEmail(e model.Email) error {
 	bcc, _ := json.Marshal(e.Bcc)
 	rt, _ := json.Marshal(e.ReplyTo)
 	att, _ := json.Marshal(e.Attachments)
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO emails (account_id, id, thread_id, folder_id, subject, from_name, from_email,
 		  to_json, cc_json, bcc_json, reply_to_json, date, snippet, body, body_type,
 		  read, flagged, draft, has_attachments, internet_message_id, attachments_json)
@@ -472,7 +472,7 @@ func (s *Store) UpsertEmail(e model.Email) error {
 		  has_attachments = excluded.has_attachments,
 		  internet_message_id = excluded.internet_message_id,
 		  attachments_json = CASE WHEN excluded.attachments_json = '[]'
-		    THEN emails.attachments_json ELSE excluded.attachments_json END`,
+		    THEN emails.attachments_json ELSE excluded.attachments_json END`),
 		e.AccountID, e.ID, e.ThreadID, e.FolderID, e.Subject, e.From.Name, e.From.Email,
 		string(to), string(cc), string(bcc), string(rt), e.Date.Unix(), e.Snippet, e.Body,
 		e.BodyType, b2i(e.Read), b2i(e.Flagged), b2i(e.Draft), b2i(e.HasAttachments),
@@ -484,7 +484,7 @@ func (s *Store) UpsertEmail(e model.Email) error {
 // (worth a mail_received event) or a replay/update of something we already hold.
 func (s *Store) EmailExists(accountID, id string) (bool, error) {
 	var one int
-	err := s.db.QueryRow(`SELECT 1 FROM emails WHERE account_id = ? AND id = ?`, accountID, id).Scan(&one)
+	err := s.db.QueryRow(s.q(`SELECT 1 FROM emails WHERE account_id = ? AND id = ?`), accountID, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -492,12 +492,12 @@ func (s *Store) EmailExists(accountID, id string) (bool, error) {
 }
 
 func (s *Store) DeleteEmail(accountID, id string) error {
-	_, err := s.db.Exec(`DELETE FROM emails WHERE account_id = ? AND id = ?`, accountID, id)
+	_, err := s.db.Exec(s.q(`DELETE FROM emails WHERE account_id = ? AND id = ?`), accountID, id)
 	return err
 }
 
 func (s *Store) GetEmail(accountID, id string) (model.Email, error) {
-	row := s.db.QueryRow(emailSelect+` WHERE account_id = ? AND id = ?`, accountID, id)
+	row := s.db.QueryRow(s.q(emailSelect+` WHERE account_id = ? AND id = ?`), accountID, id)
 	return scanEmail(row)
 }
 
@@ -534,7 +534,7 @@ func (s *Store) ListEmails(q EmailQuery) (result []model.Email, err error) {
 		args = append(args, b2i(!*q.Unread))
 	}
 	if q.Search != "" {
-		where = append(where, "(subject LIKE ? ESCAPE '\\' OR snippet LIKE ? ESCAPE '\\' OR from_email LIKE ? ESCAPE '\\')")
+		where = append(where, "("+s.d.likeCI("subject")+" OR "+s.d.likeCI("snippet")+" OR "+s.d.likeCI("from_email")+")")
 		like := "%" + escapeLike(q.Search) + "%"
 		args = append(args, like, like, like)
 	}
@@ -543,8 +543,8 @@ func (s *Store) ListEmails(q EmailQuery) (result []model.Email, err error) {
 	}
 	args = append(args, q.Limit, q.Offset)
 
-	rows, err := s.db.Query(emailSelect+" WHERE "+strings.Join(where, " AND ")+
-		" ORDER BY date DESC LIMIT ? OFFSET ?", args...)
+	rows, err := s.db.Query(s.q(emailSelect+" WHERE "+strings.Join(where, " AND ")+
+		" ORDER BY date DESC LIMIT ? OFFSET ?"), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -564,11 +564,11 @@ func (s *Store) ListThreads(accountID string, limit, offset int) ([]model.Thread
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.Query(s.q(`
 		SELECT thread_id, MAX(date) AS last_date, COUNT(*) AS n,
 		       SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) AS unread
 		FROM emails WHERE account_id = ? AND thread_id != ''
-		GROUP BY thread_id ORDER BY last_date DESC LIMIT ? OFFSET ?`,
+		GROUP BY thread_id ORDER BY last_date DESC LIMIT ? OFFSET ?`),
 		accountID, limit, offset)
 	if err != nil {
 		return nil, err
@@ -584,8 +584,8 @@ func (s *Store) ListThreads(accountID string, limit, offset int) ([]model.Thread
 		t.AccountID = accountID
 		t.LastDate = time.Unix(last, 0).UTC()
 		// Subject of the newest message in the thread reads best as the label.
-		_ = s.db.QueryRow(`SELECT subject FROM emails
-			WHERE account_id = ? AND thread_id = ? ORDER BY date DESC LIMIT 1`,
+		_ = s.db.QueryRow(s.q(`SELECT subject FROM emails
+			WHERE account_id = ? AND thread_id = ? ORDER BY date DESC LIMIT 1`),
 			accountID, t.ID).Scan(&t.Subject)
 		out = append(out, t)
 	}

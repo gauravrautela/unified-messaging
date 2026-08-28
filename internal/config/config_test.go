@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,62 @@ func TestLoadRequiresPublicBaseURL(t *testing.T) {
 	}
 	if cfg.PublicBaseURL != "https://um.example.com" {
 		t.Errorf("PublicBaseURL = %q, want the trailing slash trimmed", cfg.PublicBaseURL)
+	}
+}
+
+// A password containing both @ and # defeats a naive url.Parse: '#' starts a
+// URL fragment and '@' separates userinfo from host, so an unescaped
+// password carrying either (here, both at once) either fails to parse or —
+// worse — silently mis-splits into the wrong host without any error at all.
+// Load must recognize either failure mode and repair the DSN by
+// percent-encoding just the password segment, rather than refusing to start
+// (or, worse, connecting to the wrong place) whenever a generated password
+// happens to contain one of these characters.
+func TestLoadRepairsUnescapedPostgresPassword(t *testing.T) {
+	t.Setenv("MS_CLIENT_ID", "client-id")
+	t.Setenv("TOKEN_ENCRYPTION_KEY", validKey)
+	t.Setenv("PUBLIC_BASE_URL", "http://localhost:8080")
+	t.Setenv("DB_DRIVER", "postgres")
+	t.Setenv("DATABASE_URL", "postgresql://postgres:p@ss#1@db.example.com:5432/postgres?sslmode=require")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	u, err := url.Parse(cfg.DBDSN)
+	if err != nil {
+		t.Fatalf("repaired DBDSN does not parse: %v", err)
+	}
+	if u.Host != "db.example.com:5432" {
+		t.Errorf("host = %q, want %q", u.Host, "db.example.com:5432")
+	}
+	if pass, ok := u.User.Password(); !ok || pass != "p@ss#1" {
+		t.Errorf("password = %q, ok=%v, want %q", pass, ok, "p@ss#1")
+	}
+	if u.Path != "/postgres" {
+		t.Errorf("path = %q, want /postgres", u.Path)
+	}
+	if u.RawQuery != "sslmode=require" {
+		t.Errorf("query = %q, want sslmode=require", u.RawQuery)
+	}
+	if u.Fragment != "" {
+		t.Errorf("fragment = %q, want empty (the password swallowed the rest of the URL)", u.Fragment)
+	}
+}
+
+// A DATABASE_URL that isn't a postgres connection string at all (no "://",
+// so there is no password segment to repair) must still fail with a plain
+// error rather than panicking or silently proceeding with garbage.
+func TestLoadRejectsUnrepairablePostgresURL(t *testing.T) {
+	t.Setenv("MS_CLIENT_ID", "client-id")
+	t.Setenv("TOKEN_ENCRYPTION_KEY", validKey)
+	t.Setenv("PUBLIC_BASE_URL", "http://localhost:8080")
+	t.Setenv("DB_DRIVER", "postgres")
+	t.Setenv("DATABASE_URL", "not-a-url at all")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with a garbage DATABASE_URL succeeded, want an error")
 	}
 }
 

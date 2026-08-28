@@ -23,10 +23,10 @@ type Subscription struct {
 }
 
 func (s *Store) SaveSubscription(sub Subscription) error {
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO subscriptions (id, account_id, resource, client_state, expires_at, created_at)
 		VALUES (?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET expires_at = excluded.expires_at`,
+		ON CONFLICT(id) DO UPDATE SET expires_at = excluded.expires_at`),
 		sub.ID, sub.AccountID, sub.Resource, sub.ClientState,
 		sub.ExpiresAt.Unix(), time.Now().Unix())
 	return err
@@ -35,9 +35,9 @@ func (s *Store) SaveSubscription(sub Subscription) error {
 func (s *Store) GetSubscription(id string) (Subscription, error) {
 	var sub Subscription
 	var exp, created int64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRow(s.q(`
 		SELECT id, account_id, resource, client_state, expires_at, created_at
-		FROM subscriptions WHERE id = ?`, id).
+		FROM subscriptions WHERE id = ?`), id).
 		Scan(&sub.ID, &sub.AccountID, &sub.Resource, &sub.ClientState, &exp, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sub, ErrNotFound
@@ -48,8 +48,8 @@ func (s *Store) GetSubscription(id string) (Subscription, error) {
 }
 
 func (s *Store) ListSubscriptions() ([]Subscription, error) {
-	rows, err := s.db.Query(`
-		SELECT id, account_id, resource, client_state, expires_at, created_at FROM subscriptions`)
+	rows, err := s.db.Query(s.q(`
+		SELECT id, account_id, resource, client_state, expires_at, created_at FROM subscriptions`))
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +84,7 @@ func (s *Store) SubscriptionsForAccount(accountID string) ([]Subscription, error
 }
 
 func (s *Store) DeleteSubscription(id string) error {
-	_, err := s.db.Exec(`DELETE FROM subscriptions WHERE id = ?`, id)
+	_, err := s.db.Exec(s.q(`DELETE FROM subscriptions WHERE id = ?`), id)
 	return err
 }
 
@@ -125,9 +125,9 @@ func (s *Store) SaveWebhook(w model.Webhook) error {
 		}
 		config = sealed
 	}
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO webhooks (id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?)`),
 		w.ID, w.DeveloperID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix(), w.Kind, config)
 	return err
 }
@@ -168,7 +168,7 @@ func (s *Store) GetAnyWebhook(id string) (model.Webhook, error) {
 }
 
 func (s *Store) DeleteWebhook(developerID, id string) error {
-	res, err := s.db.Exec(`DELETE FROM webhooks WHERE developer_id = ? AND id = ?`, developerID, id)
+	res, err := s.db.Exec(s.q(`DELETE FROM webhooks WHERE developer_id = ? AND id = ?`), developerID, id)
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (s *Store) oneWebhook(q string, args ...any) (model.Webhook, error) {
 }
 
 func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.Query(s.q(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -274,15 +274,15 @@ func (s *Store) SaveDelivery(d Delivery) error {
 	// payload is a byte count, never content.
 	defer s.trace("SaveDelivery", time.Now(), "delivery_id", d.ID, "webhook_id", d.WebhookID,
 		"account_id", d.AccountID, "attempts", d.Attempts, "dead", d.Dead, "payload_bytes", len(d.Payload))
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.q(`
 		INSERT INTO webhook_deliveries
 		  (id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at,
-		  last_error = excluded.last_error, dead = excluded.dead`,
+		  last_error = excluded.last_error, dead = excluded.dead`),
 		d.ID, d.WebhookID, d.AccountID, d.EventType, d.Payload, d.Attempts,
-		d.NextAttemptAt.Unix(), d.LastError, d.Dead, d.CreatedAt.Unix())
+		d.NextAttemptAt.Unix(), d.LastError, b2i(d.Dead), d.CreatedAt.Unix())
 	return err
 }
 
@@ -308,7 +308,7 @@ func (s *Store) ListDeliveries(webhookID string, limit, offset int) ([]Delivery,
 }
 
 func (s *Store) DeleteDelivery(id string) error {
-	_, err := s.db.Exec(`DELETE FROM webhook_deliveries WHERE id = ?`, id)
+	_, err := s.db.Exec(s.q(`DELETE FROM webhook_deliveries WHERE id = ?`), id)
 	return err
 }
 
@@ -317,7 +317,7 @@ func (s *Store) DeleteDelivery(id string) error {
 // forever is an unbounded (and increasingly sensitive) amount of retained
 // mail/chat content. Live deliveries — still retrying — are never touched.
 func (s *Store) PurgeDeadDeliveries(before time.Time) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM webhook_deliveries WHERE dead = 1 AND created_at < ?`, before.Unix())
+	res, err := s.db.Exec(s.q(`DELETE FROM webhook_deliveries WHERE dead = 1 AND created_at < ?`), before.Unix())
 	if err != nil {
 		return 0, err
 	}
@@ -325,7 +325,7 @@ func (s *Store) PurgeDeadDeliveries(before time.Time) (int64, error) {
 }
 
 func (s *Store) queryDeliveries(q string, args ...any) ([]Delivery, error) {
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.Query(s.q(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -451,9 +451,9 @@ func (s *Store) SaveOAuthState(o OAuthState) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`
+	_, err = s.db.Exec(s.q(`
 		INSERT INTO oauth_states (state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, created_at, expires_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?)`),
 		o.State, o.DeveloperID, o.Provider, o.Verifier, o.SuccessURL, o.FailureURL, o.NotifyURL,
 		wh, time.Now().Unix(), o.ExpiresAt.Unix())
 	return err
@@ -463,7 +463,7 @@ func (s *Store) SaveOAuthState(o OAuthState) error {
 // the connect page, which is what /connect/{state}/qr requires before it will
 // start a pairing session.
 func (s *Store) SetOAuthConsent(state string, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE oauth_states SET consented_at = ? WHERE state = ?`, at.Unix(), state)
+	_, err := s.db.Exec(s.q(`UPDATE oauth_states SET consented_at = ? WHERE state = ?`), at.Unix(), state)
 	return err
 }
 
@@ -472,7 +472,7 @@ func (s *Store) SetOAuthConsent(state string, at time.Time) error {
 // exists so tests can simulate a connect link expiring out from under an
 // in-flight pairing session without reaching into the database directly.
 func (s *Store) SetOAuthStateExpiry(state string, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE oauth_states SET expires_at = ? WHERE state = ?`, at.Unix(), state)
+	_, err := s.db.Exec(s.q(`UPDATE oauth_states SET expires_at = ? WHERE state = ?`), at.Unix(), state)
 	return err
 }
 
@@ -483,9 +483,9 @@ func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 	var exp int64
 	var wh string
 	var consented sql.NullInt64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRow(s.q(`
 		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at, browser_hash
-		FROM oauth_states WHERE state = ?`, state).
+		FROM oauth_states WHERE state = ?`), state).
 		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented, &o.BrowserHash)
 	o.Webhook = s.decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -498,7 +498,7 @@ func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 		t := time.Unix(consented.Int64, 0).UTC()
 		o.ConsentedAt = &t
 	}
-	if _, err := s.db.Exec(`DELETE FROM oauth_states WHERE state = ?`, state); err != nil {
+	if _, err := s.db.Exec(s.q(`DELETE FROM oauth_states WHERE state = ?`), state); err != nil {
 		return o, err
 	}
 	o.ExpiresAt = time.Unix(exp, 0).UTC()
@@ -509,7 +509,7 @@ func (s *Store) TakeOAuthState(state string) (OAuthState, error) {
 }
 
 func (s *Store) PurgeExpiredOAuthStates() {
-	_, _ = s.db.Exec(`DELETE FROM oauth_states WHERE expires_at < ?`, time.Now().Unix())
+	_, _ = s.db.Exec(s.q(`DELETE FROM oauth_states WHERE expires_at < ?`), time.Now().Unix())
 }
 
 // PeekOAuthState reads a pending connect attempt without consuming it. The
@@ -520,9 +520,9 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 	var exp int64
 	var wh string
 	var consented sql.NullInt64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRow(s.q(`
 		SELECT state, developer_id, provider, verifier, success_url, failure_url, notify_url, webhook_json, expires_at, consented_at, browser_hash
-		FROM oauth_states WHERE state = ?`, state).
+		FROM oauth_states WHERE state = ?`), state).
 		Scan(&o.State, &o.DeveloperID, &o.Provider, &o.Verifier, &o.SuccessURL, &o.FailureURL, &o.NotifyURL, &wh, &exp, &consented, &o.BrowserHash)
 	o.Webhook = s.decodePendingWebhook(wh)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -544,9 +544,9 @@ func (s *Store) PeekOAuthState(state string) (OAuthState, error) {
 // false on a genuine mismatch or an unknown state — the caller cannot tell
 // those apart from the return value alone, which is fine: both mean refuse.
 func (s *Store) ClaimOAuthStateBrowser(state, hash string) (bool, error) {
-	res, err := s.db.Exec(`
+	res, err := s.db.Exec(s.q(`
 		UPDATE oauth_states SET browser_hash = ?
-		WHERE state = ? AND (browser_hash = '' OR browser_hash = ?)`,
+		WHERE state = ? AND (browser_hash = '' OR browser_hash = ?)`),
 		hash, state, hash)
 	if err != nil {
 		return false, err
