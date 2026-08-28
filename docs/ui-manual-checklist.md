@@ -46,8 +46,8 @@ Theme means the OS/browser `prefers-color-scheme` setting.
 
 ## 1. Website — `/`
 
-- [ ] Signed out: hero, nav, and every anchor (`#how`, `#providers`,
-      `#features`, `#events`) scroll to the right section; the back button
+- [ ] Signed out: hero, nav, and every anchor (`#how`, `/#providers`,
+      `/#features`, `#events`) scroll to the right section; the back button
       returns you.
 - [ ] Signed in: the nav shows the account affordance instead of Sign in.
 - [ ] Hero snippet tabs (curl / Node / Go) switch panes by click *and* by

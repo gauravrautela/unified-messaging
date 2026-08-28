@@ -303,3 +303,34 @@ curl -H "Authorization: Bearer $API_KEY" -X POST -H Content-Type:\ application/j
 - Passed: 10
 - Failed: 0
 - Sent one email to `gauravrautela007@outlook.com` with subject `smoke-test 04:33:47`
+
+## 2026-08-28 — UI overhaul + Entropix website, end-to-end journey
+
+Build: `feature/multi-tenancy` @ 541d361. Harness: headless Chrome driven over CDP
+(device emulation, session cookie, console capture) against a temp server on
+`:8095` (sqlite, WhatsApp off). Screenshots at 1280 and 360 px, light and dark.
+
+Checked, all passing, zero console errors/exceptions on every page:
+
+- `/` website: hero + tabbed curl/Node/Go snippet (Go tab compiles; `go vet` in tests),
+  how-it-works, providers from the registry, features, events chips → `/docs#event-*`
+  (10/10 resolve), footer. Dark-first hero; no external assets.
+- `/signup` → `/dashboard`: labelled fields, submit disables, lands on the empty
+  state ("No accounts yet" + Connect account).
+- Dashboard tabs (Accounts · Webhooks · API keys · Settings) via hash; Connect
+  dialog lists enabled providers with plain-English copy; Create key → one-time
+  reveal with Copy + "never shown again" + toast; Revoke present; webhook and
+  settings forms render.
+- `/mail`, `/chat`: split layout, empty states link back to the dashboard;
+  menu/back buttons at 360 px.
+- `/docs` anonymous → site shell; signed-in → console shell. 44 endpoint blocks,
+  TOC filter, events with delivery kinds + HTTP/Discord/Telegram formats,
+  errors table, rate-limits & idempotency section. `docs.css` in `<head>`.
+- Headers: signed-in `/` and `/docs` are `Cache-Control: private, no-store` +
+  `Vary: Cookie`; anonymous stay cacheable; `/static/*` immutable; CSP unchanged.
+- Mobile (360 px): `innerWidth === scrollWidth === 360` on `/`, `/login`, `/docs`,
+  `/dashboard`, `/mail`, `/chat` after the top-bar fix (was 441–466 px).
+
+Not exercised here (needs a real phone / Microsoft tenant): WhatsApp QR pairing,
+OAuth round-trip, live message delivery — see `docs/ui-manual-checklist.md` and
+`docs/whatsapp-manual-checklist.md`.
