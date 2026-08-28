@@ -186,17 +186,25 @@
 </main>
 
 <script>
-(() => {
+// app.js is loaded with defer, so it has not run yet when this inline script
+// is evaluated during parsing: window.um does not exist, and #notice is still
+// further down the document. DOMContentLoaded fires after every deferred
+// script has run and the document is complete, so both are ready by then.
+// Reading um at top level here would throw a ReferenceError and leave the
+// whole page inert.
+document.addEventListener("DOMContentLoaded", () => {
   const { $, esc, api, notice, relTime } = um;
-  // um.confirm is bound to a local name: this page must never reach for the
-  // browser's own blocking confirm(), and naming it here makes that visible.
-  const ask = um.confirm;
 
   // ---- shared bits ----
 
   // Accounts, so the webhook scope picker and the row rerenders can name one
   // without another round trip. Keyed by id.
   const accounts = new Map();
+  // The account ids currently being watched, and the label their action button
+  // shows while that lasts. watchers is what makes a second click on Resync
+  // replace the first watch rather than stack another polling loop on top.
+  const watchers = new Map();
+  const busy = new Map();
   let providers = [];
 
   const fail = (e) => notice("error", e && e.message ? e.message : String(e));
@@ -286,14 +294,20 @@
   function accountRow(a) {
     const st = um.accountState(a);
     const open = a.kind === "chat" ? "/chat?account_id=" : "/mail?account_id=";
-    // Resync and reconnect both refuse an account whose credentials have
-    // expired — only the end user can fix that — so such a row offers the
-    // connect flow instead of a button that is guaranteed to fail.
-    const refresh = a.status !== "OK"
-      ? '<button class="btn sm" type="button" data-action="connect">' + (a.kind === "chat" ? "Relink" : "Sign in again") + "</button>"
-      : (a.kind === "chat"
-        ? '<button class="btn sm" type="button" data-action="reconnect">Reconnect</button>'
-        : '<button class="btn sm" type="button" data-action="resync">Resync</button>');
+    // The busy label lives in the model, not on the button: a watch rerenders
+    // the row every few seconds, so a `disabled` flag set on the element would
+    // be thrown away on the next tick and let the account be resynced twice.
+    const working = busy.get(a.id);
+    const refresh = working
+      ? '<button class="btn sm" type="button" disabled>' + esc(working) + "</button>"
+      // Resync and reconnect both refuse an account whose credentials have
+      // expired — only the end user can fix that — so such a row offers the
+      // connect flow instead of a button that is guaranteed to fail.
+      : (a.status !== "OK"
+        ? '<button class="btn sm" type="button" data-action="connect">' + (a.kind === "chat" ? "Relink" : "Sign in again") + "</button>"
+        : (a.kind === "chat"
+          ? '<button class="btn sm" type="button" data-action="reconnect">Reconnect</button>'
+          : '<button class="btn sm" type="button" data-action="resync">Resync</button>'));
     const detail = [esc(a.provider), a.kind === "chat" ? esc(maskPhone(a.identifier)) : "", esc(st.sub)]
       .filter(Boolean).join(" · ");
     return (
@@ -356,20 +370,52 @@
   // watch re-reads one account until done(a) holds or a minute has gone by.
   // Resync and reconnect are both asynchronous server-side: the POST only
   // queues the work, so the page has to see the result to report it.
-  function watch(id, done, okText) {
-    const until = Date.now() + 60000;
-    const stop = um.poll(async () => {
+  //
+  // At most one watch runs per account — a second click replaces the first
+  // rather than stacking a second polling loop — and the minute is a hard cap.
+  // The deadline cannot be enforced from inside the tick alone: um.poll skips
+  // the tick entirely while the tab is hidden, so a backgrounded page would
+  // poll forever once it came back. The standalone timer below is what makes
+  // the cap absolute, and the in-tick check just ends it a little sooner.
+  const WATCH_MS = 60000;
+
+  function watch(id, done, okText, busyLabel) {
+    const stopPrevious = watchers.get(id);
+    if (stopPrevious) stopPrevious();
+
+    const until = Date.now() + WATCH_MS;
+    let stopPoll = null, timer = null, ended = false;
+
+    const end = (kind, text) => {
+      if (ended) return;
+      ended = true;
+      if (stopPoll) stopPoll();
+      clearTimeout(timer);
+      watchers.delete(id);
+      busy.delete(id);
+      const a = accounts.get(id);
+      if (a) replaceRow(a);
+      if (text) notice(kind, text);
+    };
+    const giveUp = () => end("info", "Still working — " + title(accounts.get(id) || { id }) + " is taking longer than usual.");
+
+    busy.set(id, busyLabel);
+    watchers.set(id, () => end("", ""));
+    const cached = accounts.get(id);
+    if (cached) replaceRow(cached);
+
+    timer = setTimeout(giveUp, WATCH_MS);
+    stopPoll = um.poll(async () => {
+      if (Date.now() > until) { giveUp(); return; }
       let a;
       try {
         a = await api("/api/v1/accounts/" + encodeURIComponent(id));
       } catch (e) {
-        stop();
-        fail(e);
+        end("error", e && e.message ? e.message : String(e));
         return;
       }
       replaceRow(a);
-      if (done(a)) { stop(); notice("success", okText); return; }
-      if (Date.now() > until) { stop(); notice("info", "Still working — this account is taking longer than usual."); }
+      if (done(a)) end("success", okText);
     }, 3000);
   }
 
@@ -377,18 +423,18 @@
     const before = (accounts.get(id) || {}).last_synced_at || "";
     await api("/api/v1/accounts/" + encodeURIComponent(id) + "/resync", { method: "POST" });
     notice("info", "Resync queued for " + title(accounts.get(id) || { id }) + ".");
-    watch(id, (a) => (a.last_synced_at || "") !== before, "Resynced.");
+    watch(id, (a) => (a.last_synced_at || "") !== before, "Resynced.", "Resyncing…");
   }
 
   async function reconnect(id) {
     await api("/api/v1/accounts/" + encodeURIComponent(id) + "/reconnect", { method: "POST" });
     notice("info", "Reconnecting " + title(accounts.get(id) || { id }) + "…");
-    watch(id, (a) => um.accountState(a).label === "Connected", "Reconnected.");
+    watch(id, (a) => um.accountState(a).label === "Connected", "Reconnected.", "Reconnecting…");
   }
 
   async function disconnect(id) {
     const name = title(accounts.get(id) || { id });
-    const ok = await ask({
+    const ok = await um.confirm({
       title: "Disconnect " + name + "?",
       body: "Mirrored mail/chats for this account are deleted. WhatsApp devices are logged out.",
       action: "Disconnect",
@@ -417,8 +463,9 @@
       else if (action === "hooks") {
         location.hash = "#webhooks";
         $("hook-scope").value = id;
+        hookFilter = id;
         notice("info", "Showing webhooks for " + title(accounts.get(id) || { id }) + ".");
-        renderWebhooks(id);
+        renderWebhooks();
       }
     } catch (err) {
       fail(err);
@@ -453,8 +500,10 @@
   // ---- webhooks ----
 
   // The listing is every hook this developer owns, global and account-bound
-  // alike; account_id says which is which, so one call covers both.
-  let hooks = [];
+  // alike; account_id says which is which, so one call covers both. hookFilter
+  // is the account the table is narrowed to, "" for all of them; it lives out
+  // here so adding or removing a hook while filtered keeps the filter.
+  let hooks = [], hookFilter = "";
 
   function hookTarget(h) {
     if (h.kind === "telegram") return "chat " + ((h.telegram || {}).chat_id || "");
@@ -468,13 +517,13 @@
     return a ? title(a) : h.account_id;
   }
 
-  function renderWebhooks(filterAccountID) {
+  function renderWebhooks() {
     const host = $("webhooks-list");
-    const shown = filterAccountID ? hooks.filter((h) => h.account_id === filterAccountID) : hooks;
+    const shown = hookFilter ? hooks.filter((h) => h.account_id === hookFilter) : hooks;
     if (!shown.length) {
       setHTML(host,
         '<div class="empty"><div class="title">' +
-          (filterAccountID ? "No webhooks on this account yet" : "No webhooks yet") + "</div>" +
+          (hookFilter ? "No webhooks on this account yet" : "No webhooks yet") + "</div>" +
         "<p>Point one at your endpoint, a Discord channel or a Telegram chat and every matching event is delivered there.</p>" +
         '<button class="btn primary" type="button" data-action="add-webhook">Add webhook</button></div>');
       return;
@@ -491,14 +540,16 @@
           '<td style="text-align:right"><button class="btn sm danger" type="button" data-action="remove-webhook">Remove</button></td>' +
         "</tr>").join("") +
       "</tbody></table>" +
-      (filterAccountID ? '<div class="row"><button class="btn sm ghost" type="button" data-action="clear-filter">Show every webhook</button></div>' : ""));
+      (hookFilter ? '<div class="row"><button class="btn sm ghost" type="button" data-action="clear-filter">Show every webhook</button></div>' : ""));
   }
 
   async function loadWebhooks() {
     try {
       const data = await api("/api/v1/webhooks");
       hooks = data.items || [];
-      renderWebhooks("");
+      // An account the filter names may have just been disconnected.
+      if (hookFilter && !accounts.has(hookFilter)) hookFilter = "";
+      renderWebhooks();
     } catch (e) {
       setHTML($("webhooks-list"),
         '<div class="empty"><div class="title">Could not load your webhooks</div>' +
@@ -520,12 +571,12 @@
     if (!btn) return;
     const action = btn.dataset.action;
     if (action === "add-webhook") { $("webhook-dialog").showModal(); return; }
-    if (action === "clear-filter") { renderWebhooks(""); return; }
+    if (action === "clear-filter") { hookFilter = ""; renderWebhooks(); return; }
     if (action === "reload-webhooks") { loadWebhooks(); return; }
     if (action !== "remove-webhook") return;
     const id = btn.closest("tr").dataset.wid;
     const hook = hooks.filter((h) => h.id === id)[0] || {};
-    const ok = await ask({
+    const ok = await um.confirm({
       title: "Remove this webhook?",
       body: "Events stop being delivered to " + hookTarget(hook) + " immediately. Anything already queued for retry is dropped.",
       action: "Remove",
@@ -664,7 +715,7 @@
     if (btn.dataset.action === "reload-keys") { loadKeys(); return; }
     if (btn.dataset.action !== "revoke-key") return;
     const row = btn.closest(".row");
-    const ok = await ask({
+    const ok = await um.confirm({
       title: "Revoke this key?",
       body: "Anything still authenticating with it stops working immediately. This cannot be undone.",
       action: "Revoke",
@@ -745,6 +796,6 @@
     await loadProviders();
     await Promise.all([loadAccounts(), loadWebhooks(), loadKeys(), loadRedirectDomains()]);
   })();
-})();
+});
 </script>
 {{end}}

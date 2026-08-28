@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -621,10 +622,55 @@ func TestDashboardShowsDeveloperAndKeysPanel(t *testing.T) {
 			t.Fatalf("dashboard missing %q", want)
 		}
 	}
-	for _, never := range []string{"alert(", "confirm(", "localStorage"} {
-		if strings.Contains(body, never) {
-			t.Fatalf("dashboard still uses %q", never)
+	// A native browser dialog blocks the page and cannot be styled, and a
+	// credential in localStorage outlives the session cookie. The design
+	// system has um.notice and um.confirm instead — so the check is for a
+	// *bare* alert()/confirm(), not for the um.-qualified helpers a page is
+	// meant to call.
+	for _, re := range nativeDialogCalls {
+		if hit := re.FindString(body); hit != "" {
+			t.Fatalf("dashboard calls a native browser dialog: %q", strings.TrimSpace(hit))
 		}
+	}
+	if strings.Contains(body, "localStorage") {
+		t.Fatal("dashboard still uses localStorage")
+	}
+}
+
+// nativeDialogCalls match window.alert(/alert(/confirm( but not um.alert( or
+// um.confirm(: the leading class rejects a "." before the name, so only an
+// unqualified call (or an explicit window.-qualified one) trips them.
+var nativeDialogCalls = []*regexp.Regexp{
+	regexp.MustCompile(`(?:^|[^.\w])(?:window\.)?alert\(`),
+	regexp.MustCompile(`(?:^|[^.\w])(?:window\.)?confirm\(`),
+}
+
+// app.js is loaded with defer, so it has not run while the inline script is
+// being evaluated: window.um does not exist yet, and #notice (in layout_end)
+// has not been parsed either. Everything the page does therefore has to wait
+// for DOMContentLoaded — reading um at the top level would throw a
+// ReferenceError and leave the whole dashboard inert.
+func TestDashboardScriptWaitsForDeferredHelpers(t *testing.T) {
+	s, _ := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `src="/static/app.js?v=`) || !strings.Contains(body, "defer") {
+		t.Fatal("dashboard does not load app.js with defer; this test's premise no longer holds")
+	}
+	start := strings.Index(body, "<script>")
+	if start < 0 {
+		t.Fatal("dashboard has no inline script")
+	}
+	script := body[start:]
+	ready := strings.Index(script, "DOMContentLoaded")
+	if ready < 0 {
+		t.Fatal("dashboard script never waits for DOMContentLoaded, so it runs before the deferred app.js")
+	}
+	if strings.Contains(script[:ready], "= um") {
+		t.Fatal("dashboard script reads um before DOMContentLoaded, when app.js has not run yet")
 	}
 }
 
