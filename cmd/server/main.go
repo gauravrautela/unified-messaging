@@ -131,10 +131,12 @@ func run(log *slog.Logger) error {
 		),
 	)
 	// WhatsApp is opt-in: it opens a socket per linked account and stores
-	// device keys unsealed in SQLite, so it only joins the registry when an
-	// operator has deliberately turned it on.
+	// device keys unsealed in the database, so it only joins the registry
+	// when an operator has deliberately turned it on. db.Dialect() is
+	// whatsmeow's own name for whichever engine db is actually running on
+	// ("sqlite3" or "postgres"), never assumed.
 	if cfg.WhatsAppEnabled {
-		wa, err := whatsapp.New(db.DB(), cfg.WhatsAppDeviceName, log)
+		wa, err := whatsapp.New(db.DB(), db.Dialect(), cfg.WhatsAppDeviceName, log)
 		if err != nil {
 			return err
 		}

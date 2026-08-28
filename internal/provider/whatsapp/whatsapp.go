@@ -48,17 +48,23 @@ var (
 
 // New builds the adapter on an existing database handle. It shares the
 // service's *sql.DB rather than opening its own so that whatsmeow's device
-// tables live in the same file, under the same connection limits, as
+// tables live in the same database, under the same connection limits, as
 // everything else.
 //
+// dialect is whatsmeow's own name for the engine behind db — "sqlite3" or
+// "postgres" (see Store.Dialect) — never hardcoded here: whatsmeow's own
+// migrations speak a different SQL dialect per engine, same as ours, and a
+// mismatched dialect fails immediately (a SQLite PRAGMA sent to Postgres, or
+// the reverse) rather than silently doing the wrong thing.
+//
 // deviceName is what the end user sees in WhatsApp's "linked devices" list.
-func New(db *sql.DB, deviceName string, log *slog.Logger) (*Provider, error) {
+func New(db *sql.DB, dialect, deviceName string, log *slog.Logger) (*Provider, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	// whatsmeow's own logging is silenced: this adapter logs the events that
 	// matter through slog, with the redaction rules the rest of the service uses.
-	c := sqlstore.NewWithDB(db, "sqlite3", waLog.Noop)
+	c := sqlstore.NewWithDB(db, dialect, waLog.Noop)
 	if err := c.Upgrade(context.Background()); err != nil {
 		return nil, fmt.Errorf("whatsapp: store upgrade: %w", err)
 	}

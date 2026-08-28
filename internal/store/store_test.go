@@ -358,7 +358,7 @@ func TestOAuthStateSealsPendingTelegramBotToken(t *testing.T) {
 	}
 
 	var raw string
-	if err := s.db.QueryRow(`SELECT webhook_json FROM oauth_states WHERE state = ?`, "tg1").Scan(&raw); err != nil {
+	if err := s.db.QueryRow(s.q(`SELECT webhook_json FROM oauth_states WHERE state = ?`), "tg1").Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if raw == "" || strings.Contains(raw, "123:ABC") {
@@ -758,6 +758,9 @@ func TestOAuthStateCarriesDeveloper(t *testing.T) {
 // true if the DSN carries the pragma.
 func TestForeignKeysAreOnForEveryConnection(t *testing.T) {
 	s := newTestStore(t)
+	if s.DriverName() != "sqlite" {
+		t.Skip("foreign_keys is a SQLite per-connection PRAGMA; Postgres enforces foreign keys unconditionally")
+	}
 	s.db.SetMaxIdleConns(0) // every query now opens a new connection
 	for i := 0; i < 3; i++ {
 		var on int

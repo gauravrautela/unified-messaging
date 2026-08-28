@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -125,10 +126,16 @@ func Load() (*Config, error) {
 	case "sqlite":
 		c.DBDSN = c.DBPath
 	case "postgres":
-		c.DBDSN = os.Getenv("DATABASE_URL")
-		if c.DBDSN == "" {
+		raw := os.Getenv("DATABASE_URL")
+		if raw == "" {
 			return nil, fmt.Errorf("DATABASE_URL is required when DB_DRIVER=postgres")
 		}
+		dsn, err := repairPostgresDSN(raw)
+		if err != nil {
+			// Never include raw here: it carries the password.
+			return nil, err
+		}
+		c.DBDSN = dsn
 	default:
 		return nil, fmt.Errorf("DB_DRIVER must be \"sqlite\" or \"postgres\", got %q", c.DBDriver)
 	}
@@ -150,6 +157,83 @@ func Load() (*Config, error) {
 	}
 	c.TokenKey = key
 	return c, nil
+}
+
+// repairPostgresDSN validates dsn as a postgres connection URL and, when its
+// password segment carries an unescaped character that is structural in a
+// URL (@, #, ?, /, %, a space, ...), returns a corrected copy with just that
+// segment percent-encoded.
+//
+// This matters because such a password does not reliably fail loudly: a
+// space or a bad %-escape makes url.Parse return an error ("invalid
+// userinfo"), but a stray '#' or '@' does not — '#' starts a URL fragment
+// and the rest of the string (host, port, path, query) silently becomes
+// part of it, so the connection string parses "successfully" into the wrong
+// host and database with no error at all. A valid postgres DSN never has a
+// URL fragment, so requiring Fragment == "" (and a non-empty Host) catches
+// that silent case too, not just the ones url.Parse rejects outright.
+func repairPostgresDSN(dsn string) (string, error) {
+	invalid := fmt.Errorf("DATABASE_URL is not a valid postgres connection string " +
+		"(if the password contains @, #, ?, /, %%, or a space, it must be percent-encoded)")
+
+	schemeEnd := strings.Index(dsn, "://")
+	if schemeEnd < 0 {
+		return "", invalid
+	}
+	if dsnLooksValid(dsn) {
+		return dsn, nil
+	}
+
+	// Locate the password segment by hand rather than trusting url.Parse,
+	// which is exactly what just failed (or silently mis-split). The
+	// username runs from "://" to the first ':'; the password runs from
+	// there to the LAST '@' in the whole string — which is the true
+	// userinfo/host separator even when the password itself contains '@',
+	// because a legitimate host never contains one.
+	rest := dsn[schemeEnd+3:]
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return "", invalid
+	}
+	passStart := schemeEnd + 3 + colon + 1
+	at := strings.LastIndexByte(dsn, '@')
+	if at < passStart {
+		return "", invalid
+	}
+
+	repaired := dsn[:passStart] + percentEncodeUserinfo(dsn[passStart:at]) + dsn[at:]
+	if !dsnLooksValid(repaired) {
+		return "", invalid
+	}
+	return repaired, nil
+}
+
+// dsnLooksValid reports whether dsn parses as a URL with a real host and no
+// fragment — see repairPostgresDSN for why an unwanted fragment, not just a
+// parse error, signals a mis-split DSN.
+func dsnLooksValid(dsn string) bool {
+	u, err := url.Parse(dsn)
+	return err == nil && u.Host != "" && u.Fragment == ""
+}
+
+// percentEncodeUserinfo percent-encodes every byte that is not safe to place
+// literally in a URL's userinfo segment, leaving unreserved characters
+// (letters, digits, - . _ ~) untouched.
+func percentEncodeUserinfo(s string) string {
+	const unreserved = "-._~"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			b.WriteByte(c)
+		case strings.IndexByte(unreserved, c) >= 0:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 // PushEnabled reports whether providers can reach us for push notifications.

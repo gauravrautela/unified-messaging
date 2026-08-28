@@ -15,6 +15,7 @@ func TestRebindPostgres(t *testing.T) {
 		`INSERT INTO t (a, b) VALUES (?, ?)`:          `INSERT INTO t (a, b) VALUES ($1, $2)`,
 		`UPDATE t SET a = ? WHERE b = ? AND c = ?`:    `UPDATE t SET a = $1 WHERE b = $2 AND c = $3`,
 		`SELECT '?' AS literal, a FROM t WHERE b = ?`: `SELECT '?' AS literal, a FROM t WHERE b = $1`, // ? inside a quoted string is untouched
+		"-- what about ? here\nSELECT ? ":             "-- what about ? here\nSELECT $1 ",             // ? inside a line comment is untouched
 	}
 	for in, want := range cases {
 		if got := d.rebind(in); got != want {

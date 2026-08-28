@@ -75,9 +75,16 @@ func (r *receiver) count() int {
 	return len(r.hits)
 }
 
+// waitForTimeout is generous enough to cover the delivery retry pipeline it
+// polls even when every store read/write in it is a real network round trip
+// (running against TEST_DATABASE_URL) rather than SQLite's effectively-free
+// local ones. It only bounds how long a test waits before failing — the
+// fast (SQLite) path still returns as soon as cond() is true.
+const waitForTimeout = 20 * time.Second
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitForTimeout)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
