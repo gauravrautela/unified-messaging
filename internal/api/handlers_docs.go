@@ -35,6 +35,12 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 			"send": docs.SendMessage, "hosted": docs.HostedAuth,
 			"hook": docs.WebhookPayload, "key": docs.CreateKey,
 		},
+		// The three delivery formats shown side by side under #events: the
+		// JSON event a kind="webhook" hook receives, and the rendered
+		// notification the other two kinds get instead.
+		"Formats": map[string]any{
+			"Discord": docs.DiscordSample, "Telegram": docs.TelegramSample, "Notes": docs.KindNotes,
+		},
 		"Base": s.baseURL(r),
 	})
 }

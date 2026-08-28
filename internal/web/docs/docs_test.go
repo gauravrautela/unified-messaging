@@ -166,3 +166,45 @@ func TestSnippetsAreRunnable(t *testing.T) {
 		}
 	}
 }
+
+// The two notification samples are shown on the page as JSON, next to the
+// HTTP one, so they have to actually be JSON — and they have to carry the
+// field the transport keys on, or they are illustrating the wrong request.
+func TestDeliveryFormatSamplesParse(t *testing.T) {
+	for _, c := range []struct {
+		name, sample, field string
+	}{
+		{"DiscordSample", DiscordSample, "content"},
+		{"TelegramSample", TelegramSample, "text"},
+	} {
+		if strings.TrimSpace(c.sample) == "" {
+			t.Errorf("%s is empty", c.name)
+			continue
+		}
+		var got map[string]any
+		if err := json.Unmarshal([]byte(c.sample), &got); err != nil {
+			t.Errorf("%s does not parse as JSON: %v", c.name, err)
+			continue
+		}
+		body, _ := got[c.field].(string)
+		if body == "" {
+			t.Errorf("%s has no %q string", c.name, c.field)
+		}
+		// Both render the same chat_received event, so both must name the
+		// person and quote the message — a sample that lost the body would
+		// still be valid JSON.
+		for _, want := range []string{"Grace Hopper", "Thursday works."} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s.%s does not contain %q", c.name, c.field, want)
+			}
+		}
+	}
+	if len(KindNotes) == 0 {
+		t.Error("KindNotes is empty")
+	}
+	for i, n := range KindNotes {
+		if strings.TrimSpace(n) == "" {
+			t.Errorf("KindNotes[%d] is blank", i)
+		}
+	}
+}

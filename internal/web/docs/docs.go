@@ -67,8 +67,10 @@ func Anchor(method, path string) string {
 // groupOrder is the order groups appear on the page: what a new integrator
 // needs first (a key), then connecting a mailbox, then the data.
 //
-// It mirrors the buckets api.routeGroup assigns. The two lists are asserted
-// to agree by the api-side docs test.
+// It is the only bucketing left: the api package used to carry a routeGroup
+// of its own, which was deleted when the docs page moved here, so there is no
+// longer a second list that could disagree with this one. What can still
+// drift is the set of routes, which is what the api-side docs test polices.
 var groupOrder = []string{
 	"Developer & keys",
 	"Connecting mailboxes",
@@ -1369,4 +1371,45 @@ var Errors = []ErrorCode{
 		Fix: "The upstream provider refused or failed. The message carries their reason; it is usually safe to retry."},
 	{Code: "internal", Status: 500,
 		Fix: "A bug or an unavailable dependency on our side. Retry; if it persists, quote the timestamp and the request path."},
+}
+
+// ---- delivery formats ----
+//
+// A hook's kind decides what actually arrives. Every Event above is the
+// kind="webhook" shape; the other two kinds render the same event as a short
+// human notification instead, through internal/notify. These are one
+// representative pair for chat_received, so the page can show all three
+// side by side rather than describing two of them in prose.
+
+// DiscordSample is the body POSTed to a Discord incoming webhook for the
+// chat_received event above. allowed_mentions is always empty so a message
+// whose text happens to contain @everyone cannot make the bot ping a server.
+//
+// On the wire Go's JSON encoder escapes "<" and ">" as the \u003c and \u003e
+// sequences; the samples here spell the tags literally, which decodes to the
+// identical string.
+var DiscordSample = `{
+  "allowed_mentions": { "parse": [] },
+  "content": "💬 **WhatsApp** · Grace Hopper\n**Grace Hopper**: Thursday works."
+}`
+
+// TelegramSample is the body POSTed to
+// https://api.telegram.org/bot<token>/sendMessage for the same event. The
+// token only ever appears in the URL, never in the body or in an error.
+var TelegramSample = `{
+  "chat_id": "-1001234567890",
+  "disable_web_page_preview": true,
+  "parse_mode": "HTML",
+  "text": "💬 <b>WhatsApp</b> · Grace Hopper\n<b>Grace Hopper</b>: Thursday works."
+}`
+
+// KindNotes explains what the three kinds share and where they differ, in
+// the one place the page shows all three formats together.
+var KindNotes = []string{
+	"Every event type reaches every kind: nothing here is webhook-only. Only the rendering differs.",
+	`kind="webhook" gets the JSON event verbatim, signed with X-Outlook-Signature when the hook has a secret. It is the only kind you can parse.`,
+	`kind="discord" and kind="telegram" get one short line of Markdown or HTML instead — no signature, no ids to branch on. Use them to watch a channel, not to drive logic.`,
+	"User content is escaped for the flavour and phone numbers are masked (+1 650••• •123). Mail text is cut at 200 characters and chat text at 300.",
+	"The whole rendered message is capped at what the transport accepts — 2,000 characters for Discord, 4,096 for Telegram — and cut with an ellipsis rather than rejected.",
+	"All three ride the same event filter, the same retry schedule and the same deliveries log, so a Discord 429 is an ordinary retryable failure, never a dropped event.",
 }

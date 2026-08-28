@@ -34,6 +34,7 @@
     <li><a href="#events">Events</a></li>
     <li><a href="#delivery">Webhook delivery</a></li>
     <li><a href="#errors">Errors</a></li>
+    <li><a href="#limits">Rate limits &amp; idempotency</a></li>
     <li><a href="#self-hosting">Self-hosting</a></li>
     <li><a href="#llms">llms.txt</a></li>
   </ul></div>
@@ -128,10 +129,34 @@ X-API-Key: $API_KEY          # equivalent, for clients that cannot set Authoriza
 <section id="events">
 <h2>Events</h2>
 <p>Every event body carries <code>type</code>, <code>account_id</code>, <code>timestamp</code> and the <code>webhook</code> that produced the delivery, plus one payload field named after the surface. Subscribe with <code>events: ["…"]</code>, or <code>["*"]</code> for all of them.</p>
+
+<h3 id="formats">Delivery formats</h3>
+<p>Each event below lists the hook kinds it reaches &mdash; every one reaches all three. What differs is the shape that arrives. Here is the same <code>chat_received</code> event as each kind receives it:</p>
+<div class="snippet">
+  <div class="tabs sm" role="tablist" aria-label="Delivery format">
+    <button type="button" role="tab" aria-selected="true" data-lang="http">HTTP</button>
+    <button type="button" role="tab" aria-selected="false" data-lang="discord">Discord</button>
+    <button type="button" role="tab" aria-selected="false" data-lang="telegram">Telegram</button>
+    <span class="spacer"></span>
+    <button class="btn ghost sm" type="button" data-copy>Copy</button>
+  </div>
+  <div class="pane">
+    <pre data-lang="http">{{range .Events}}{{if eq .Type "chat_received"}}{{.Sample}}{{end}}{{end}}</pre>
+    <pre data-lang="discord" hidden>POST https://discord.com/api/webhooks/1234567890/AbCdEf
+
+{{.Formats.Discord}}</pre>
+    <pre data-lang="telegram" hidden>POST https://api.telegram.org/bot&lt;bot_token&gt;/sendMessage
+
+{{.Formats.Telegram}}</pre>
+  </div>
+</div>
+<ul>{{range .Formats.Notes}}<li>{{.}}</li>{{end}}</ul>
+
 {{range .Events}}
 <article class="event" id="event-{{.Type}}">
   <h3><span class="badge">event</span> {{.Type}}</h3>
   <p>{{.When}}</p>
+  <p class="muted small">Delivered via: {{range $i, $k := .Kinds}}{{if $i}} &middot; {{end}}<code>{{$k}}</code>{{end}}</p>
   <div class="pane"><pre>{{.Sample}}</pre></div>
 </article>
 {{end}}
@@ -168,6 +193,23 @@ ok := hmac.Equal([]byte(want), []byte(r.Header.Get("X-Outlook-Signature")))</pre
   <thead><tr><th>Code</th><th>Status</th><th>What to do</th></tr></thead>
   <tbody>{{range .Errors}}<tr><td>{{.Code}}</td><td>{{.Status}}</td><td>{{.Fix}}</td></tr>{{end}}</tbody>
 </table>
+</section>
+
+<section id="limits">
+<h2>Rate limits &amp; idempotency</h2>
+<p><b>There is no rate limiting here.</b> This service does not throttle callers, and it does not cap how many API keys, webhooks or connect links one developer creates. That is deliberate but it is not a licence: put a gateway or reverse proxy in front of a public deployment and enforce your limits there. Nothing in the API will slow you down before your provider does.</p>
+<p>What is capped is size, not rate: a request body is <b>64&nbsp;KB</b> on ordinary routes and <b>8&nbsp;MB</b> on the mail-send family (<code>emails</code>, <code>reply</code>, <code>forward</code>, <code>drafts</code>), over which is <b>413 <code>body_too_large</code></b>; attachments total at most <b>3&nbsp;MB</b> decoded, over which is <b>400 <code>attachment_too_large</code></b>.</p>
+
+<h3>Idempotency-Key</h3>
+<p>Every chat write &mdash; send, edit, delete, react and start-a-chat &mdash; honours an <code>Idempotency-Key</code> header. It is any unique string you choose, one per logical operation:</p>
+<div class="pane"><pre>Idempotency-Key: 8f14e45f-ea0d-4b3a-9c2f-1d5a7b03e9c4</pre></div>
+<ul>
+<li><b>Same key, same body</b> &rarr; the first response is replayed. The message is not sent twice. This is the whole point: a network timeout on a send tells you nothing about whether it arrived, and retrying without a key is how a user gets the same message twice.</li>
+<li><b>Same key, different body</b> &rarr; <b>409 <code>idempotency_conflict</code></b>. That is a client bug &mdash; a reused key means two different operations were given the same identity &mdash; so it is refused rather than guessed at.</li>
+<li><b>Same key while the first request is still running</b> &rarr; also <b>409 <code>idempotency_conflict</code></b>. Wait for the first to answer rather than racing it.</li>
+<li>Keys are scoped per developer and per operation (method, path, account and body), so the same key on two different endpoints does not collide.</li>
+</ul>
+<p>It is optional everywhere and worth setting on anything you would retry. Mail sends are not idempotency-keyed; dedupe those on your side if you retry them.</p>
 </section>
 
 <section id="self-hosting">
@@ -243,13 +285,21 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!btn) return;
     var scope = btn.closest(".snippet") || btn.closest(".pane");
     var pre = scope && [].slice.call(scope.querySelectorAll("pre")).find(function (p) { return !p.hidden; });
-    if (pre) window.um.copy(pre.textContent, btn);
+    // um comes from the deferred app.js; guard it so a copy click cannot
+    // throw on a page where that script failed to load.
+    if (pre && window.um) window.um.copy(pre.textContent, btn);
   });
 
   // --- contents: filter, current section, "/" to focus ---
   var nav = document.querySelector("nav.toc"), filter = document.getElementById("toc-filter");
   var wrap = document.querySelector(".toc-wrap");
-  if (window.matchMedia("(max-width:48rem)").matches) { wrap.open = false; }
+  // Above 48rem docs.css hides the <summary>, so a <details> left closed by a
+  // narrow layout would be unreachable after a resize. Track the breakpoint
+  // instead of reading it once at load.
+  var narrow = window.matchMedia("(max-width:48rem)");
+  var sync = function (mq) { wrap.open = !mq.matches; };
+  sync(narrow);
+  narrow.addEventListener("change", sync);
 
   filter.addEventListener("input", function () {
     var q = filter.value.trim().toLowerCase();
