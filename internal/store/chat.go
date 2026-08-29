@@ -460,6 +460,18 @@ func (s *Store) RevokeChatMessage(accountID, id string) error {
 	return err
 }
 
+// EvictChatMessageContent blanks a chat message's text. Unlike mail, the
+// participants are not on this row — they live in `attendees`, which is
+// address-book state and out of scope. The row itself survives so a late
+// reaction or receipt still resolves through GetChatMessage.
+func (s *Store) EvictChatMessageContent(accountID, id string, at time.Time) error {
+	_, err := s.db.Exec(s.q(`
+		UPDATE chat_messages SET text = '', content_evicted_at = ?
+		WHERE account_id = ? AND id = ? AND content_evicted_at IS NULL`),
+		at.Unix(), accountID, id)
+	return err
+}
+
 func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	var m model.ChatMessage
 	var isFromMe, deleted int

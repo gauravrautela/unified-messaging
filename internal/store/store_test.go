@@ -1545,3 +1545,140 @@ func TestDevelopersHaveRetentionColumnDefaultingToZero(t *testing.T) {
 		t.Fatalf("retention_max_age_secs = %d, want 0 (retention off by default)", secs)
 	}
 }
+
+// Eviction blanks content and participants but keeps every column sync depends
+// on. EmailExists in particular is the only thing stopping a resync from
+// re-firing mail_received for the whole mailbox.
+func TestEvictEmailContentBlanksContentAndKeepsEnvelope(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", ThreadID: "t1", FolderID: "f1",
+		Subject: "quarterly numbers", Snippet: "here they are",
+		From: model.Recipient{Name: "Alice", Email: "alice@example.com"},
+		To:   []model.Recipient{{Name: "Bob", Email: "bob@example.com"}},
+		Body: "<p>secret</p>", BodyType: "html", Date: time.Now().UTC(),
+		Read: true, HasAttachments: true, InternetMessageID: "<abc@example.com>",
+		Attachments: []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]string{
+		"subject": got.Subject, "snippet": got.Snippet, "body": got.Body,
+		"body_type": got.BodyType, "from.name": got.From.Name, "from.email": got.From.Email,
+	} {
+		if v != "" {
+			t.Errorf("%s = %q after eviction, want empty", name, v)
+		}
+	}
+	if len(got.To) != 0 || len(got.Attachments) != 0 {
+		t.Errorf("to=%v attachments=%v after eviction, want both empty", got.To, got.Attachments)
+	}
+	if got.ThreadID != "t1" || got.FolderID != "f1" || got.InternetMessageID != "<abc@example.com>" {
+		t.Errorf("envelope lost: thread=%q folder=%q imid=%q", got.ThreadID, got.FolderID, got.InternetMessageID)
+	}
+	if !got.Read || !got.HasAttachments {
+		t.Errorf("flags lost: read=%v has_attachments=%v", got.Read, got.HasAttachments)
+	}
+	// The invariant that keeps a resync from replaying the mailbox.
+	if ok, err := s.EmailExists(acct, "m1"); err != nil || !ok {
+		t.Fatalf("EmailExists = %v, %v after eviction; want true (a resync would re-fire mail_received)", ok, err)
+	}
+}
+
+func TestEvictEmailContentIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "m1", Subject: "x", Body: "y", Date: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	first := time.Now().Add(-time.Hour).UTC()
+	if err := s.EvictEmailContent(acct, "m1", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var at int64
+	if err := s.DB().QueryRow(s.Q(`SELECT content_evicted_at FROM emails WHERE account_id = ? AND id = ?`), acct, "m1").Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	if at != first.Unix() {
+		t.Fatalf("content_evicted_at = %d, want the first eviction %d", at, first.Unix())
+	}
+}
+
+// The guard that matters most: sync runs unattended, for every message,
+// forever. Without it a resync refills every evicted row.
+func TestUpsertEmailDoesNotRefillEvictedRow(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	full := model.Email{
+		AccountID: acct, ID: "m1", Subject: "quarterly numbers",
+		From:    model.Recipient{Email: "alice@example.com"},
+		To:      []model.Recipient{{Email: "bob@example.com"}},
+		Snippet: "here they are", Body: "<p>secret</p>", BodyType: "html",
+		Date: time.Now().UTC(), Attachments: []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}},
+	}
+	if err := s.UpsertEmail(full); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resync hands us the whole message again.
+	full.Read = true
+	if err := s.UpsertEmail(full); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "" || got.Subject != "" || got.From.Email != "" || len(got.Attachments) != 0 {
+		t.Fatalf("resync refilled an evicted row: subject=%q body=%q from=%q atts=%d",
+			got.Subject, got.Body, got.From.Email, len(got.Attachments))
+	}
+	// Flags are not content and must still track the provider.
+	if !got.Read {
+		t.Error("read flag did not update on an evicted row; flags are not content")
+	}
+}
+
+func TestEvictChatMessageContentBlanksTextOnly(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", Kind: "text",
+		Text: "meet me at six", SentAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictChatMessageContent(acct, "cm1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetChatMessage(acct, "cm1")
+	if err != nil {
+		t.Fatalf("GetChatMessage after eviction: %v (a late reaction must still resolve)", err)
+	}
+	if got.Text != "" {
+		t.Errorf("text = %q after eviction, want empty", got.Text)
+	}
+	if got.ChatID != "c1" || got.Kind != "text" {
+		t.Errorf("envelope lost: chat=%q kind=%q", got.ChatID, got.Kind)
+	}
+}
