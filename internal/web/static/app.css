@@ -153,6 +153,7 @@ dialog .dlg-body{padding:var(--s4)} dialog .dlg-foot{padding:var(--s3) var(--s4)
 .bubble .text{white-space:pre-wrap;overflow-wrap:anywhere}
 .bubble .when{font-size:11px;color:var(--muted);margin-top:2px;text-align:right}
 .bubble.deleted .text{font-style:italic;color:var(--muted)}
+.bubble.evicted .text{font-style:italic;color:var(--muted)}
 .bubble.sending{opacity:.6}
 .bubble.failed{border:1px solid var(--danger)} .bubble.failed .when{color:var(--danger)}
 #newmsgs{position:absolute;left:50%;transform:translateX(-50%);bottom:4.5rem;z-index:5;box-shadow:0 4px 14px rgba(0,0,0,.22)}

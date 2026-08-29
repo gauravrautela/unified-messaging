@@ -111,7 +111,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// logout form carries it as a hidden field.
 	csrf := s.csrfToken(w, r)
 	s.renderPage(w, http.StatusOK, "dashboard", map[string]any{
-		"Shell":  web.Shell{Title: "Dashboard", Version: web.Version, Email: dev.Email, CSRF: csrf, Nav: "dashboard"},
-		"Events": webhookEvents,
+		"Shell":               web.Shell{Title: "Dashboard", Version: web.Version, Email: dev.Email, CSRF: csrf, Nav: "dashboard"},
+		"Events":              webhookEvents,
+		"RetentionMaxAgeSecs": dev.RetentionMaxAgeSecs,
 	})
 }
