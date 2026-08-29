@@ -96,6 +96,13 @@ func run(log *slog.Logger) error {
 					continue
 				}
 				log.Info("purge", "dead_deliveries", n)
+
+				evicted, err := db.EvictExpiredContent(time.Now())
+				if err != nil {
+					log.Error("evicting expired content", "err", err)
+					continue
+				}
+				log.Info("retention sweep", "evicted", evicted)
 			}
 		}
 	}()
