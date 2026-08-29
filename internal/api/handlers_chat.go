@@ -607,6 +607,16 @@ func (s *Server) handlePatchChatMessage(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusForbidden, "not_own_message", "cannot edit another attendee's message")
 		return
 	}
+	if m.ContentEvicted {
+		// Refuse before calling the provider: the store guard in EditChatMessage
+		// would make the write a silent no-op anyway, but doing nothing while
+		// reporting 200 would tell the caller an edit happened when it did not.
+		// The retention policy has already destroyed this message's content, and
+		// that is permanent — there is no history API to recover it from.
+		writeError(w, http.StatusConflict, "content_evicted",
+			"this message's content was removed by the retention policy and can no longer be edited")
+		return
+	}
 	chatID, mid := r.PathValue("id"), r.PathValue("mid")
 	if err := chatter.Edit(r.Context(), acct.ID, chatID, mid, req.Text); err != nil {
 		writeProviderError(w, err)

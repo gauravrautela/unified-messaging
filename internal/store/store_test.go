@@ -1785,6 +1785,61 @@ func TestGetChatMessageReportsContentEvicted(t *testing.T) {
 	}
 }
 
+// EditChatMessage is called from two places: the WhatsApp inbound sink
+// (which guards against editing an evicted message itself) and the public
+// API edit handler (which, before this guard, did not). The store-level
+// guard is defence in depth for both: an edit against an evicted row must be
+// a silent no-op, never a resurrection of destroyed content, while an edit
+// against a normal row must still work exactly as before.
+func TestEditChatMessageSkipsEvictedRow(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "original", SentAt: at, Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictChatMessageContent(acct, "cm1", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EditChatMessage(acct, "cm1", "resurrected text", at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetChatMessage(acct, "cm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "" {
+		t.Fatalf("text = %q after editing an evicted message, want it to stay blank", got.Text)
+	}
+	if got.EditedAt != nil {
+		t.Fatalf("edited_at = %v after editing an evicted message, want nil (the edit must be a no-op)", got.EditedAt)
+	}
+
+	// Happy path: editing a normal (non-evicted) message still works.
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm2", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "original", SentAt: at, Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EditChatMessage(acct, "cm2", "edited text", at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetChatMessage(acct, "cm2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "edited text" || got.EditedAt == nil {
+		t.Fatalf("after edit = %+v, want text updated and edited_at set", got)
+	}
+}
+
 func TestSetAndReadRetentionMaxAge(t *testing.T) {
 	s := newTestStore(t)
 	dev := seedDeveloper(t, s, "dev_1", "dev1@example.com")

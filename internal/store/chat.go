@@ -447,8 +447,17 @@ func (s *Store) ApplyReaction(accountID, id string, r model.Reaction) error {
 	})
 }
 
+// EditChatMessage rewrites a message's text. The content_evicted_at IS NULL
+// guard mirrors EvictChatMessageContent below: without it, an edit against an
+// already-evicted row would resurrect content the retention policy destroyed
+// — permanently, since an evicted row is exactly the row every eviction path
+// (this store's own sweep and the delivery trigger) skips forever. Matching
+// zero rows is not an error here; both callers rely on that, so a match
+// against an evicted row is a silent no-op rather than a failure.
 func (s *Store) EditChatMessage(accountID, id, text string, at time.Time) error {
-	_, err := s.db.Exec(s.q(`UPDATE chat_messages SET text = ?, edited_at = ? WHERE account_id = ? AND id = ?`),
+	_, err := s.db.Exec(s.q(`
+		UPDATE chat_messages SET text = ?, edited_at = ?
+		WHERE account_id = ? AND id = ? AND content_evicted_at IS NULL`),
 		text, at.Unix(), accountID, id)
 	return err
 }

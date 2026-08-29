@@ -2361,6 +2361,60 @@ func TestChatRoutesHappyPath(t *testing.T) {
 	}
 }
 
+// C1: the public API edit handler must refuse to write over an evicted
+// message rather than resurrecting its content — mirroring the guard already
+// in place on the WhatsApp inbound edit path (chatsync/sink.go). The refusal
+// must happen before the provider is called, not after: a half-performed
+// edit (sent to WhatsApp but not recorded) is worse than refusing outright.
+func TestPatchChatMessageRefusesEvictedContent(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	h := s.Routes()
+	j := func(method, path, body string) *httptest.ResponseRecorder {
+		req := withKey(httptest.NewRequest(method, path, strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "EVICTED1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "gone", SentAt: time.Now(), Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EvictChatMessageContent(acc, "EVICTED1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := j("PATCH", "/api/v1/chats/c1/messages/EVICTED1?account_id="+acc, `{"text":"resurrected"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "content_evicted") {
+		t.Fatalf("edit evicted message: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.fake().Commands(); len(got) != 0 {
+		t.Fatalf("provider was called for a refused edit: %d commands", len(got))
+	}
+	got, err := db.GetChatMessage(acc, "EVICTED1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "" {
+		t.Fatalf("text = %q after a refused edit, want it to stay blank", got.Text)
+	}
+
+	// The same request against a normal own-message still succeeds.
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "NORMAL1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "hi", SentAt: time.Now(), Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = j("PATCH", "/api/v1/chats/c1/messages/NORMAL1?account_id="+acc, `{"text":"hi!"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edit normal message: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestSendFailureLeavesNoRow(t *testing.T) {
 	s, db := newTestServer(t)
 	dev, key := seedDev(t, s, "a@x.com")
