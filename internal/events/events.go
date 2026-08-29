@@ -240,6 +240,15 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 	// this event was actually sent to and whether every one of them accepted
 	// it. Neither fact is recoverable afterwards — a hook that succeeds on the
 	// first attempt never writes a delivery row at all.
+	//
+	// matched counts only hooks that receive the full payload (see
+	// deliversFullPayload). Discord and Telegram hooks discard payload and
+	// render a short notify.Format summary instead (sender.go); a developer
+	// whose only subscriber is one of those has never actually had the full
+	// message forwarded, and must not have it evicted on the strength of a
+	// summary going out. failed still counts across every kind, including
+	// Discord and Telegram: a failure there is still a signal something went
+	// wrong, and not evicting is the conservative choice.
 	var matched int
 	var failed atomic.Bool
 	var developerID string
@@ -249,7 +258,9 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 				"developer_id", h.DeveloperID, "reason", "event filter")
 			continue
 		}
-		matched++
+		if deliversFullPayload(h.Kind) {
+			matched++
+		}
 		developerID = h.DeveloperID
 		// Encoded per hook: the payload names the hook it went through. ev is
 		// copied into the closure below so concurrent goroutines never share
@@ -306,9 +317,13 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 	}
 }
 
-// evictDelivered drops a message's content once every subscribing hook has
-// accepted it, if the owning developer has asked us not to retain it. The
-// subscriber's own copy is now the copy of record.
+// evictDelivered drops a message's content once every subscribing hook that
+// receives the full payload has accepted it, if the owning developer has
+// asked us not to retain it. The subscriber's own copy is now the copy of
+// record — but only a full-payload (plain "webhook") subscriber actually has
+// one; Discord and Telegram hooks receive a short notify.Format summary, not
+// the message, so they do not count toward "delivered" here (see
+// deliversFullPayload, and matched in deliver above).
 //
 // Only the events that *carry* a message evict: chat_updated, chat_reaction
 // and chat_deleted reference a message whose own event already governed it.
@@ -454,6 +469,18 @@ func subscribes(h model.Webhook, eventType string) bool {
 		}
 	}
 	return false
+}
+
+// deliversFullPayload reports whether a hook's kind receives the whole
+// serialized event, matching exactly the case notify.Registry.For resolves
+// to webhookSender: kind "webhook", or "" for a row from before the kind
+// column existed (schema.go defaults new rows to "webhook", so an empty kind
+// is that same case, not a distinct one). discordSender and telegramSender
+// both take payload as an ignored argument and render a short notify.Format
+// summary instead — a hook of either kind has not received the full message,
+// no matter how the delivery attempt turned out.
+func deliversFullPayload(kind string) bool {
+	return kind == model.WebhookKindWebhook || kind == ""
 }
 
 // targetLabel names where a delivery goes without leaking a credential.

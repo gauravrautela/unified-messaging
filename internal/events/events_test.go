@@ -869,6 +869,99 @@ func TestDeliverDoesNotEvictWhenEncodingFailsForAHook(t *testing.T) {
 	}
 }
 
+// A hook that only receives a short human-readable summary must not count as
+// "delivered": discordSender and telegramSender both discard the payload
+// argument and render notify.Format(ev, ...) instead (sender.go), which is at
+// most a couple hundred runes and, for mail_sent, no body at all. A developer
+// whose only subscriber is a Discord bot must not have the full mirror
+// destroyed on the strength of that summary going out successfully.
+func TestDeliverDoesNotEvictWhenOnlyDiscordHookSucceeds(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	if err := db.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	discord := newReceiver(t, http.StatusNoContent)
+	if err := db.SaveWebhook(model.Webhook{
+		ID: "wh_d", DeveloperID: "dev_1", AccountID: "acc_1", Kind: "discord",
+		URL: discord.URL + "/api/webhooks/1/t", Events: []string{"*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	if discord.count() != 1 {
+		t.Fatalf("discord hook was not called: %d hits", discord.count())
+	}
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Fatal("evicted content whose only subscriber never received the full payload")
+	}
+}
+
+// The webhook subscriber alongside a Discord one, both succeeding, must still
+// evict: the webhook subscriber genuinely received the full payload, and the
+// Discord hook's summary-only delivery does not hold that back.
+func TestDeliverEvictsWhenAWebhookAndADiscordHookBothSucceed(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	if err := db.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	rcv := newReceiver(t, http.StatusOK)
+	discord := newReceiver(t, http.StatusNoContent)
+	for _, h := range []model.Webhook{
+		{ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1", Kind: "webhook", URL: rcv.URL, Events: []string{"*"}},
+		{ID: "wh_d", DeveloperID: "dev_1", AccountID: "acc_1", Kind: "discord",
+			URL: discord.URL + "/api/webhooks/1/t", Events: []string{"*"}},
+	} {
+		if err := db.SaveWebhook(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	if rcv.count() != 1 || discord.count() != 1 {
+		t.Fatalf("hooks called: webhook=%d discord=%d, want 1 and 1", rcv.count(), discord.count())
+	}
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ContentEvicted {
+		t.Fatal("not evicted although the full-payload webhook subscriber accepted it")
+	}
+}
+
 func TestDeliverDoesNotEvictWhenRetentionIsOff(t *testing.T) {
 	db := newTestStore(t)
 	seedTenant(t, db)
