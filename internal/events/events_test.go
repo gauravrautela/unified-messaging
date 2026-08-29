@@ -701,3 +701,157 @@ func TestDrainHonoursItsDeadlineWhenThePoolIsBusy(t *testing.T) {
 		t.Fatalf("drain did not return within %v of its %v deadline", 2*time.Second, drainDeadline)
 	}
 }
+
+// seedEmail puts a message in the mirror so eviction has something to blank.
+func seedEmail(t *testing.T, db *store.Store, accountID, id string) {
+	t.Helper()
+	if err := db.UpsertEmail(model.Email{
+		AccountID: accountID, ID: id, Subject: "quarterly numbers",
+		From: model.Recipient{Email: "alice@example.com"},
+		Body: "<p>secret</p>", BodyType: "html", Date: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeliverEvictsContentOnceEveryHookAccepts(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	if err := db.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	rcv := newReceiver(t, http.StatusOK)
+	if err := db.SaveWebhook(model.Webhook{
+		ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1",
+		URL: rcv.URL, Events: []string{"*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ContentEvicted || got.Body != "" || got.From.Email != "" {
+		t.Fatalf("not evicted after a clean delivery: evicted=%v body=%q from=%q",
+			got.ContentEvicted, got.Body, got.From.Email)
+	}
+}
+
+// A failed hook means the content may still be needed. The retry has its own
+// payload snapshot, but the mirror stays until max-age.
+func TestDeliverDoesNotEvictWhenAHookFails(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	if err := db.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	rcv := newReceiver(t, http.StatusInternalServerError)
+	if err := db.SaveWebhook(model.Webhook{
+		ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1",
+		URL: rcv.URL, Events: []string{"*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Fatal("evicted although the hook failed; the mirror must survive to max-age")
+	}
+}
+
+// The zero-webhook trap: nothing was forwarded, so nothing may be destroyed.
+func TestDeliverDoesNotEvictWithNoWebhooks(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	if err := db.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Fatal("evicted content that was never forwarded anywhere")
+	}
+}
+
+func TestDeliverDoesNotEvictWhenRetentionIsOff(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	rcv := newReceiver(t, http.StatusOK)
+	if err := db.SaveWebhook(model.Webhook{
+		ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1",
+		URL: rcv.URL, Events: []string{"*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Fatal("evicted although the developer has no retention policy")
+	}
+}

@@ -235,12 +235,22 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 	// skipped this would let the next event start, or let drain's Wait()
 	// return, while those goroutines were still in flight.
 	defer wg.Wait()
+	// matched and failed are what makes eviction-on-delivery possible without
+	// a schema change: at the end of this function we know both how many hooks
+	// this event was actually sent to and whether every one of them accepted
+	// it. Neither fact is recoverable afterwards — a hook that succeeds on the
+	// first attempt never writes a delivery row at all.
+	var matched int
+	var failed atomic.Bool
+	var developerID string
 	for _, h := range hooks {
 		if !subscribes(h, ev.Type) {
 			d.log.Debug("hook skipped", "webhook_id", h.ID, "account_id", ev.AccountID,
 				"developer_id", h.DeveloperID, "reason", "event filter")
 			continue
 		}
+		matched++
+		developerID = h.DeveloperID
 		// Encoded per hook: the payload names the hook it went through. ev is
 		// copied into the closure below so concurrent goroutines never share
 		// (and race on) the Webhook field set here.
@@ -276,12 +286,60 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 			defer wg.Done()
 			defer func() { <-d.sem }()
 			if err := d.send(ctx, h, dl, 1); err != nil {
+				failed.Store(true)
 				d.enqueue(dl, err)
 				return
 			}
 			d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
 				"decision", "delivered", "attempts", 1)
 		}()
+	}
+	// Explicit, in addition to the deferred Wait that covers the early returns
+	// above: the eviction decision below needs every hook to have finished.
+	wg.Wait()
+	if matched > 0 && !failed.Load() {
+		d.evictDelivered(ev, developerID)
+	}
+}
+
+// evictDelivered drops a message's content once every subscribing hook has
+// accepted it, if the owning developer has asked us not to retain it. The
+// subscriber's own copy is now the copy of record.
+//
+// Only the events that *carry* a message evict: chat_updated, chat_reaction
+// and chat_deleted reference a message whose own event already governed it.
+//
+// Best effort throughout. A failure here must never fail a delivery — the
+// hourly sweep picks the message up on the max-age path instead.
+func (d *Dispatcher) evictDelivered(ev model.Event, developerID string) {
+	if developerID == "" {
+		return
+	}
+	maxAge, err := d.store.RetentionMaxAge(developerID)
+	if err != nil {
+		d.log.Error("reading retention policy", "developer_id", developerID, "err", err)
+		return
+	}
+	if maxAge <= 0 {
+		return
+	}
+	now := time.Now().UTC()
+	switch ev.Type {
+	case model.EventMailReceived, model.EventMailSent:
+		if ev.Email == nil || ev.Email.ID == "" {
+			return
+		}
+		err = d.store.EvictEmailContent(ev.AccountID, ev.Email.ID, now)
+	case model.EventChatReceived, model.EventChatSent:
+		if ev.Message == nil || ev.Message.ID == "" {
+			return
+		}
+		err = d.store.EvictChatMessageContent(ev.AccountID, ev.Message.ID, now)
+	default:
+		return
+	}
+	if err != nil {
+		d.log.Error("evicting delivered content", "account_id", ev.AccountID, "event", ev.Type, "err", err)
 	}
 }
 
