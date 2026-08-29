@@ -88,6 +88,13 @@ type Email struct {
 	Draft          bool `json:"draft"`
 	HasAttachments bool `json:"has_attachments"`
 
+	// ContentEvicted reports that this message's content and participants were
+	// removed by the owning developer's retention policy. The flag is negative
+	// so its zero value is correct at the many sites that build an Email
+	// without going through the store — a provider adapter, the syncer, an API
+	// handler — none of which know about retention.
+	ContentEvicted bool `json:"content_evicted"`
+
 	// InternetMessageID is the RFC 5322 Message-ID. It is the only identifier
 	// that survives leaving the mailbox, so it is what a cross-provider system
 	// would key threading on.

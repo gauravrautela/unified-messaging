@@ -628,7 +628,8 @@ func (s *Store) ListThreads(accountID string, limit, offset int) ([]model.Thread
 const emailSelect = `
 SELECT account_id, id, thread_id, folder_id, subject, from_name, from_email,
        to_json, cc_json, bcc_json, reply_to_json, date, snippet, body, body_type,
-       read, flagged, draft, has_attachments, internet_message_id, attachments_json
+       read, flagged, draft, has_attachments, internet_message_id, attachments_json,
+       content_evicted_at
 FROM emails`
 
 func scanEmail(r scanner) (model.Email, error) {
@@ -636,10 +637,11 @@ func scanEmail(r scanner) (model.Email, error) {
 	var toJ, ccJ, bccJ, rtJ, attJ string
 	var date int64
 	var read, flagged, draft, hasAtt int
+	var evictedAt sql.NullInt64
 	err := r.Scan(&e.AccountID, &e.ID, &e.ThreadID, &e.FolderID, &e.Subject,
 		&e.From.Name, &e.From.Email, &toJ, &ccJ, &bccJ, &rtJ, &date, &e.Snippet,
 		&e.Body, &e.BodyType, &read, &flagged, &draft, &hasAtt,
-		&e.InternetMessageID, &attJ)
+		&e.InternetMessageID, &attJ, &evictedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return e, ErrNotFound
 	}
@@ -656,6 +658,7 @@ func scanEmail(r scanner) (model.Email, error) {
 	}
 	e.Date = time.Unix(date, 0).UTC()
 	e.Read, e.Flagged, e.Draft, e.HasAttachments = read == 1, flagged == 1, draft == 1, hasAtt == 1
+	e.ContentEvicted = evictedAt.Valid
 	return e, nil
 }
 

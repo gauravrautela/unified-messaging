@@ -306,7 +306,7 @@ func (s *Store) ReplaceChatMembers(accountID, chatID string, members []model.Cha
 const chatMessageSelect = `
 	SELECT m.account_id, m.id, m.chat_id, m.sender_id, COALESCE(a.phone, ''), COALESCE(a.name, ''),
 	       COALESCE(a.is_self, 0), m.is_from_me, m.kind, m.text, m.quoted_id, m.sent_at, m.edited_at,
-	       m.deleted, m.status, m.reactions_json
+	       m.deleted, m.status, m.reactions_json, m.content_evicted_at
 	FROM chat_messages m
 	LEFT JOIN attendees a ON a.account_id = m.account_id AND a.id = m.sender_id`
 
@@ -479,9 +479,10 @@ func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	var editedAt sql.NullInt64
 	var reactionsJSON string
 	var senderIsSelf int
+	var evictedAt sql.NullInt64
 	err := r.Scan(&m.AccountID, &m.ID, &m.ChatID, &m.Sender.ID, &m.Sender.Phone, &m.Sender.Name, &senderIsSelf,
 		&isFromMe, &m.Kind, &m.Text, &m.QuotedMessageID,
-		&sentAt, &editedAt, &deleted, &m.Status, &reactionsJSON)
+		&sentAt, &editedAt, &deleted, &m.Status, &reactionsJSON, &evictedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -500,6 +501,7 @@ func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	if m.Reactions == nil {
 		m.Reactions = []model.Reaction{}
 	}
+	m.ContentEvicted = evictedAt.Valid
 	return m, nil
 }
 

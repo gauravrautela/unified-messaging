@@ -1682,3 +1682,105 @@ func TestEvictChatMessageContentBlanksTextOnly(t *testing.T) {
 		t.Errorf("envelope lost: chat=%q kind=%q", got.ChatID, got.Kind)
 	}
 }
+
+func TestGetEmailReportsContentEvicted(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "m1", Subject: "x", Body: "y", Date: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Error("ContentEvicted = true on a fresh message, want false")
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ContentEvicted {
+		t.Error("ContentEvicted = false after eviction, want true")
+	}
+}
+
+// The list form needs the flag too: list responses already omit the body, so
+// without it a client cannot tell "not included here" from "destroyed".
+func TestListEmailsReportsContentEvicted(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "m1", Subject: "x", Body: "y", Date: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListEmails(EmailQuery{AccountID: acct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].ContentEvicted {
+		t.Fatalf("ListEmails = %+v, want one row with ContentEvicted true", got)
+	}
+}
+
+// Eviction blanks subject, snippet and from_email — the three columns
+// ListEmails searches (store.go:537) — so an evicted message can never be a
+// search hit again. That is correct (there is nothing left to match) but
+// surprising, so it is pinned here rather than discovered in production.
+func TestSearchDoesNotMatchEvictedMail(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", Subject: "quarterly numbers",
+		Snippet: "here they are", From: model.Recipient{Email: "alice@example.com"},
+		Body: "<p>secret</p>", Date: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListEmails(EmailQuery{AccountID: acct, Search: "quarterly"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("baseline search returned %d rows, want 1", len(got))
+	}
+
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.ListEmails(EmailQuery{AccountID: acct, Search: "quarterly"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("search returned %d rows for an evicted message, want 0", len(got))
+	}
+}
+
+func TestGetChatMessageReportsContentEvicted(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", Kind: "text", Text: "hi", SentAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictChatMessageContent(acct, "cm1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetChatMessage(acct, "cm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ContentEvicted {
+		t.Error("ContentEvicted = false after eviction, want true")
+	}
+}

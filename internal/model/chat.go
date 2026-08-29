@@ -64,7 +64,13 @@ type ChatMessage struct {
 	EditedAt        *time.Time `json:"edited_at,omitempty"`
 	Deleted         bool       `json:"deleted"`
 	Status          string     `json:"status,omitempty"` // own messages: sending | sent | delivered | read
-	Reactions       []Reaction `json:"reactions"`
+
+	// ContentEvicted reports that this message's text was removed by the
+	// owning developer's retention policy. See model.Email.ContentEvicted for
+	// why the flag is negative.
+	ContentEvicted bool `json:"content_evicted"`
+
+	Reactions []Reaction `json:"reactions"`
 }
 
 // Chat event names.
