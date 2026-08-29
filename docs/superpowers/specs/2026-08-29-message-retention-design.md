@@ -45,7 +45,7 @@ ALTER TABLE chat_messages ADD COLUMN content_evicted_at BIGINT
 
 The migration follows each `ADD COLUMN` with a one-time `UPDATE ... SET stored_at = <migration clock> WHERE stored_at = 0`, so pre-existing rows start their clock at upgrade rather than at the epoch.
 
-`content_evicted_at` is NULL until evicted. It is the flag the API reports on (§6) and the two guards in §7 test.
+`content_evicted_at` is NULL until evicted. It is the flag the API reports on (§6) and the three guards in §7 test.
 
 ---
 
@@ -118,14 +118,16 @@ Hourly granularity is adequate because §4 covers the fast path; max-age is a ba
 **`model.Email` and `model.ChatMessage`** gain:
 
 ```go
-ContentAvailable bool `json:"content_available"`
+ContentEvicted bool `json:"content_evicted"`
 ```
 
 Always emitted, deliberately not `omitempty`: an absent field cannot be distinguished from an older server. It appears on both the full and list forms — list responses already omit `body` (`handlers_llms.go:86`), so without it a client cannot tell "not included here" from "destroyed."
 
-An evicted email returns its envelope with `subject`, `snippet`, `body`, `body_plain`, `from`, `to`, `cc`, `bcc`, `attachments` empty and `content_available: false`.
+**The flag is negative (`content_evicted`) rather than positive (`content_available`) so that its zero value is correct.** `model.Email` is constructed all over the codebase — in the Outlook adapter from a Graph response, in the syncer, in API request handlers — and only the two store scanners know anything about retention. A positive `ContentAvailable bool` would default to `false` at every one of those sites, so every webhook would announce that content it is carrying had been destroyed. Inverting the field makes every existing construction site correct without touching it.
 
-`emailSelect` (`store/store.go:595`) and the chat message select gain `content_evicted_at`; `scanEmail` and its chat counterpart set `ContentAvailable` from it.
+An evicted email returns its envelope with `subject`, `snippet`, `body`, `body_plain`, `from`, `to`, `cc`, `bcc`, `attachments` empty and `content_evicted: true`.
+
+`emailSelect` (`store/store.go:595`) and `chatMessageSelect` (`store/chat.go:306`) gain `content_evicted_at`; `scanEmail` and `scanChatMessage` set `ContentEvicted` from whether it is non-NULL.
 
 **Settings**, following the shape of `PUT /api/v1/me/redirect-domains`:
 
@@ -139,15 +141,19 @@ An evicted email returns its envelope with `subject`, `snippet`, `body`, `body_p
 
 *Search stops matching evicted mail.* `ListEmails` matches `Search` against `subject`, `snippet` and `from_email` (`store/store.go:537`) — eviction blanks all three, so an evicted message can never be a search hit. This is correct behaviour (the text is gone; there is nothing to match) but it is surprising, and a developer who enables retention will see their search results shrink over time. It belongs in the docs next to the knob, not in a footnote.
 
-*The mail and chat viewers need an evicted state.* They render whatever the API returns, so without a change an evicted message shows as a blank message with no sender — indistinguishable from a bug. They read `content_available` and render an explicit "content removed by your retention policy" state instead.
+*The mail and chat viewers need an evicted state.* They render whatever the API returns, so without a change an evicted message shows as a blank message with no sender — indistinguishable from a bug. They read `content_evicted` and render an explicit "content removed by your retention policy" state instead.
 
 ---
 
-## 7. Two guards against content coming back
+## 7. Three guards against content coming back
 
-Eviction is not idempotent against the write paths, which will happily repopulate a blanked row. Both cases are one `if`, and both are silent leaks if missed.
+Eviction is not idempotent against the write paths, which will happily repopulate a blanked row. Each case is a few lines, and each is a silent leak if missed.
 
-**Attachment cache-fill** — `handlers_mail.go:251-258` lazily fills `attachments_json` from the provider on `GET /emails/{id}` when it is empty. On an evicted email that re-creates the filenames at rest, and unlike an edit there is no subsequent event to trigger re-eviction, so they persist until max-age. Skip the cache-fill when `content_evicted_at` is set. The two attachment *endpoints* are unaffected — `handleListAttachments` and `handleDownloadAttachment` go live to the provider (`handlers_mail.go:446`, `:463`) and never read the column.
+**Sync re-upsert** — `UpsertEmail`'s conflict clause deliberately preserves a body it already holds rather than letting a delta blank it (`store/store.go:469`), but the converse is that a non-empty incoming body always wins. A resync, or any delta that carries full message properties, would refill every evicted row. The `ON CONFLICT` clause gains `AND emails.content_evicted_at IS NULL` on the content columns, so an evicted row stays evicted no matter what sync hands it. This is the guard that matters most: it is the only one on the path that runs unattended, for every message, forever.
+
+`UpsertChatMessage` needs no such guard — it is `ON CONFLICT DO NOTHING` (`store/chat.go:323`).
+
+**Attachment cache-fill** — `Server.complete` (`handlers_mail.go:250-259`) lazily fetches attachment metadata from the provider on `GET /emails/{id}` when the row has none, puts it on the response, and writes it back with `UpsertEmail`. The write-back is already stopped by the guard above, but the *response* would still carry filenames the tenant's policy says are gone. `complete` skips the fetch entirely when the message is evicted. The two attachment *endpoints* are unaffected — `handleListAttachments` and `handleDownloadAttachment` go live to the provider (`handlers_mail.go:446`, `:463`) and never read the column.
 
 **WhatsApp edits** — `sink.go:169` suppresses replayed edits with `prev.EditedAt != nil && prev.Text == text`. On an evicted row `prev.Text` is `''`, so a replay no longer matches, re-applies, and re-emits a duplicate `chat_updated` — a bug eviction would introduce. The edit path returns early when `content_evicted_at` is set, logging `decision=content-evicted`. This also removes the repopulate-then-re-evict cycle that storing the new text would create.
 
@@ -160,11 +166,11 @@ The cost is that a genuine late edit to an evicted message is dropped rather tha
 - **Store:** eviction blanks exactly the columns in §3 and leaves the rest intact; is idempotent; is a no-op when `retention_max_age_secs = 0`.
 - **`deliver()` trigger:** all hooks succeed first try → evicted; one hook enqueues a retry → not evicted; zero hooks match → not evicted; `chat_reaction` does not evict its target.
 - **Sweep:** a message past max-age with no webhook configured is evicted; one inside the window is not; the developer join scopes it to the right tenant.
-- **Guards:** `GET` on an evicted email does not refill `attachments_json`; a replayed edit on an evicted chat message is suppressed and emits no second `chat_updated`.
+- **Guards:** `UpsertEmail` with a full body does not refill an evicted row (the sync-resync case); `GET` on an evicted email neither refills nor returns attachment metadata; a replayed edit on an evicted chat message is suppressed and emits no second `chat_updated`.
 - **Sync invariants — the regressions that matter most:** `EmailExists` returns true for an evicted email, and a resync after eviction fires no `mail_received`; `GetChatMessage` still resolves an evicted message so a late reaction is applied.
 - **Dead deliveries:** purged at the tenant cutoff when it is shorter than the global one.
 - **Migration:** existing rows land at `retention_max_age_secs = 0` with `stored_at` stamped at the migration clock — an upgrade evicts nothing.
-- **API:** evicted email serializes with `content_available: false` and empty participants; a non-evicted one with `true`.
+- **API:** evicted email serializes with `content_evicted: true` and empty participants; a non-evicted one with `false`. An event emitted straight from the syncer (never through a store scanner) carries `false`, proving the zero value is right.
 - **Search:** an evicted email is not returned for a search that matched its subject before eviction — asserted so the behaviour change is pinned rather than discovered.
 
 ---
