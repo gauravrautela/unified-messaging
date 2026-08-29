@@ -138,3 +138,72 @@ func TestEvictExpiredContentSweepsChatMessages(t *testing.T) {
 		t.Fatalf("chat message not evicted: evicted=%v text=%q", got.ContentEvicted, got.Text)
 	}
 }
+
+func seedDeadDelivery(t *testing.T, s *Store, id, webhookID, accountID string, ageDays int) {
+	t.Helper()
+	if err := s.SaveDelivery(Delivery{
+		ID: id, WebhookID: webhookID, AccountID: accountID, EventType: "mail_received",
+		Payload: []byte(`{"type":"mail_received"}`), Attempts: 8, Dead: true,
+		CreatedAt: time.Now().Add(-time.Duration(ageDays) * 24 * time.Hour).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPurgeDeadDeliveriesHonoursAShorterTenantPolicy(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	hook := model.Webhook{ID: "wh_1", DeveloperID: "dev_1", AccountID: acct, URL: "https://example.com/hook", Events: []string{"*"}}
+	if err := s.SaveWebhook(hook); err != nil {
+		t.Fatal(err)
+	}
+	seedDeadDelivery(t, s, "dl_1", "wh_1", acct, 2)
+
+	// Global cutoff is 7 days: on its own this row survives.
+	n, err := s.PurgeDeadDeliveries(time.Now(), 7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("purged %d rows under the global cutoff alone, want 0", n)
+	}
+
+	// The tenant says one hour. The two-day-old dead delivery must go.
+	if err := s.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.PurgeDeadDeliveries(time.Now(), 7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("purged %d rows under a 1h tenant policy, want 1", n)
+	}
+}
+
+// A live delivery is still retrying and must never be purged, whatever the
+// policy says — the payload is the only copy the retry has.
+func TestPurgeDeadDeliveriesLeavesLiveRowsAlone(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", AccountID: acct, URL: "https://example.com/hook", Events: []string{"*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveDelivery(Delivery{
+		ID: "dl_live", WebhookID: "wh_1", AccountID: acct, EventType: "mail_received",
+		Payload: []byte(`{}`), Attempts: 2, Dead: false,
+		CreatedAt: time.Now().Add(-30 * 24 * time.Hour).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRetentionMaxAge("dev_1", 60); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.PurgeDeadDeliveries(time.Now(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("purged %d live deliveries, want 0", n)
+	}
+}

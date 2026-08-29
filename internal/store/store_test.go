@@ -1298,7 +1298,7 @@ func TestPurgeDeadDeliveriesRemovesRowsOlderThanCutoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := s.PurgeDeadDeliveries(now.Add(-7 * 24 * time.Hour))
+	n, err := s.PurgeDeadDeliveries(now, 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -67,7 +67,7 @@ func run(log *slog.Logger) error {
 	db.SetSealKey(cfg.TokenKey)
 	db.SetLogger(log.With("component", "store"))
 	db.PurgeExpiredOAuthStates()
-	db.PurgeDeadDeliveries(time.Now().Add(-cfg.DeliveryRetention))
+	db.PurgeDeadDeliveries(time.Now(), cfg.DeliveryRetention)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -90,7 +90,7 @@ func run(log *slog.Logger) error {
 				return
 			case <-t.C:
 				db.PurgeExpiredOAuthStates()
-				n, err := db.PurgeDeadDeliveries(time.Now().Add(-cfg.DeliveryRetention))
+				n, err := db.PurgeDeadDeliveries(time.Now(), cfg.DeliveryRetention)
 				if err != nil {
 					log.Error("purging dead deliveries", "err", err)
 					continue
