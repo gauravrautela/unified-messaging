@@ -171,6 +171,15 @@ func (s *sink) Edited(accountID, chatID, messageID, text string, at time.Time) {
 			log.Debug("chat event", "kind", "edit", "decision", "unknown-message")
 			return
 		}
+		if prev.ContentEvicted {
+			// The replay guard below compares prev.Text, which eviction blanked.
+			// A replayed edit would no longer match, would re-apply, and would
+			// emit a second chat_updated. There is also nothing legitimate to
+			// forward: WhatsApp's edit window is 15 minutes, far inside any
+			// retention policy, so a real edit cannot reach an evicted message.
+			log.Debug("chat event", "kind", "edit", "decision", "content-evicted")
+			return
+		}
 		if prev.EditedAt != nil && prev.Text == text {
 			log.Debug("chat event", "kind", "edit", "decision", "replay", "text_bytes", len(text))
 			return

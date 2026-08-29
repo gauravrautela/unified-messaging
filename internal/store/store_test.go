@@ -1298,7 +1298,7 @@ func TestPurgeDeadDeliveriesRemovesRowsOlderThanCutoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := s.PurgeDeadDeliveries(now.Add(-7 * 24 * time.Hour))
+	n, err := s.PurgeDeadDeliveries(now, 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1474,5 +1474,407 @@ func TestMigrationDropsPreHashSessionRows(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != hashed {
 		t.Fatalf("sessions after reopen = %v, want only the hashed row", got)
+	}
+}
+
+// stored_at is ingestion time, not the provider's timestamp: a backfill of an
+// old mailbox must not look ancient to the retention sweep.
+func TestUpsertEmailStampsStoredAtOnInsertOnly(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	old := time.Now().Add(-3 * 365 * 24 * time.Hour).UTC().Truncate(time.Second)
+
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", Subject: "hello", Body: "body", Date: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var first int64
+	if err := s.DB().QueryRow(s.Q(`SELECT stored_at FROM emails WHERE account_id = ? AND id = ?`), acct, "m1").Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first < time.Now().Add(-time.Minute).Unix() {
+		t.Fatalf("stored_at = %d, want a recent timestamp, not the message date %d", first, old.Unix())
+	}
+
+	// A later update must not restamp it, or nothing would ever age out.
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", Subject: "hello again", Body: "body", Date: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var second int64
+	if err := s.DB().QueryRow(s.Q(`SELECT stored_at FROM emails WHERE account_id = ? AND id = ?`), acct, "m1").Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("stored_at changed on update: %d -> %d", first, second)
+	}
+}
+
+func TestUpsertChatMessageStampsStoredAt(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", Kind: "text", Text: "hi",
+		SentAt: time.Now().Add(-48 * time.Hour).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var storedAt int64
+	if err := s.DB().QueryRow(s.Q(`SELECT stored_at FROM chat_messages WHERE account_id = ? AND id = ?`), acct, "cm1").Scan(&storedAt); err != nil {
+		t.Fatal(err)
+	}
+	if storedAt < time.Now().Add(-time.Minute).Unix() {
+		t.Fatalf("stored_at = %d, want a recent timestamp", storedAt)
+	}
+}
+
+func TestDevelopersHaveRetentionColumnDefaultingToZero(t *testing.T) {
+	s := newTestStore(t)
+	dev := seedDeveloper(t, s, "dev_1", "dev1@example.com")
+	var secs int64
+	if err := s.DB().QueryRow(s.Q(`SELECT retention_max_age_secs FROM developers WHERE id = ?`), dev).Scan(&secs); err != nil {
+		t.Fatal(err)
+	}
+	if secs != 0 {
+		t.Fatalf("retention_max_age_secs = %d, want 0 (retention off by default)", secs)
+	}
+}
+
+// Eviction blanks content and participants but keeps every column sync depends
+// on. EmailExists in particular is the only thing stopping a resync from
+// re-firing mail_received for the whole mailbox.
+func TestEvictEmailContentBlanksContentAndKeepsEnvelope(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", ThreadID: "t1", FolderID: "f1",
+		Subject: "quarterly numbers", Snippet: "here they are",
+		From: model.Recipient{Name: "Alice", Email: "alice@example.com"},
+		To:   []model.Recipient{{Name: "Bob", Email: "bob@example.com"}},
+		Body: "<p>secret</p>", BodyType: "html", Date: time.Now().UTC(),
+		Read: true, HasAttachments: true, InternetMessageID: "<abc@example.com>",
+		Attachments: []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]string{
+		"subject": got.Subject, "snippet": got.Snippet, "body": got.Body,
+		"body_type": got.BodyType, "from.name": got.From.Name, "from.email": got.From.Email,
+	} {
+		if v != "" {
+			t.Errorf("%s = %q after eviction, want empty", name, v)
+		}
+	}
+	if len(got.To) != 0 || len(got.Attachments) != 0 {
+		t.Errorf("to=%v attachments=%v after eviction, want both empty", got.To, got.Attachments)
+	}
+	if got.ThreadID != "t1" || got.FolderID != "f1" || got.InternetMessageID != "<abc@example.com>" {
+		t.Errorf("envelope lost: thread=%q folder=%q imid=%q", got.ThreadID, got.FolderID, got.InternetMessageID)
+	}
+	if !got.Read || !got.HasAttachments {
+		t.Errorf("flags lost: read=%v has_attachments=%v", got.Read, got.HasAttachments)
+	}
+	// The invariant that keeps a resync from replaying the mailbox.
+	if ok, err := s.EmailExists(acct, "m1"); err != nil || !ok {
+		t.Fatalf("EmailExists = %v, %v after eviction; want true (a resync would re-fire mail_received)", ok, err)
+	}
+}
+
+func TestEvictEmailContentIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "m1", Subject: "x", Body: "y", Date: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	first := time.Now().Add(-time.Hour).UTC()
+	if err := s.EvictEmailContent(acct, "m1", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var at int64
+	if err := s.DB().QueryRow(s.Q(`SELECT content_evicted_at FROM emails WHERE account_id = ? AND id = ?`), acct, "m1").Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	if at != first.Unix() {
+		t.Fatalf("content_evicted_at = %d, want the first eviction %d", at, first.Unix())
+	}
+}
+
+// The guard that matters most: sync runs unattended, for every message,
+// forever. Without it a resync refills every evicted row.
+func TestUpsertEmailDoesNotRefillEvictedRow(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	full := model.Email{
+		AccountID: acct, ID: "m1", Subject: "quarterly numbers",
+		From:    model.Recipient{Email: "alice@example.com"},
+		To:      []model.Recipient{{Email: "bob@example.com"}},
+		Snippet: "here they are", Body: "<p>secret</p>", BodyType: "html",
+		Date: time.Now().UTC(), Attachments: []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}},
+	}
+	if err := s.UpsertEmail(full); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resync hands us the whole message again.
+	full.Read = true
+	if err := s.UpsertEmail(full); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "" || got.Subject != "" || got.From.Email != "" || len(got.Attachments) != 0 {
+		t.Fatalf("resync refilled an evicted row: subject=%q body=%q from=%q atts=%d",
+			got.Subject, got.Body, got.From.Email, len(got.Attachments))
+	}
+	// Flags are not content and must still track the provider.
+	if !got.Read {
+		t.Error("read flag did not update on an evicted row; flags are not content")
+	}
+}
+
+func TestEvictChatMessageContentBlanksTextOnly(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", Kind: "text",
+		Text: "meet me at six", SentAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictChatMessageContent(acct, "cm1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetChatMessage(acct, "cm1")
+	if err != nil {
+		t.Fatalf("GetChatMessage after eviction: %v (a late reaction must still resolve)", err)
+	}
+	if got.Text != "" {
+		t.Errorf("text = %q after eviction, want empty", got.Text)
+	}
+	if got.ChatID != "c1" || got.Kind != "text" {
+		t.Errorf("envelope lost: chat=%q kind=%q", got.ChatID, got.Kind)
+	}
+}
+
+func TestGetEmailReportsContentEvicted(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "m1", Subject: "x", Body: "y", Date: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Error("ContentEvicted = true on a fresh message, want false")
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetEmail(acct, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ContentEvicted {
+		t.Error("ContentEvicted = false after eviction, want true")
+	}
+}
+
+// The list form needs the flag too: list responses already omit the body, so
+// without it a client cannot tell "not included here" from "destroyed".
+func TestListEmailsReportsContentEvicted(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{AccountID: acct, ID: "m1", Subject: "x", Body: "y", Date: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListEmails(EmailQuery{AccountID: acct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].ContentEvicted {
+		t.Fatalf("ListEmails = %+v, want one row with ContentEvicted true", got)
+	}
+}
+
+// Eviction blanks subject, snippet and from_email — the three columns
+// ListEmails searches (store.go:537) — so an evicted message can never be a
+// search hit again. That is correct (there is nothing left to match) but
+// surprising, so it is pinned here rather than discovered in production.
+func TestSearchDoesNotMatchEvictedMail(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", Subject: "quarterly numbers",
+		Snippet: "here they are", From: model.Recipient{Email: "alice@example.com"},
+		Body: "<p>secret</p>", Date: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListEmails(EmailQuery{AccountID: acct, Search: "quarterly"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("baseline search returned %d rows, want 1", len(got))
+	}
+
+	if err := s.EvictEmailContent(acct, "m1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.ListEmails(EmailQuery{AccountID: acct, Search: "quarterly"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("search returned %d rows for an evicted message, want 0", len(got))
+	}
+}
+
+func TestGetChatMessageReportsContentEvicted(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", Kind: "text", Text: "hi", SentAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictChatMessageContent(acct, "cm1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetChatMessage(acct, "cm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ContentEvicted {
+		t.Error("ContentEvicted = false after eviction, want true")
+	}
+}
+
+// EditChatMessage is called from two places: the WhatsApp inbound sink
+// (which guards against editing an evicted message itself) and the public
+// API edit handler (which, before this guard, did not). The store-level
+// guard is defence in depth for both: an edit against an evicted row must be
+// a silent no-op, never a resurrection of destroyed content, while an edit
+// against a normal row must still work exactly as before.
+func TestEditChatMessageSkipsEvictedRow(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "original", SentAt: at, Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EvictChatMessageContent(acct, "cm1", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EditChatMessage(acct, "cm1", "resurrected text", at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetChatMessage(acct, "cm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "" {
+		t.Fatalf("text = %q after editing an evicted message, want it to stay blank", got.Text)
+	}
+	if got.EditedAt != nil {
+		t.Fatalf("edited_at = %v after editing an evicted message, want nil (the edit must be a no-op)", got.EditedAt)
+	}
+
+	// Happy path: editing a normal (non-evicted) message still works.
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm2", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "original", SentAt: at, Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EditChatMessage(acct, "cm2", "edited text", at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetChatMessage(acct, "cm2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "edited text" || got.EditedAt == nil {
+		t.Fatalf("after edit = %+v, want text updated and edited_at set", got)
+	}
+}
+
+func TestSetAndReadRetentionMaxAge(t *testing.T) {
+	s := newTestStore(t)
+	dev := seedDeveloper(t, s, "dev_1", "dev1@example.com")
+
+	d, err := s.RetentionMaxAge(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 0 {
+		t.Fatalf("RetentionMaxAge = %v on a new developer, want 0 (retention off)", d)
+	}
+
+	if err := s.SetRetentionMaxAge(dev, 3600); err != nil {
+		t.Fatal(err)
+	}
+	d, err = s.RetentionMaxAge(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != time.Hour {
+		t.Fatalf("RetentionMaxAge = %v, want 1h", d)
+	}
+
+	got, err := s.GetDeveloper(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RetentionMaxAgeSecs != 3600 {
+		t.Fatalf("GetDeveloper().RetentionMaxAgeSecs = %d, want 3600", got.RetentionMaxAgeSecs)
+	}
+}
+
+func TestRetentionMaxAgeUnknownDeveloper(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.RetentionMaxAge("dev_missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RetentionMaxAge for an unknown developer = %v, want ErrNotFound", err)
 	}
 }

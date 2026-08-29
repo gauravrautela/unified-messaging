@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"html/template"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,6 +16,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/safehttp"
 	"github.com/gauravrautela/unified-messaging/internal/store"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
 // notifyClient delivers notify_url callbacks. notify_url is attacker-chosen
@@ -242,20 +241,27 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	state := r.PathValue("state")
 	pending, err := s.store.PeekOAuthState(state)
 	if err != nil {
-		renderMessage(w, http.StatusNotFound, "Link not valid",
-			"This connection link is unknown or has already been used.")
+		s.renderResult(w, http.StatusNotFound, resultPage{
+			Title: "Link not valid",
+			Body:  "This connection link is unknown or has already been used. Ask the app you came from for a new one.",
+		})
 		return
 	}
 	if time.Now().After(pending.ExpiresAt) {
-		renderMessage(w, http.StatusGone, "Link expired",
-			"This connection link has expired. Please request a new one.")
+		s.renderResult(w, http.StatusGone, resultPage{
+			Title: "Link expired",
+			Body:  "This connection link has expired. Ask the app you came from for a new one.",
+		})
 		return
 	}
 
 	p, err := s.resolveProvider(pending.Provider)
 	if err != nil {
-		renderMessage(w, http.StatusInternalServerError, "Provider unavailable",
-			"This connection link refers to a backend that is no longer configured.")
+		s.renderResult(w, http.StatusInternalServerError, resultPage{
+			Title:  "We can't connect that account right now",
+			Body:   "This connection link refers to a backend that is no longer configured. Nothing was shared.",
+			Detail: err.Error(),
+		})
 		return
 	}
 
@@ -263,10 +269,7 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	// this must branch before ever calling it.
 	if p.Linker() != nil {
 		s.ensureLinkCookie(w, r, pending.ExpiresAt)
-		renderLink(w, linkPageData{
-			Provider: displayName(p.Name()),
-			State:    state,
-		})
+		s.renderConnectQR(w, p.Name(), state)
 		return
 	}
 
@@ -274,10 +277,11 @@ func (s *Server) handleConnectRedirect(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force_consent") == "1"
 	authorizeURL := p.Auth().AuthorizeURL(state, challenge, force)
 
-	renderLanding(w, landingData{
-		Provider:     displayName(p.Name()),
-		AuthorizeURL: authorizeURL,
-	})
+	// The failure redirect doubles as the Cancel destination: it is where this
+	// developer already asked us to send a flow that did not complete, and it
+	// was checked against their allowlist when the link was minted. With none
+	// configured the page offers no Cancel button at all rather than a dead end.
+	s.renderConnectOAuth(w, provider.DisplayName(p.Name()), authorizeURL, pending.FailureURL)
 }
 
 // statePrefix logs a short, non-sensitive fragment of an OAuth state, without
@@ -288,15 +292,6 @@ func statePrefix(state string) string {
 		return state[:6]
 	}
 	return state
-}
-
-func displayName(providerName string) string {
-	switch providerName {
-	case "OUTLOOK":
-		return "Outlook"
-	default:
-		return providerName
-	}
 }
 
 // handleOAuthCallback is Microsoft's redirect target.
@@ -318,20 +313,26 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			}), http.StatusFound)
 			return
 		}
-		renderMessage(w, http.StatusBadRequest, "Connection cancelled",
-			fmt.Sprintf("%s: %s", errCode, desc))
+		s.renderResult(w, http.StatusBadRequest, resultPage{
+			Title:  "Connection cancelled",
+			Body:   "The account was not connected, and nothing was shared.",
+			Detail: errorDetail(errCode, desc),
+		})
 		return
 	}
 
 	pending, err := s.store.TakeOAuthState(state)
 	if err != nil {
-		renderMessage(w, http.StatusBadRequest, "Invalid state",
-			"This connection link is unknown, expired, or already used.")
+		s.renderResult(w, http.StatusBadRequest, resultPage{
+			Title: "Link not valid",
+			Body:  "This connection link is unknown, expired, or has already been used. Ask the app you came from for a new one.",
+		})
 		return
 	}
 
 	if code == "" {
-		s.failConnect(w, r, pending, "missing_code", "Microsoft did not return an authorization code.")
+		s.failConnect(w, r, pending, "missing_code",
+			provider.DisplayName(pending.Provider)+" did not return an authorization code.")
 		return
 	}
 
@@ -373,8 +374,16 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}), http.StatusFound)
 		return
 	}
-	renderMessage(w, http.StatusOK, "Account connected",
-		fmt.Sprintf("%s is now connected. Account ID: %s", acct.Email, acct.ID))
+	// No success_redirect_url was configured — a caller that supplied one was
+	// already redirected above — so this page is where the flow ends. The
+	// account id still rides along, behind Details with a copy button, because
+	// an integrator without notify_url has no other way to learn it.
+	s.renderResult(w, http.StatusOK, resultPage{
+		Title:   "Account connected",
+		Body:    acct.Email + " is now connected.",
+		Copy:    acct.ID,
+		Success: true,
+	})
 }
 
 func (s *Server) afterConnect(acct model.Account) {
@@ -399,7 +408,26 @@ func (s *Server) failConnect(w http.ResponseWriter, r *http.Request, pending sto
 		}), http.StatusFound)
 		return
 	}
-	renderMessage(w, http.StatusBadRequest, "Connection failed", msg)
+	s.renderResult(w, http.StatusBadRequest, resultPage{
+		Title:  "We couldn't finish connecting",
+		Body:   "The account was not connected, and nothing was shared. You can try again from the app you came from.",
+		Detail: errorDetail(code, msg),
+	})
+}
+
+// errorDetail joins a provider's error code and description into the one
+// line that goes under <details>. Either half may be empty — a consent screen
+// that reports only "access_denied" is normal — so this never produces a
+// dangling separator.
+func errorDetail(code, desc string) string {
+	switch {
+	case code != "" && desc != "":
+		return code + ": " + desc
+	case code != "":
+		return code
+	default:
+		return desc
+	}
 }
 
 func (s *Server) notify(target string, payload map[string]any) {
@@ -502,14 +530,35 @@ func appendQuery(raw string, extra url.Values) string {
 	return u.String()
 }
 
-var messageTmpl = template.Must(template.New("msg").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><title>{{.Title}}</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;max-width:34rem;margin:15vh auto;padding:0 1rem;color:#1a1a1a}
-h1{font-size:1.25rem;margin:0 0 .5rem}p{color:#555;word-break:break-all}</style></head>
-<body><h1>{{.Title}}</h1><p>{{.Body}}</p></body></html>`))
+// resultPage is a terminal outcome of a connect flow, in the shape the page
+// renders it: one sentence a non-technical person can act on, plus whatever an
+// integrator needs, which the page keeps under a "Details" disclosure rather
+// than in that sentence. Copy is a value worth carrying away (an account id);
+// Detail is the provider's own error text.
+//
+// There is no "continue here next" field: when the developer configured a
+// success_redirect_url the callback 302s to it and this page never renders,
+// which is the documented contract and matches what the QR page does.
+type resultPage struct {
+	Title, Body, Detail string
+	Copy                string
+	// Success marks the one outcome the person can walk away from. Only that
+	// page says "you can return to the app now" — telling someone whose
+	// connection just failed to go back to the app would be telling them the
+	// wrong thing.
+	Success bool
+}
 
-func renderMessage(w http.ResponseWriter, status int, title, body string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_ = messageTmpl.Execute(w, struct{ Title, Body string }{title, body})
+// renderResult writes one outcome through the same public layout the rest of
+// the connect flow uses, at the status code the outcome actually deserves —
+// "this link expired" must not answer OK.
+func (s *Server) renderResult(w http.ResponseWriter, status int, p resultPage) {
+	s.renderPage(w, status, "connect_result", map[string]any{
+		"Shell":   web.Shell{Title: p.Title, Version: web.Version, Styles: []string{"connect.css"}},
+		"Title":   p.Title,
+		"Body":    p.Body,
+		"Detail":  p.Detail,
+		"Copy":    p.Copy,
+		"Success": p.Success,
+	})
 }

@@ -34,6 +34,9 @@ const Name = "WHATSAPP"
 type Provider struct {
 	container *sqlstore.Container
 	log       *slog.Logger
+	// RosterGroups is whether Chats scans joined groups. See
+	// config.WhatsAppRosterGroups for why an operator would turn it off.
+	RosterGroups bool
 
 	mu    sync.Mutex
 	conns map[string]*conn // accountID -> live connection (used by commands)
@@ -72,9 +75,10 @@ func New(db *sql.DB, dialect, deviceName string, log *slog.Logger) (*Provider, e
 		store.DeviceProps.Os = proto.String(deviceName)
 	}
 	return &Provider{
-		container: c,
-		log:       log.With("component", "whatsapp"),
-		conns:     map[string]*conn{},
+		container:    c,
+		log:          log.With("component", "whatsapp"),
+		conns:        map[string]*conn{},
+		RosterGroups: true,
 	}, nil
 }
 
@@ -93,8 +97,14 @@ func (p *Provider) Chat() provider.Chatter       { return p }
 // auto-reconnect (on by default in NewClient) would run a second, invisible
 // connection alongside the one the runtime is managing.
 func (p *Provider) newClient(device *store.Device) *whatsmeow.Client {
-	c := whatsmeow.NewClient(device, waLog.Noop)
+	c := whatsmeow.NewClient(device, waLogger(p.log))
 	c.EnableAutoReconnect = false
+	// The phone pushes message-history blobs to a linked device; this service
+	// mirrors from live events only and never reads them. Downloading them is
+	// not free either: whatsmeow stores every LID mapping a blob mentions, one
+	// statement at a time, under the lock every inbound decrypt takes — on a
+	// remote database that stalls live messages for minutes per blob.
+	c.ManualHistorySyncDownload = true
 	return c
 }
 

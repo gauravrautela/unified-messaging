@@ -144,6 +144,15 @@ func (c *conn) handle(evt any) {
 	case *events.Disconnected:
 		c.p.log.Info("whatsapp socket closed", "account_id", c.accountID)
 		c.sink.Disconnected(c.accountID, "disconnected", false)
+	case *events.UndecryptableMessage:
+		// The library will ask the sender to retry; nothing to store yet, but
+		// a run of these is the first sign of a broken session.
+		c.p.log.Warn("whatsapp undecryptable message", "account_id", c.accountID,
+			"chat_id", logChatID(v.Info.Chat), "message_id", v.Info.ID, "unavailable", v.IsUnavailable)
+	default:
+		// Type name only: enough to see what the library is telling us
+		// without logging any of the payload.
+		c.p.log.Debug("whatsapp event ignored", "account_id", c.accountID, "type", fmt.Sprintf("%T", evt))
 	}
 }
 
@@ -181,9 +190,15 @@ func (p *Provider) Chats(ctx context.Context, accountID string) ([]model.Chat, [
 		return nil, nil, nil, provider.ErrNotFound
 	}
 
-	groups, err := c.client.GetJoinedGroups(ctx)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("whatsapp: joined groups: %w", err)
+	var groups []*types.GroupInfo
+	if p.RosterGroups {
+		var err error
+		groups, err = c.client.GetJoinedGroups(ctx)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("whatsapp: joined groups: %w", err)
+		}
+	} else {
+		log.Debug("whatsapp roster: group scan disabled")
 	}
 
 	var chats []model.Chat

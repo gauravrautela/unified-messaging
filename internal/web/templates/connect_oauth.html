@@ -1,0 +1,27 @@
+{{define "connect_oauth"}}{{template "layout_public_start" .}}{{template "connect_oauth_content" .}}{{template "layout_public_end" .}}{{end}}
+
+{{/* The OAuth landing page: the one screen between "clicked a link from some
+     app" and "typing a password on the provider's site". It names the provider
+     from the registry and lists the scopes as sentences, so the person reading
+     it can tell what they are about to hand over. */}}
+{{define "connect_oauth_content"}}
+<ol class="steps" aria-label="Progress">
+  <li aria-current="step">Review</li><li>Authorize</li><li>Done</li>
+</ol>
+<h1>Connect your {{.Provider}} account</h1>
+<p class="muted" style="margin:var(--s2) 0 var(--s4)">Entropix is connecting your {{.Provider}} account.
+You'll sign in on {{.Provider}}'s own page; Entropix never sees your password.</p>
+{{if .Scopes}}
+<h2 style="font-size:15px">What the app will be able to do</h2>
+<ul class="scopes">{{range .Scopes}}<li>{{.}}</li>{{end}}</ul>
+{{end}}
+<div class="actions" style="margin-top:var(--s5)">
+  <a class="btn primary" href="{{.AuthorizeURL}}">Continue to {{.Provider}}</a>
+  {{if .CancelURL}}<a class="btn" href="{{.CancelURL}}">Cancel</a>{{end}}
+</div>
+{{if .CancelURL}}
+<p class="muted small" style="margin:var(--s4) 0 0">You can disconnect at any time.</p>
+{{else}}
+<p class="muted small" style="margin:var(--s4) 0 0">Changed your mind? You can close this page. You can disconnect at any time.</p>
+{{end}}
+{{end}}

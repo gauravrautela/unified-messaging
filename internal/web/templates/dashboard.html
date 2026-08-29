@@ -1,0 +1,828 @@
+{{define "dashboard"}}{{template "layout_start" .}}{{template "dashboard_content" .}}{{template "layout_end" .}}{{end}}
+
+{{define "dashboard_content"}}
+<main class="page">
+  <div class="page-head">
+    <div>
+      <h1>Accounts</h1>
+      <p class="muted small" id="provider-line">Loading providers…</p>
+    </div>
+    <div class="actions">
+      <button class="btn primary" type="button" id="connect-btn">Connect account</button>
+    </div>
+  </div>
+
+  <nav class="tabs" aria-label="Sections">
+    <a href="#accounts" aria-current="true">Accounts</a><a href="#webhooks">Webhooks</a><a href="#api-keys">API keys</a><a href="#settings">Settings</a>
+  </nav>
+
+  <section id="accounts" class="card" aria-label="Connected accounts">
+    <div id="accounts-list">
+      <div class="row"><div class="skeleton" style="width:40%"></div></div>
+      <div class="row"><div class="skeleton" style="width:55%"></div></div>
+    </div>
+  </section>
+
+  <section id="webhooks" class="card hidden" aria-label="Webhooks">
+    <div class="card-head">
+      <div>
+        <h2 style="margin:0">Webhooks</h2>
+        <p class="muted small" style="margin:2px 0 0">Every matching event is POSTed to the target, with retries.</p>
+      </div>
+      <button class="btn primary sm" type="button" id="webhook-btn">Add webhook</button>
+    </div>
+    <div id="webhooks-list">
+      <div class="row"><div class="skeleton" style="width:50%"></div></div>
+    </div>
+  </section>
+
+  <section id="api-keys" class="card hidden" aria-label="API keys">
+    <div class="card-head">
+      <div>
+        <h2 style="margin:0">API keys</h2>
+        <p class="muted small" style="margin:2px 0 0">Send one as <code>Authorization: Bearer &lt;key&gt;</code>. A key is shown once.</p>
+      </div>
+      <button class="btn primary sm" type="button" id="key-btn">Create key</button>
+    </div>
+    <div id="new-key" class="card-body hidden">
+      <div class="alert success">
+        <div><strong>Copy this key now.</strong> It is never shown again.</div>
+        <div style="display:flex;gap:var(--s2);align-items:center;margin-top:var(--s2)">
+          <code id="new-key-value" style="flex:1;min-width:0;word-break:break-all"></code>
+          <button class="btn sm" type="button" data-copy>Copy</button>
+        </div>
+      </div>
+    </div>
+    <div id="keys">
+      <div class="row"><div class="skeleton" style="width:35%"></div></div>
+    </div>
+  </section>
+
+  <section id="settings" class="hidden" aria-label="Settings">
+    <div class="card" style="margin-bottom:var(--s5)">
+      <div class="card-head"><h2 style="margin:0">Password</h2></div>
+      <div class="card-body">
+        <form id="password-form" style="max-width:24rem">
+          <div class="field">
+            <label for="current-password">Current password</label>
+            <input id="current-password" type="password" autocomplete="current-password" required>
+          </div>
+          <div class="field">
+            <label for="new-password">New password</label>
+            <input id="new-password" type="password" autocomplete="new-password" minlength="10" required>
+            <span class="hint">At least 10 characters. Changing it signs you out of every other browser.</span>
+          </div>
+          <button class="btn primary" type="submit">Change password</button>
+        </form>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:var(--s5)">
+      <div class="card-head"><h2 style="margin:0">Redirect domains</h2></div>
+      <div class="card-body">
+        <form id="redirect-domains-form" style="max-width:28rem">
+          <div class="field">
+            <label for="redirect-domains">Allowed hosts</label>
+            <textarea id="redirect-domains" rows="4" placeholder="app.example.com&#10;*.example.com" style="resize:vertical"></textarea>
+            <span class="hint">One per line. A hosted-auth success or failure redirect must land on one of these. Use <code>*.example.com</code> to cover every subdomain.</span>
+          </div>
+          <button class="btn primary" type="submit">Save domains</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 style="margin:0">Message retention</h2></div>
+      <div class="card-body">
+        <form id="retention-form" style="max-width:28rem">
+          <div class="field">
+            <label for="retention-max-age">Keep message content for</label>
+            <input id="retention-max-age" type="number" min="0" max="31536000" step="1" value="{{.RetentionMaxAgeSecs}}" required>
+            <span class="hint">
+              Seconds. Content is dropped the moment every subscribing webhook has accepted it, and is never kept
+              longer than this even if a webhook never accepts it. Eviction is permanent —
+              <strong>for WhatsApp there is no way to recover it</strong>: there is no history API to re-fetch from,
+              so your webhook endpoint is the only copy once content is gone. Use <code>0</code> to keep content
+              forever (the default).
+            </span>
+          </div>
+          <button class="btn primary" type="submit">Save retention</button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <dialog id="connect-dialog" aria-label="Connect an account">
+    <div class="dlg-head">Connect an account</div>
+    <div class="dlg-body">
+      <p class="muted small" style="margin-top:0">You finish signing in on the provider's own page. We never see the password.</p>
+      <div id="connect-providers" role="radiogroup" aria-label="Provider"></div>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn primary" type="button" id="connect-go">Continue</button>
+    </div>
+  </dialog>
+
+  <dialog id="key-dialog" aria-label="Create an API key">
+    <form id="key-form">
+      <div class="dlg-head">Create an API key</div>
+      <div class="dlg-body">
+        <div class="field" style="margin-bottom:0">
+          <label for="key-name">Name</label>
+          <input id="key-name" maxlength="60" placeholder="production" required>
+          <span class="hint">Only you see this — it tells two keys apart later.</span>
+        </div>
+      </div>
+      <div class="dlg-foot">
+        <button class="btn" type="button" data-close>Cancel</button>
+        <button class="btn primary" type="submit">Create key</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="webhook-dialog" aria-label="Add a webhook">
+    <form id="webhook-form">
+      <div class="dlg-head">Add a webhook</div>
+      <div class="dlg-body">
+        <div class="field">
+          <label for="hook-scope">Scope</label>
+          <select id="hook-scope" name="scope"></select>
+          <span class="hint">A global hook receives events from every connected account.</span>
+        </div>
+        <div class="field">
+          <label for="hook-kind">Deliver to</label>
+          <select id="hook-kind" name="kind">
+            <option value="webhook">Your endpoint (JSON)</option>
+            <option value="discord">Discord channel</option>
+            <option value="telegram">Telegram chat</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="hook-name">Label</label>
+          <input id="hook-name" name="name" maxlength="60" placeholder="optional, echoed in every delivery">
+        </div>
+        <div data-kind-fields="webhook">
+          <div class="field">
+            <label for="hook-url">URL</label>
+            <input id="hook-url" name="url" type="url" placeholder="https://your-app.example.com/hooks/mail">
+          </div>
+          <div class="field">
+            <label for="hook-secret">Signing secret</label>
+            <input id="hook-secret" name="secret" type="text" autocomplete="off" placeholder="optional">
+            <span class="hint">Returned once so you can verify the signature, then never again.</span>
+          </div>
+        </div>
+        <div data-kind-fields="discord" hidden>
+          <div class="field">
+            <label for="hook-discord-url">Discord webhook URL</label>
+            <input id="hook-discord-url" name="discord_url" type="url" placeholder="https://discord.com/api/webhooks/…">
+          </div>
+        </div>
+        <div data-kind-fields="telegram" hidden>
+          <div class="field">
+            <label for="hook-bot-token">Bot token</label>
+            <input id="hook-bot-token" name="bot_token" type="password" autocomplete="off" placeholder="from @BotFather">
+          </div>
+          <div class="field">
+            <label for="hook-chat-id">Chat id</label>
+            <input id="hook-chat-id" name="chat_id" type="text" placeholder="-1001234567890">
+          </div>
+        </div>
+        <fieldset class="field" style="border:0;padding:0;margin-bottom:0;min-width:0">
+          <legend style="font-weight:500;padding:0">Events</legend>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:var(--s2);margin:var(--s2) 0">
+            {{range .Events}}<label class="check"><input type="checkbox" name="events" value="{{.}}"><span>{{.}}</span></label>
+            {{end}}
+          </div>
+          <span class="hint">Leave every box clear for the default: everything on a global hook, new messages on an account hook.</span>
+        </fieldset>
+      </div>
+      <div class="dlg-foot">
+        <button class="btn" type="button" data-close>Cancel</button>
+        <button class="btn primary" type="submit" data-action="set-webhook">Add webhook</button>
+      </div>
+    </form>
+  </dialog>
+</main>
+
+<script>
+// app.js is loaded with defer, so it has not run yet when this inline script
+// is evaluated during parsing: window.um does not exist, and #notice is still
+// further down the document. DOMContentLoaded fires after every deferred
+// script has run and the document is complete, so both are ready by then.
+// Reading um at top level here would throw a ReferenceError and leave the
+// whole page inert.
+document.addEventListener("DOMContentLoaded", () => {
+  const { $, esc, api, notice, relTime } = um;
+
+  // ---- shared bits ----
+
+  // Accounts, so the webhook scope picker and the row rerenders can name one
+  // without another round trip. Keyed by id.
+  const accounts = new Map();
+  // The account ids currently being watched, and the label their action button
+  // shows while that lasts. watchers is what makes a second click on Resync
+  // replace the first watch rather than stack another polling loop on top.
+  const watchers = new Map();
+  const busy = new Map();
+  let providers = [];
+
+  const fail = (e) => notice("error", e && e.message ? e.message : String(e));
+
+  function setHTML(el, html) { el.innerHTML = html; }
+
+  function title(a) {
+    if (a.kind === "chat") return a.name || um.maskPhone(a.identifier) || a.id;
+    return a.email || a.name || um.maskPhone(a.identifier) || a.id;
+  }
+
+  // maskDiscordURL mirrors notify.MaskDiscordURL for the browser. A Discord
+  // webhook URL is a bearer credential, and a dashboard ends up in screenshots
+  // and screen shares, so the token is masked here exactly as it is in the logs.
+  function maskDiscordURL(u) {
+    return String(u).replace(
+      /^(https?:\/\/(?:[a-z0-9-]+\.)?discord(?:app)?\.com(?::\d+)?\/api\/webhooks\/\d+)\/[^\/\s"?]+/i,
+      "$1/•••");
+  }
+
+  // ---- tabs ----
+
+  const sections = ["accounts", "webhooks", "api-keys", "settings"];
+  function showSection(name) {
+    if (sections.indexOf(name) < 0) name = "accounts";
+    sections.forEach((s) => $(s).classList.toggle("hidden", s !== name));
+    document.querySelectorAll(".tabs a").forEach((a) => {
+      if (a.getAttribute("href") === "#" + name) a.setAttribute("aria-current", "true");
+      else a.removeAttribute("aria-current");
+    });
+  }
+  const fromHash = () => showSection(location.hash.replace(/^#/, ""));
+  window.addEventListener("hashchange", fromHash);
+
+  // ---- providers ----
+
+  async function loadProviders() {
+    try {
+      const data = await api("/api/v1/providers");
+      providers = data.items || [];
+    } catch (e) {
+      $("provider-line").textContent = "Could not load providers.";
+      fail(e);
+      return;
+    }
+    const pretty = (n) => String(n).charAt(0) + String(n).slice(1).toLowerCase();
+    $("provider-line").textContent = providers.length
+      ? providers.map((p) => pretty(p.name)).join(" · ")
+      : "No providers are configured on this deployment.";
+    const host = $("connect-providers");
+    if (!providers.length) {
+      setHTML(host, '<p class="muted small">Nothing to connect: this deployment has no provider configured.</p>');
+      $("connect-go").disabled = true;
+      return;
+    }
+    setHTML(host, providers.map((p, i) =>
+      '<label class="check" style="padding:var(--s2) 0">' +
+        '<input type="radio" name="provider" value="' + esc(p.name) + '"' + (i === 0 ? " checked" : "") + '>' +
+        '<span><span class="title">' + esc(pretty(p.name)) + "</span>" +
+        '<span class="sub" style="display:block">' + esc(p.kind) + " · " +
+          (p.auth === "link" ? "scan a QR code" : "sign in with OAuth") + "</span></span>" +
+      "</label>"
+    ).join(""));
+  }
+
+  // ---- accounts ----
+
+  function accountRow(a) {
+    const st = um.accountState(a);
+    const open = a.kind === "chat" ? "/chat?account_id=" : "/mail?account_id=";
+    // The busy label lives in the model, not on the button: a watch rerenders
+    // the row every few seconds, so a `disabled` flag set on the element would
+    // be thrown away on the next tick and let the account be resynced twice.
+    const working = busy.get(a.id);
+    const refresh = working
+      ? '<button class="btn sm" type="button" disabled>' + esc(working) + "</button>"
+      // Resync and reconnect both refuse an account whose credentials have
+      // expired — only the end user can fix that — so such a row offers the
+      // connect flow instead of a button that is guaranteed to fail.
+      : (a.status !== "OK"
+        ? '<button class="btn sm" type="button" data-action="connect">' + (a.kind === "chat" ? "Relink" : "Sign in again") + "</button>"
+        : (a.kind === "chat"
+          ? '<button class="btn sm" type="button" data-action="reconnect">Reconnect</button>'
+          : '<button class="btn sm" type="button" data-action="resync">Resync</button>'));
+    const detail = [esc(a.provider), a.kind === "chat" ? esc(um.maskPhone(a.identifier)) : "", esc(st.sub)]
+      .filter(Boolean).join(" · ");
+    return (
+      '<div class="row" data-id="' + esc(a.id) + '">' +
+        '<div class="avatar" aria-hidden="true">' + esc(String(a.provider || "?").charAt(0)) + "</div>" +
+        '<div class="grow">' +
+          '<div class="title">' + esc(title(a)) + "</div>" +
+          '<div class="sub"><span class="badge">' + esc(a.kind) + "</span> " + detail + "</div>" +
+        "</div>" +
+        '<span class="pill ' + esc(st.cls) + '">' + esc(st.label) + "</span>" +
+        '<div class="actions">' +
+          '<a class="btn sm" href="' + open + esc(a.id) + '">Open</a>' +
+          refresh +
+          '<button class="btn sm" type="button" data-action="hooks">Webhooks</button>' +
+          '<button class="btn sm danger" type="button" data-action="disconnect">Disconnect</button>' +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  function renderAccounts() {
+    const list = $("accounts-list");
+    const items = [...accounts.values()];
+    if (!items.length) {
+      setHTML(list,
+        '<div class="empty"><div class="title">No accounts yet</div>' +
+        "<p>Connect a mailbox or a WhatsApp number and its mail, chats and events start flowing straight away.</p>" +
+        '<button class="btn primary" type="button" data-action="connect">Connect account</button></div>');
+      return;
+    }
+    setHTML(list, items.map(accountRow).join(""));
+  }
+
+  async function loadAccounts() {
+    try {
+      const data = await api("/api/v1/accounts");
+      accounts.clear();
+      (data.items || []).forEach((a) => accounts.set(a.id, a));
+      renderAccounts();
+      fillScopes();
+    } catch (e) {
+      setHTML($("accounts-list"),
+        '<div class="empty"><div class="title">Could not load your accounts</div>' +
+        '<button class="btn" type="button" data-action="reload">Try again</button></div>');
+      fail(e);
+    }
+  }
+
+  // replaceRow swaps one account's row in place, so a poll that is watching a
+  // resync never yanks the rest of the list out from under a click.
+  function replaceRow(a) {
+    accounts.set(a.id, a);
+    const el = document.querySelector('.row[data-id="' + CSS.escape(a.id) + '"]');
+    if (!el) { renderAccounts(); return; }
+    const tmp = document.createElement("div");
+    setHTML(tmp, accountRow(a));
+    el.replaceWith(tmp.firstChild);
+  }
+
+  // watch re-reads one account until done(a) holds or a minute has gone by.
+  // Resync and reconnect are both asynchronous server-side: the POST only
+  // queues the work, so the page has to see the result to report it.
+  //
+  // At most one watch runs per account — a second click replaces the first
+  // rather than stacking a second polling loop — and the minute is a hard cap.
+  // The deadline cannot be enforced from inside the tick alone: um.poll skips
+  // the tick entirely while the tab is hidden, so a backgrounded page would
+  // poll forever once it came back. The standalone timer below is what makes
+  // the cap absolute, and the in-tick check just ends it a little sooner.
+  const WATCH_MS = 60000;
+
+  function watch(id, done, okText, busyLabel) {
+    const stopPrevious = watchers.get(id);
+    if (stopPrevious) stopPrevious();
+
+    const until = Date.now() + WATCH_MS;
+    let stopPoll = null, timer = null, ended = false;
+
+    const end = (kind, text) => {
+      if (ended) return;
+      ended = true;
+      if (stopPoll) stopPoll();
+      clearTimeout(timer);
+      watchers.delete(id);
+      busy.delete(id);
+      const a = accounts.get(id);
+      if (a) replaceRow(a);
+      if (text) notice(kind, text);
+    };
+    const giveUp = () => end("info", "Still working — " + title(accounts.get(id) || { id }) + " is taking longer than usual.");
+
+    busy.set(id, busyLabel);
+    watchers.set(id, () => end("", ""));
+    const cached = accounts.get(id);
+    if (cached) replaceRow(cached);
+
+    timer = setTimeout(giveUp, WATCH_MS);
+    stopPoll = um.poll(async () => {
+      if (Date.now() > until) { giveUp(); return; }
+      let a;
+      try {
+        a = await api("/api/v1/accounts/" + encodeURIComponent(id));
+      } catch (e) {
+        end("error", e && e.message ? e.message : String(e));
+        return;
+      }
+      replaceRow(a);
+      if (done(a)) end("success", okText);
+    }, 3000);
+  }
+
+  async function resync(id) {
+    const before = (accounts.get(id) || {}).last_synced_at || "";
+    await api("/api/v1/accounts/" + encodeURIComponent(id) + "/resync", { method: "POST" });
+    notice("info", "Resync queued for " + title(accounts.get(id) || { id }) + ".");
+    watch(id, (a) => (a.last_synced_at || "") !== before, "Resynced.", "Resyncing…");
+  }
+
+  async function reconnect(id) {
+    await api("/api/v1/accounts/" + encodeURIComponent(id) + "/reconnect", { method: "POST" });
+    notice("info", "Reconnecting " + title(accounts.get(id) || { id }) + "…");
+    watch(id, (a) => um.accountState(a).label === "Connected", "Reconnected.", "Reconnecting…");
+  }
+
+  async function disconnect(id) {
+    const name = title(accounts.get(id) || { id });
+    const ok = await um.confirm({
+      title: "Disconnect " + name + "?",
+      body: "Mirrored mail/chats for this account are deleted. WhatsApp devices are logged out.",
+      action: "Disconnect",
+      danger: true,
+    });
+    if (!ok) return;
+    await api("/api/v1/accounts/" + encodeURIComponent(id), { method: "DELETE" });
+    notice("success", name + " disconnected.");
+    await Promise.all([loadAccounts(), loadWebhooks()]);
+  }
+
+  $("accounts-list").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === "connect") { openConnect(); return; }
+    if (action === "reload") { loadAccounts(); return; }
+    const row = btn.closest(".row");
+    if (!row) return;
+    const id = row.dataset.id;
+    btn.disabled = true;
+    try {
+      if (action === "resync") await resync(id);
+      else if (action === "reconnect") await reconnect(id);
+      else if (action === "disconnect") await disconnect(id);
+      else if (action === "hooks") {
+        location.hash = "#webhooks";
+        $("hook-scope").value = id;
+        hookFilter = id;
+        notice("info", "Showing webhooks for " + title(accounts.get(id) || { id }) + ".");
+        renderWebhooks();
+      }
+    } catch (err) {
+      fail(err);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ---- connect flow ----
+
+  function openConnect() {
+    if (!providers.length) { notice("error", "No provider is configured on this deployment."); return; }
+    $("connect-dialog").showModal();
+  }
+  $("connect-btn").addEventListener("click", openConnect);
+
+  $("connect-go").addEventListener("click", async () => {
+    const picked = document.querySelector('#connect-providers input[name=provider]:checked');
+    const go = $("connect-go");
+    go.disabled = true;
+    try {
+      const body = { success_redirect_url: location.origin + location.pathname + "?connected=1" };
+      if (picked) body.provider = picked.value;
+      const data = await api("/api/v1/hosted-auth", { method: "POST", body });
+      location.href = data.url;
+    } catch (e) {
+      fail(e);
+      go.disabled = false;
+    }
+  });
+
+  // ---- webhooks ----
+
+  // The listing is every hook this developer owns, global and account-bound
+  // alike; account_id says which is which, so one call covers both. hookFilter
+  // is the account the table is narrowed to, "" for all of them; it lives out
+  // here so adding or removing a hook while filtered keeps the filter.
+  let hooks = [], hookFilter = "";
+
+  function hookTarget(h) {
+    if (h.kind === "telegram") return "chat " + ((h.telegram || {}).chat_id || "");
+    if (h.kind === "discord") return maskDiscordURL(h.url || "");
+    return h.url || "";
+  }
+
+  function hookScope(h) {
+    if (!h.account_id) return "All accounts";
+    const a = accounts.get(h.account_id);
+    return a ? title(a) : h.account_id;
+  }
+
+  function renderWebhooks() {
+    const host = $("webhooks-list");
+    const shown = hookFilter ? hooks.filter((h) => h.account_id === hookFilter) : hooks;
+    if (!shown.length) {
+      setHTML(host,
+        '<div class="empty"><div class="title">' +
+          (hookFilter ? "No webhooks on this account yet" : "No webhooks yet") + "</div>" +
+        "<p>Point one at your endpoint, a Discord channel or a Telegram chat and every matching event is delivered there.</p>" +
+        '<button class="btn primary" type="button" data-action="add-webhook">Add webhook</button></div>');
+      return;
+    }
+    setHTML(host,
+      '<table class="table"><thead><tr><th>Target</th><th>Scope</th><th>Events</th><th></th></tr></thead><tbody>' +
+      shown.map((h) =>
+        '<tr data-wid="' + esc(h.id) + '">' +
+          "<td><span class=\"badge\">" + esc(h.kind) + "</span> " +
+            (h.name ? "<strong>" + esc(h.name) + "</strong><br>" : "") +
+            '<code style="word-break:break-all">' + esc(hookTarget(h)) + "</code></td>" +
+          "<td>" + esc(hookScope(h)) + "</td>" +
+          '<td class="muted small">' + esc((h.events && h.events.length) ? h.events.join(", ") : "everything") + "</td>" +
+          '<td style="text-align:right"><button class="btn sm danger" type="button" data-action="remove-webhook">Remove</button></td>' +
+        "</tr>").join("") +
+      "</tbody></table>" +
+      (hookFilter ? '<div class="row"><button class="btn sm ghost" type="button" data-action="clear-filter">Show every webhook</button></div>' : ""));
+  }
+
+  async function loadWebhooks() {
+    try {
+      const data = await api("/api/v1/webhooks");
+      hooks = data.items || [];
+      // An account the filter names may have just been disconnected.
+      if (hookFilter && !accounts.has(hookFilter)) hookFilter = "";
+      renderWebhooks();
+    } catch (e) {
+      setHTML($("webhooks-list"),
+        '<div class="empty"><div class="title">Could not load your webhooks</div>' +
+        '<button class="btn" type="button" data-action="reload-webhooks">Try again</button></div>');
+      fail(e);
+    }
+  }
+
+  function fillScopes() {
+    const sel = $("hook-scope");
+    const keep = sel.value;
+    setHTML(sel, '<option value="">All accounts (global)</option>' +
+      [...accounts.values()].map((a) => '<option value="' + esc(a.id) + '">' + esc(title(a)) + "</option>").join(""));
+    if (keep && sel.querySelector('option[value="' + CSS.escape(keep) + '"]')) sel.value = keep;
+  }
+
+  $("webhooks-list").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === "add-webhook") { $("webhook-dialog").showModal(); return; }
+    if (action === "clear-filter") { hookFilter = ""; renderWebhooks(); return; }
+    if (action === "reload-webhooks") { loadWebhooks(); return; }
+    if (action !== "remove-webhook") return;
+    const id = btn.closest("tr").dataset.wid;
+    const hook = hooks.filter((h) => h.id === id)[0] || {};
+    const ok = await um.confirm({
+      title: "Remove this webhook?",
+      body: "Events stop being delivered to " + hookTarget(hook) + " immediately. Anything already queued for retry is dropped.",
+      action: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+      await api("/api/v1/webhooks/" + encodeURIComponent(id), { method: "DELETE" });
+      notice("success", "Webhook removed.");
+      await loadWebhooks();
+    } catch (err) {
+      fail(err);
+      btn.disabled = false;
+    }
+  });
+
+  $("webhook-btn").addEventListener("click", () => $("webhook-dialog").showModal());
+
+  $("hook-kind").addEventListener("change", (e) => {
+    document.querySelectorAll("[data-kind-fields]").forEach((el) => {
+      el.hidden = el.dataset.kindFields !== e.target.value;
+    });
+  });
+
+  $("webhook-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const val = (id) => $(id).value.trim();
+    const kind = $("hook-kind").value;
+    const body = { kind: kind };
+    const name = val("hook-name");
+    if (name) body.name = name;
+    if (kind === "webhook") {
+      body.url = val("hook-url");
+      const secret = val("hook-secret");
+      if (secret) body.secret = secret;
+      if (!body.url) { notice("error", "A webhook needs a URL to POST to."); return; }
+    } else if (kind === "discord") {
+      body.url = val("hook-discord-url");
+      if (!body.url) { notice("error", "Paste the Discord channel's incoming-webhook URL."); return; }
+    } else {
+      body.bot_token = val("hook-bot-token");
+      body.chat_id = val("hook-chat-id");
+      if (!body.bot_token || !body.chat_id) { notice("error", "A Telegram hook needs both a bot token and a chat id."); return; }
+    }
+    const events = [...document.querySelectorAll('#webhook-form input[name=events]:checked')].map((i) => i.value);
+    if (events.length) body.events = events;
+    const scope = $("hook-scope").value;
+    const path = scope ? "/api/v1/accounts/" + encodeURIComponent(scope) + "/webhooks" : "/api/v1/webhooks";
+    const submit = e.target.querySelector('[type=submit]');
+    submit.disabled = true;
+    try {
+      await api(path, { method: "POST", body });
+      $("webhook-dialog").close();
+      $("webhook-form").reset();
+      document.querySelectorAll("[data-kind-fields]").forEach((el) => { el.hidden = el.dataset.kindFields !== "webhook"; });
+      notice("success", "Webhook added.");
+      await loadWebhooks();
+    } catch (err) {
+      fail(err);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  // ---- API keys ----
+
+  function keyRow(k) {
+    const used = k.last_used_at ? "last used " + relTime(k.last_used_at) : "never used";
+    return (
+      '<div class="row" data-kid="' + esc(k.id) + '">' +
+        '<div class="grow">' +
+          '<div class="title">' + esc(k.name || "Unnamed key") + "</div>" +
+          '<div class="sub"><code>' + esc(k.prefix) + "…</code> · created " + esc(relTime(k.created_at)) + " · " + esc(used) + "</div>" +
+        "</div>" +
+        (k.revoked_at
+          ? '<span class="pill">Revoked</span>'
+          : '<div class="actions"><button class="btn sm danger" type="button" data-action="revoke-key">Revoke</button></div>') +
+      "</div>"
+    );
+  }
+
+  async function loadKeys() {
+    try {
+      const data = await api("/api/v1/api-keys");
+      const items = data.items || [];
+      if (!items.length) {
+        setHTML($("keys"),
+          '<div class="empty"><div class="title">No API keys yet</div>' +
+          "<p>A key is how your own backend calls this API without a browser session.</p>" +
+          '<button class="btn primary" type="button" data-action="create-key">Create key</button></div>');
+        return;
+      }
+      setHTML($("keys"), items.map(keyRow).join(""));
+    } catch (e) {
+      setHTML($("keys"),
+        '<div class="empty"><div class="title">Could not load your API keys</div>' +
+        '<button class="btn" type="button" data-action="reload-keys">Try again</button></div>');
+      fail(e);
+    }
+  }
+
+  $("key-btn").addEventListener("click", () => $("key-dialog").showModal());
+
+  $("key-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = $("key-name").value.trim();
+    if (!name) { notice("error", "Give the key a name."); return; }
+    const submit = e.target.querySelector('[type=submit]');
+    submit.disabled = true;
+    try {
+      const k = await api("/api/v1/api-keys", { method: "POST", body: { name: name } });
+      $("key-dialog").close();
+      $("key-name").value = "";
+      $("new-key-value").textContent = k.key;
+      $("new-key").classList.remove("hidden");
+      notice("success", "Key created. Copy it now — it is never shown again.");
+      await loadKeys();
+    } catch (err) {
+      fail(err);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  $("new-key").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-copy]");
+    if (!btn) return;
+    um.copy($("new-key-value").textContent, btn);
+  });
+
+  $("keys").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    if (btn.dataset.action === "create-key") { $("key-dialog").showModal(); return; }
+    if (btn.dataset.action === "reload-keys") { loadKeys(); return; }
+    if (btn.dataset.action !== "revoke-key") return;
+    const row = btn.closest(".row");
+    const ok = await um.confirm({
+      title: "Revoke this key?",
+      body: "Anything still authenticating with it stops working immediately. This cannot be undone.",
+      action: "Revoke",
+      danger: true,
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+      await api("/api/v1/api-keys/" + encodeURIComponent(row.dataset.kid), { method: "DELETE" });
+      notice("success", "Key revoked.");
+      await loadKeys();
+    } catch (err) {
+      fail(err);
+      btn.disabled = false;
+    }
+  });
+
+  // ---- settings ----
+
+  $("password-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submit = e.target.querySelector('[type=submit]');
+    submit.disabled = true;
+    try {
+      await api("/api/v1/me/password", {
+        method: "POST",
+        body: { current_password: $("current-password").value, new_password: $("new-password").value },
+      });
+      $("current-password").value = "";
+      $("new-password").value = "";
+      notice("success", "Password changed. Every other browser has been signed out.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  async function loadRedirectDomains() {
+    try {
+      const me = await api("/api/v1/me");
+      $("redirect-domains").value = (me.redirect_domains || []).join("\n");
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  $("redirect-domains-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submit = e.target.querySelector('[type=submit]');
+    submit.disabled = true;
+    try {
+      const domains = $("redirect-domains").value.split("\n").map((s) => s.trim()).filter(Boolean);
+      const res = await api("/api/v1/me/redirect-domains", { method: "PUT", body: { domains: domains } });
+      $("redirect-domains").value = (res.redirect_domains || []).join("\n");
+      notice("success", domains.length ? "Redirect domains saved." : "Redirect allowlist cleared.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  async function loadRetention() {
+    try {
+      const me = await api("/api/v1/me");
+      $("retention-max-age").value = me.retention_max_age_secs || 0;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  $("retention-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submit = e.target.querySelector('[type=submit]');
+    const secs = parseInt($("retention-max-age").value, 10) || 0;
+    submit.disabled = true;
+    try {
+      const res = await api("/api/v1/me/retention", { method: "PUT", body: { retention_max_age_secs: secs } });
+      $("retention-max-age").value = res.retention_max_age_secs || 0;
+      notice("success", res.retention_max_age_secs
+        ? "Retention saved. Content older than " + res.retention_max_age_secs + "s is now evicted once every webhook accepts it."
+        : "Retention set to keep content forever.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  // ---- dialogs ----
+
+  document.querySelectorAll("dialog").forEach((d) => {
+    d.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => d.close()));
+  });
+
+  // ---- boot ----
+
+  (async function init() {
+    fromHash();
+    if (new URLSearchParams(location.search).get("connected")) {
+      notice("success", "Account connected.");
+      history.replaceState(null, "", location.pathname + location.hash);
+    }
+    await loadProviders();
+    await Promise.all([loadAccounts(), loadWebhooks(), loadKeys(), loadRedirectDomains(), loadRetention()]);
+  })();
+});
+</script>
+{{end}}

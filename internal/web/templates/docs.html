@@ -1,0 +1,374 @@
+{{/* The reference is the one page that renders on both shells. A signed-in
+     developer gets the console chrome (Dashboard / Mail / Chat / Docs and a
+     working Sign out); an anonymous reader — who has no console to go back
+     to — gets the site chrome instead, so the wordmark leads to the homepage
+     and there is a Sign in / Get API key to act on. */}}
+{{define "docs"}}{{if .Shell.Email}}{{template "layout_start" .}}{{template "docs_content" .}}{{template "layout_end" .}}{{else}}{{template "layout_site_start" .}}{{template "docs_content" .}}{{template "layout_site_end" .}}{{end}}{{end}}
+
+{{/* snippet renders one operation three ways. The tabs and the copy button
+     are wired by the page script; with JavaScript off the curl pane — the one
+     that is runnable as written — is still there. */}}
+{{define "snippet"}}<div class="snippet">
+  <div class="tabs sm">
+    <div class="langs" role="group" aria-label="Language">
+      <button type="button" class="lang" aria-pressed="true" data-lang="curl">curl</button>
+      <button type="button" class="lang" aria-pressed="false" data-lang="node">Node</button>
+      <button type="button" class="lang" aria-pressed="false" data-lang="go">Go</button>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn ghost sm" type="button" data-copy>Copy</button>
+  </div>
+  <div class="pane"><pre data-lang="curl">{{.Curl}}</pre><pre data-lang="node" hidden>{{.Node}}</pre><pre data-lang="go" hidden>{{.Go}}</pre></div>
+</div>{{end}}
+
+{{define "docs_content"}}<main class="page docs">
+
+<details class="toc-wrap" open>
+<summary>Contents</summary>
+<nav class="toc" aria-label="Contents">
+  <input id="toc-filter" type="search" placeholder="Filter  /" aria-label="Filter contents" autocomplete="off">
+  <div class="grp"><h2>Start here</h2><ul>
+    <li><a href="#quickstart">Quickstart</a></li>
+    <li><a href="#authentication">Authentication</a></li>
+    <li><a href="#hosted-auth">Hosted auth</a></li>
+  </ul></div>
+  {{range .Groups}}<div class="grp"><h2>{{.Name}}</h2><ul>
+    {{range .Endpoints}}<li data-route="{{.Method}} {{.Path}}"><a href="#{{.Anchor}}" title="{{.Method}} {{.Path}}"><span class="m {{.Method}}">{{.Method}}</span><code>{{.Path}}</code></a></li>
+    {{end}}</ul></div>
+  {{end}}
+  <div class="grp"><h2>Reference</h2><ul>
+    <li><a href="#events">Events</a></li>
+    <li><a href="#delivery">Webhook delivery</a></li>
+    <li><a href="#retention">Message retention</a></li>
+    <li><a href="#errors">Errors</a></li>
+    <li><a href="#limits">Rate limits &amp; idempotency</a></li>
+    <li><a href="#self-hosting">Self-hosting</a></li>
+    <li><a href="#llms">llms.txt</a></li>
+  </ul></div>
+  <p class="none">Nothing matches that.</p>
+</nav>
+</details>
+
+<div class="body">
+
+<h1>Entropix API reference</h1>
+<p class="lede">One REST API for your end users&rsquo; mailboxes and WhatsApp numbers: connect them with hosted auth, receive every message on your webhook, send with one call. Base URL for this deployment: <code>{{.Base}}</code>.</p>
+
+<section id="quickstart">
+<h2>Quickstart</h2>
+<p>Five steps from nothing to a message sent as one of your users.</p>
+<ol class="steps">
+
+<li><b>Create an API key.</b>
+Keys are minted from the dashboard only, so a leaked key cannot mint more keys. Sign in at <a href="/login">/login</a>, then <a href="/dashboard">Dashboard</a> &rarr; New key. The full key is shown exactly once and never stored.
+{{template "snippet" (index .Snippets "key")}}</li>
+
+<li><b>Check it is live.</b>
+<code>GET /api/v1/me</code> is the cheapest call there is: it answers with the developer the credential belongs to and how you authenticated.
+<div class="pane"><pre>curl "{{.Base}}/api/v1/me" -H "Authorization: Bearer $API_KEY"</pre></div></li>
+
+<li><b>Connect an end user.</b>
+Mint a single-use link from your server and send the user to it. Your API key never leaves your server and the user never sees your provider credentials.
+{{template "snippet" (index .Snippets "hosted")}}</li>
+
+<li><b>Receive their messages.</b>
+Register a webhook (at connect time, or with <code>POST /api/v1/webhooks</code>) and we POST every event to it, signed and retried.
+{{template "snippet" (index .Snippets "hook")}}</li>
+
+<li><b>Send.</b>
+One endpoint per surface: <code>POST /api/v1/chats/{chat_id}/messages</code> for chat, <code>POST /api/v1/emails</code> for mail.
+{{template "snippet" (index .Snippets "send")}}</li>
+
+</ol>
+</section>
+
+<section id="authentication">
+<h2>Authentication</h2>
+<p>Every <code>/api/v1</code> call carries an API key:</p>
+<div class="pane"><pre>Authorization: Bearer $API_KEY
+X-API-Key: $API_KEY          # equivalent, for clients that cannot set Authorization</pre></div>
+<p>Keys start with <code>um_</code>. Only a 12-character prefix is stored, so a key you have lost cannot be recovered &mdash; revoke it and create another. A revoked or unknown key is <b>401 <code>unauthorized</code></b>.</p>
+<div class="note"><b>Some endpoints refuse a key on purpose.</b> Creating and revoking keys, changing your password and replacing your redirect-domain allowlist accept a signed-in dashboard session only, and answer <b>403 <code>session_required</code></b> to a bearer token. That is the blast radius of a leaked key: it can read and send on the accounts you already connected, but it cannot mint credentials or widen where your users can be redirected.</div>
+<p>Tenancy is strict. An account, webhook, message or chat belonging to another developer answers <b>404</b>, never 403 &mdash; ids are not enumerable across tenants.</p>
+<p>Mail and chat routes are scoped to exactly one connected account: pass <code>?account_id=acc_…</code>, or <code>account_id</code> in the body where the endpoint documents it. Without one the answer is <b>400 <code>missing_account_id</code></b>.</p>
+</section>
+
+<section id="hosted-auth">
+<h2>Hosted auth</h2>
+<p>You never handle an end user&rsquo;s provider credentials. <code>POST /api/v1/hosted-auth</code> mints a single-use link; you send the user to it; they sign in to Outlook or scan a WhatsApp QR code; we tell your server the new <code>account_id</code>.</p>
+<ol class="steps">
+<li><b>Mint the link</b> from your server, with <code>notify_url</code> set.</li>
+<li><b>Send the user to <code>url</code></b> before <code>expires_at</code> (default 30 minutes). The link is bound to the browser that opens it &mdash; reopening it elsewhere is <b>403 <code>link_browser_mismatch</code></b>.</li>
+<li><b>Read the account id off your <code>notify_url</code></b>, which we POST server-to-server the moment the account connects. Do not depend on the browser completing its redirect; it may never come back.</li>
+</ol>
+<p><code>success_redirect_url</code> and <code>failure_redirect_url</code> must be absolute http(s) URLs whose host is this deployment&rsquo;s own origin or on your redirect-domain allowlist (Dashboard &rarr; Settings &rarr; Redirect domains). Anything else is <b>400 <code>invalid_url</code></b>, which is what stops a stolen key from bouncing your users to somebody else&rsquo;s site.</p>
+<div class="note warn"><b>WhatsApp is a linked device, not the Business API.</b> The user links this service the same way web.whatsapp.com links &mdash; the connect page shows them that, and asks them to accept it, before any QR code appears. They can revoke it from the phone at any time (WhatsApp &rarr; Settings &rarr; Linked devices &rarr; Log out), which flips the account to <code>status: "CREDENTIALS"</code> and emits <code>account_status</code>. Relinking needs a fresh hosted-auth link; pairing the same number again keeps the existing <code>account_id</code>, its webhooks and its stored chats.</div>
+</section>
+
+{{range .Groups}}
+<section>
+<h2>{{.Name}}</h2>
+{{range .Endpoints}}
+<section class="endpoint" id="{{.Anchor}}">
+  <h3><span class="m {{.Method}}">{{.Method}}</span> <code>{{.Path}}</code> <a class="anchor" href="#{{.Anchor}}" aria-label="Link to {{.Method}} {{.Path}}">#</a></h3>
+  <p>{{.Summary}}</p>
+  {{if .Params}}
+  <h4>Parameters</h4>
+  <table class="table">
+    <thead><tr><th>Name</th><th>In</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>{{range .Params}}<tr>
+      <td>{{.Name}}{{if .Required}} <span class="req" title="Required">*</span>{{end}}</td>
+      <td>{{.In}}</td><td>{{.Type}}</td><td>{{.Desc}}</td>
+    </tr>{{end}}</tbody>
+  </table>
+  {{end}}
+  {{if .Request}}
+  <h4>Request body</h4>
+  <div class="pane"><pre>{{.Request}}</pre></div>
+  {{end}}
+  <h4>Response</h4>
+  <div class="pane"><pre>{{.Response}}</pre></div>
+</section>
+{{end}}
+</section>
+{{end}}
+
+<section id="events">
+<h2>Events</h2>
+<p>Every event body carries <code>type</code>, <code>account_id</code>, <code>timestamp</code> and the <code>webhook</code> that produced the delivery, plus one payload field named after the surface. Subscribe with <code>events: ["…"]</code>, or <code>["*"]</code> for all of them.</p>
+
+<h3 id="formats">Delivery formats</h3>
+<p>Each event below lists the hook kinds it reaches &mdash; every one reaches all three. What differs is the shape that arrives. Here is the same <code>chat_received</code> event as each kind receives it:</p>
+<div class="snippet">
+  <div class="tabs sm" role="tablist" aria-label="Delivery format">
+    <button type="button" role="tab" aria-selected="true" data-lang="http">HTTP</button>
+    <button type="button" role="tab" aria-selected="false" data-lang="discord">Discord</button>
+    <button type="button" role="tab" aria-selected="false" data-lang="telegram">Telegram</button>
+    <span class="spacer"></span>
+    <button class="btn ghost sm" type="button" data-copy>Copy</button>
+  </div>
+  <div class="pane">
+    <pre data-lang="http">{{range .Events}}{{if eq .Type "chat_received"}}{{.Sample}}{{end}}{{end}}</pre>
+    <pre data-lang="discord" hidden>POST https://discord.com/api/webhooks/1234567890/AbCdEf
+
+{{.Formats.Discord}}</pre>
+    <pre data-lang="telegram" hidden>POST https://api.telegram.org/bot&lt;bot_token&gt;/sendMessage
+
+{{.Formats.Telegram}}</pre>
+  </div>
+</div>
+<ul>{{range .Formats.Notes}}<li>{{.}}</li>{{end}}</ul>
+
+{{range .Events}}
+<article class="event" id="event-{{.Type}}">
+  <h3><span class="badge">event</span> {{.Type}}</h3>
+  <p>{{.When}}</p>
+  <p class="muted small">Delivered via: {{range $i, $k := .Kinds}}{{if $i}} &middot; {{end}}<code>{{$k}}</code>{{end}}</p>
+  <div class="pane"><pre>{{.Sample}}</pre></div>
+</article>
+{{end}}
+</section>
+
+<section id="delivery">
+<h2>Webhook delivery</h2>
+<p>A <code>kind: "webhook"</code> hook receives the JSON above, with these headers:</p>
+<div class="pane"><pre>X-Outlook-Event: chat_received
+X-Outlook-Delivery: 1                    # attempt number, 1 for a first delivery
+X-Outlook-Signature: sha256=&lt;hex hmac&gt;   # only when the hook has a secret</pre></div>
+<p>Verify the signature over the <b>raw request body</b>, constant-time:</p>
+<div class="pane"><pre>mac := hmac.New(sha256.New, []byte(secret))
+mac.Write(rawBody)
+want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+ok := hmac.Equal([]byte(want), []byte(r.Header.Get("X-Outlook-Signature")))</pre></div>
+<ul>
+<li>Answer <b>2xx within 15&nbsp;s</b>. Anything else &mdash; including a 3xx redirect, which is never followed &mdash; counts as a failure.</li>
+<li>Failures retry on a fixed schedule after the immediate first attempt: <b>30s, 2m, 10m, 30m, 2h, 6h, 12h</b>. After the last one the delivery is marked <code>dead</code> and kept for inspection (<code>DELIVERY_RETENTION_DAYS</code>, default 7).</li>
+<li>Delivery is <b>at-least-once</b>. Dedupe on the message id; <code>X-Outlook-Delivery</code> tells a redelivery from a first attempt.</li>
+<li><code>GET /api/v1/webhooks/{id}/deliveries</code> is the queue: what is waiting, what was abandoned, and why.</li>
+</ul>
+<p>Two other <code>kind</code>s post a short human notification instead of JSON, on the same event filter and the same retry schedule: <code>discord</code> (a <code>discord.com/api/webhooks/…</code> incoming-webhook URL) and <code>telegram</code> (a <code>bot_token</code> from <b>@BotFather</b> plus a <code>chat_id</code>). A Telegram target is checked against Telegram once at registration, so a bad token fails on the create call rather than silently at delivery time.</p>
+</section>
+
+<section id="retention">
+<h2>Message retention</h2>
+<p>By default every message body is kept forever. <code>PUT /api/v1/me/retention</code> (session-only) lowers that per developer: <code>{"retention_max_age_secs": 3600}</code> sets a limit in seconds, and <code>0</code> restores &ldquo;keep forever&rdquo;. Applies to every account you own, mail and chat alike.</p>
+<p>Content is dropped on whichever of these happens first:</p>
+<ul>
+<li><b>Every subscribing webhook has accepted it.</b> The moment the last hook that would have received a message succeeds, its content is deleted immediately &mdash; there is no waiting for the retention window to expire if delivery is already done.</li>
+<li><b>The retention window elapses.</b> An hourly sweep evicts anything older than <code>retention_max_age_secs</code> regardless of delivery state &mdash; a hook that is still retrying, or that was never configured, does not keep content alive past the limit.</li>
+</ul>
+<p>An evicted Email or ChatMessage still exists &mdash; you keep the id, the timestamp and <code>content_evicted: true</code> &mdash; but its content is gone, permanently:</p>
+<ul>
+<li><b>Search stops matching it.</b> <code>GET /api/v1/emails?q=</code> matches your query against <code>subject</code>, <code>snippet</code> and the sender address, all of which eviction blanks. An evicted email simply drops out of search results as it ages out, with no error to tell you why.</li>
+<li><b>There is no undo, and for WhatsApp there is no fallback.</b> Eviction is permanent for every provider. For WhatsApp specifically there is no history API to re-fetch a message from afterward, so once this service's copy is evicted, your own webhook endpoint's copy (if a delivery ever succeeded) is the only one that still exists anywhere.</li>
+<li><b>A WhatsApp edit to an already-evicted message is ignored.</b> If an edit arrives for a message whose content has already been evicted, the edit is dropped rather than reviving or partially restoring the row.</li>
+<li><b>For chat, only the message text is removed &mdash; not who was in the conversation.</b> Attendees are address-book state, stored independently of message content, and retention never touches them. A chat whose every message has been evicted still lists the same participants.</li>
+</ul>
+</section>
+
+<section id="errors">
+<h2>Errors</h2>
+<p>Every error is the same shape, whatever produced it:</p>
+<div class="pane"><pre>{
+  "error": { "code": "missing_account_id", "message": "account_id is required" }
+}</pre></div>
+<p>Branch on <code>code</code>, never on <code>message</code> &mdash; the wording may improve, the code will not change.</p>
+<table class="table errors">
+  <thead><tr><th>Code</th><th>Status</th><th>What to do</th></tr></thead>
+  <tbody>{{range .Errors}}<tr><td>{{.Code}}</td><td>{{.Status}}</td><td>{{.Fix}}</td></tr>{{end}}</tbody>
+</table>
+</section>
+
+<section id="limits">
+<h2>Rate limits &amp; idempotency</h2>
+<p><b>There is no rate limiting here.</b> This service does not throttle callers, and it does not cap how many API keys, webhooks or connect links one developer creates. That is deliberate but it is not a licence: put a gateway or reverse proxy in front of a public deployment and enforce your limits there. Nothing in the API will slow you down before your provider does.</p>
+<p>What is capped is size, not rate: a request body is <b>64&nbsp;KB</b> on ordinary routes and <b>8&nbsp;MB</b> on the mail-send family (<code>emails</code>, <code>reply</code>, <code>forward</code>, <code>drafts</code>), over which is <b>413 <code>body_too_large</code></b>; attachments total at most <b>3&nbsp;MB</b> decoded, over which is <b>400 <code>attachment_too_large</code></b>.</p>
+
+<h3>Idempotency-Key</h3>
+<p>Every chat write &mdash; send, edit, delete, react and start-a-chat &mdash; honours an <code>Idempotency-Key</code> header. It is any unique string you choose, one per logical operation:</p>
+<div class="pane"><pre>Idempotency-Key: 8f14e45f-ea0d-4b3a-9c2f-1d5a7b03e9c4</pre></div>
+<ul>
+<li><b>Same key, same body</b> &rarr; the first response is replayed. The message is not sent twice. This is the whole point: a network timeout on a send tells you nothing about whether it arrived, and retrying without a key is how a user gets the same message twice.</li>
+<li><b>Same key, different body</b> &rarr; <b>409 <code>idempotency_conflict</code></b>. That is a client bug &mdash; a reused key means two different operations were given the same identity &mdash; so it is refused rather than guessed at.</li>
+<li><b>Same key while the first request is still running</b> &rarr; also <b>409 <code>idempotency_conflict</code></b>. Wait for the first to answer rather than racing it.</li>
+<li>Keys are scoped per developer and per operation (method, path, account and body), so the same key on two different endpoints does not collide.</li>
+</ul>
+<p>It is optional everywhere and worth setting on anything you would retry. Mail sends are not idempotency-keyed; dedupe those on your side if you retry them.</p>
+</section>
+
+<section id="self-hosting">
+<h2>Self-hosting</h2>
+<p>Entropix is one static Go binary with its UI embedded &mdash; no build step, no asset pipeline, no sidecar. It stores everything in SQLite by default and speaks Postgres when you point it at one. <code>GET /healthz</code> is the readiness probe.</p>
+<div class="note warn">If you enable WhatsApp, note that the linked-device keys live in this service&rsquo;s own database <b>unsealed</b> &mdash; unlike OAuth refresh tokens, which are AES-256-GCM sealed before they touch disk. Anyone who can read the database file can impersonate a linked device, so run it behind disk-level encryption.</div>
+</section>
+
+<section id="llms">
+<h2>llms.txt</h2>
+<p>Building with an AI assistant? Give it <a href="/llms.txt"><code>/llms.txt</code></a> &mdash; this same reference as exact, machine-readable Markdown, generated from the same route table, so it cannot drift from what the server serves.</p>
+</section>
+
+</div>
+
+<aside class="rail" aria-label="At a glance">
+  <div class="card"><div class="card-body">
+    <h2>Base URL</h2>
+    <div class="pane"><pre>{{.Base}}</pre></div>
+    <h2 style="margin-top:var(--s3)">Auth</h2>
+    <div class="pane"><pre>Authorization: Bearer $API_KEY</pre></div>
+  </div></div>
+  <div class="card"><div class="card-body">
+    <h2>Events</h2>
+    <ul>{{range .Events}}<li><a href="#event-{{.Type}}">{{.Type}}</a></li>{{end}}</ul>
+  </div></div>
+  <div class="card"><div class="card-body">
+    <h2>Elsewhere</h2>
+    <p style="margin:0"><a href="/llms.txt">llms.txt</a> · <a href="/dashboard">Dashboard</a> · <a href="/">Product</a></p>
+  </div></div>
+</aside>
+
+</main>
+
+<script>
+// app.js is deferred, so window.um does not exist while this script is being
+// parsed and #notice (in layout_end) is not in the DOM yet. Everything below
+// therefore waits for DOMContentLoaded, which fires only after every deferred
+// script has run.
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+
+  // --- snippet tabs: one visible pane per block ---
+  document.querySelectorAll(".snippet").forEach(function (block) {
+    var tabs = [].slice.call(block.querySelectorAll(".langs .lang"));
+    var panes = [].slice.call(block.querySelectorAll("pre[data-lang]"));
+    function show(lang) {
+      tabs.forEach(function (t) { t.setAttribute("aria-pressed", String(t.dataset.lang === lang)); });
+      panes.forEach(function (p) { p.hidden = p.dataset.lang !== lang; });
+    }
+    tabs.forEach(function (t, i) {
+      t.addEventListener("click", function () { show(t.dataset.lang); });
+      t.addEventListener("keydown", function (e) {
+        var d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+        if (!d) return;
+        e.preventDefault();
+        var next = tabs[(i + d + tabs.length) % tabs.length];
+        next.focus(); show(next.dataset.lang);
+      });
+    });
+  });
+
+  // --- copy: whatever pane is actually on screen ---
+  document.querySelectorAll(".pane").forEach(function (pane) {
+    if (pane.closest(".snippet")) return; // those get the button in their tab row
+    var b = document.createElement("button");
+    b.type = "button"; b.className = "btn ghost sm copy"; b.textContent = "Copy";
+    b.setAttribute("data-copy", "");
+    pane.appendChild(b);
+  });
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-copy]");
+    if (!btn) return;
+    var scope = btn.closest(".snippet") || btn.closest(".pane");
+    var pre = scope && [].slice.call(scope.querySelectorAll("pre")).find(function (p) { return !p.hidden; });
+    // um comes from the deferred app.js; guard it so a copy click cannot
+    // throw on a page where that script failed to load.
+    if (pre && window.um) window.um.copy(pre.textContent, btn);
+  });
+
+  // --- contents: filter, current section, "/" to focus ---
+  var nav = document.querySelector("nav.toc"), filter = document.getElementById("toc-filter");
+  var wrap = document.querySelector(".toc-wrap");
+  // Above 48rem docs.css hides the <summary>, so a <details> left closed by a
+  // narrow layout would be unreachable after a resize. Track the breakpoint
+  // instead of reading it once at load.
+  var narrow = window.matchMedia("(max-width:48rem)");
+  var sync = function (mq) { wrap.open = !mq.matches; };
+  sync(narrow);
+  narrow.addEventListener("change", sync);
+
+  filter.addEventListener("input", function () {
+    var q = filter.value.trim().toLowerCase();
+    var any = false;
+    nav.querySelectorAll(".grp").forEach(function (g) {
+      var shown = 0;
+      g.querySelectorAll("li").forEach(function (li) {
+        var hay = ((li.dataset.route || "") + " " + li.textContent).toLowerCase();
+        var hit = !q || hay.indexOf(q) >= 0;
+        li.hidden = !hit;
+        if (hit) shown++;
+      });
+      g.hidden = shown === 0;
+      if (shown) any = true;
+    });
+    nav.classList.toggle("empty", !any);
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
+    var t = document.activeElement;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    e.preventDefault();
+    wrap.open = true;
+    filter.focus(); filter.select();
+  });
+
+  var links = {};
+  nav.querySelectorAll("a[href^='#']").forEach(function (a) { links[a.getAttribute("href").slice(1)] = a; });
+  var targets = Object.keys(links).map(function (id) { return document.getElementById(id); }).filter(Boolean);
+  if (targets.length && "IntersectionObserver" in window) {
+    var visible = new Set(), current = null;
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) { en.isIntersecting ? visible.add(en.target.id) : visible.delete(en.target.id); });
+      // The first target in document order that is on screen is the one the
+      // reader is in; without that ordering the highlight jumps around as
+      // entries arrive in observer order rather than page order.
+      var first = targets.find(function (t) { return visible.has(t.id); });
+      if (!first || first.id === current) return;
+      if (current && links[current]) links[current].removeAttribute("aria-current");
+      current = first.id;
+      links[current].setAttribute("aria-current", "true");
+    }, { rootMargin: "-60px 0px -70% 0px" });
+    targets.forEach(function (t) { io.observe(t); });
+  }
+});
+</script>
+{{end}}

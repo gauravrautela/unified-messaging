@@ -247,7 +247,11 @@ func (s *Server) complete(ctx context.Context, mailbox provider.Mailbox, e *mode
 			}
 		}
 	}
-	if e.HasAttachments && len(e.Attachments) == 0 {
+	// An evicted message has no attachment metadata by policy. Without this
+	// the lazy cache-fill would fetch the filenames from the provider and put
+	// them on the response — the store write is already refused, but the
+	// response would still hand back what the tenant asked us to forget.
+	if e.HasAttachments && len(e.Attachments) == 0 && !e.ContentEvicted {
 		atts, err := mailbox.ListAttachments(ctx, e.AccountID, e.ID)
 		if err != nil {
 			s.log.Warn("listing attachments", "account_id", e.AccountID, "email_id", e.ID, "err", err)

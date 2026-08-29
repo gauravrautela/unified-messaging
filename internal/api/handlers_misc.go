@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,8 +17,110 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/notify"
+	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
+	"github.com/gauravrautela/unified-messaging/internal/web"
+	"github.com/gauravrautela/unified-messaging/internal/web/docs"
 )
+
+// renderPage executes the named web template into a buffer before writing
+// anything to w, so a template error (a typo'd field, a page added to
+// Templates() without every layout it needs) becomes a clean 500 instead of
+// a 200 whose body silently cuts off mid-render. Every HTML page in the
+// server goes through here rather than writing headers and executing a
+// template by hand.
+//
+// status is a parameter because not every page is a 200: an auth form
+// re-renders under 400/401/403/500 and a connect result under 404/410, and
+// "this link expired" must not answer OK. Anything the handler wants on the
+// response (Cache-Control, Vary) must be set before the call — the buffer is
+// only written out once the template has succeeded.
+func (s *Server) renderPage(w http.ResponseWriter, status int, name string, data any) {
+	var buf bytes.Buffer
+	if err := web.Templates().ExecuteTemplate(&buf, name, data); err != nil {
+		s.log.Error("render page", "page", name, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = buf.WriteTo(w)
+}
+
+// siteProvider is one card in the website's providers section. It is built
+// from the registry rather than hardcoded, so a deployment that enables a
+// different provider set advertises exactly what it can actually connect.
+type siteProvider struct {
+	Name string   // provider.DisplayName, e.g. "Outlook"
+	Kind string   // "mail" or "chat"
+	Caps []string // what this kind of account supports
+	Note string   // one-sentence caveat, "" for most providers
+}
+
+// mailCaps and chatCaps are what an account of each kind can do. They are
+// per-kind rather than per-provider because that is the honest granularity
+// today: every mail provider goes through the same Mailer/Folderer surface
+// and every chat provider through the same Chatter surface.
+var (
+	mailCaps = []string{"Read", "Send", "Folders", "Webhooks"}
+	chatCaps = []string{"Receive", "Send", "Reactions", "Edit", "Delete", "Webhooks"}
+)
+
+// providerNotes carries the caveats a developer needs before they build on a
+// provider. WhatsApp's is not optional: it is a linked-device integration,
+// not a Business API one, and saying so on the marketing page is cheaper for
+// everyone than saying it after someone's number is banned.
+var providerNotes = map[string]string{
+	"WHATSAPP": "Connects as a linked device on a real WhatsApp account — no Business API review, but automated sending carries a genuine risk of Meta banning the number.",
+}
+
+// siteProviders maps the registry onto the website's provider cards.
+func (s *Server) siteProviders() []siteProvider {
+	names := s.registry.Names()
+	out := make([]siteProvider, 0, len(names))
+	for _, n := range names {
+		p, err := s.registry.Get(n)
+		if err != nil {
+			continue
+		}
+		caps := mailCaps
+		if p.Kind() == model.AccountKindChat {
+			caps = chatCaps
+		}
+		out = append(out, siteProvider{
+			Name: provider.DisplayName(n), Kind: p.Kind(), Caps: caps, Note: providerNotes[n],
+		})
+	}
+	return out
+}
+
+// handleSite is the public product website. It is the only page that
+// renders for both anonymous and signed-in visitors on the same route.
+//
+// The snippets it shows are the same Go values the reference at /docs
+// renders, which is the point of them being shared: a curl line that works
+// on the marketing page and a different one in the docs would be worse than
+// having no marketing page at all.
+func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
+	email := ""
+	if dev, ok := s.sessionDeveloper(w, r); ok {
+		email = dev.Email
+		// Signed in, the homepage names the developer and swaps the CTAs for
+		// a Dashboard link, so it is no longer one document a shared cache
+		// may hand to the next visitor.
+		markSessionVaried(w)
+	}
+	// Title is left blank: layout_head renders a bare "Entropix" title when
+	// Title is empty, rather than the homepage repeating the name twice.
+	s.renderPage(w, http.StatusOK, "site", map[string]any{
+		"Shell":     web.Shell{Version: web.Version, Email: email, Styles: []string{"site.css"}},
+		"Providers": s.siteProviders(),
+		"Events":    docs.Events,
+		"Send":      docs.SendMessage,
+		"Connect":   docs.HostedAuth,
+		"Receive":   docs.WebhookPayload,
+	})
+}
 
 // ---- accounts ----
 

@@ -26,6 +26,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
 	"github.com/gauravrautela/unified-messaging/internal/syncer"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
 type Server struct {
@@ -86,6 +87,7 @@ var apiRoutes = []string{
 	"GET /api/v1/me",
 	"POST /api/v1/me/password",
 	"PUT /api/v1/me/redirect-domains",
+	"PUT /api/v1/me/retention",
 	"GET /api/v1/api-keys",
 	"POST /api/v1/api-keys",
 	"DELETE /api/v1/api-keys/{id}",
@@ -136,6 +138,9 @@ var apiRoutes = []string{
 // without being added here fails that test.
 var browserRoutes = []string{
 	"GET /healthz",
+
+	"GET /{$}",
+	"GET /static/",
 
 	"GET /connect/{state}",
 	"POST /connect/{state}/consent",
@@ -198,6 +203,10 @@ func (s *Server) browserHandlers() map[string]http.HandlerFunc {
 			writeJSON(w, status, body)
 		},
 
+		// --- public product website + embedded static assets ---
+		"GET /{$}":     s.handleSite,
+		"GET /static/": web.Static().ServeHTTP,
+
 		// --- connection flow (browser-facing; no API key) ---
 		"GET /connect/{state}":          s.handleConnectRedirect,
 		"POST /connect/{state}/consent": s.handleConsent,
@@ -250,6 +259,7 @@ func (s *Server) Routes() http.Handler {
 		"GET /api/v1/me":                  s.handleMe,
 		"POST /api/v1/me/password":        s.handleChangePassword,
 		"PUT /api/v1/me/redirect-domains": s.handleSetRedirectDomains,
+		"PUT /api/v1/me/retention":        s.handleSetRetention,
 		"GET /api/v1/api-keys":            s.handleListAPIKeys,
 		"POST /api/v1/api-keys":           s.handleCreateAPIKey,
 		"DELETE /api/v1/api-keys/{id}":    s.handleRevokeAPIKey,

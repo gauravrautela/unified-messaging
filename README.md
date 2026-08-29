@@ -46,10 +46,11 @@ internal/
 | **Providers** | Contract-driven registry; a mail backend supplies an `Authenticator` and a `Mailbox`, optionally a `Pusher`; a chat backend supplies a `Linker` and a `Chatter` |
 | **Connect (mail)** | Auth-code + PKCE flow, single-use connect links, `notify_url` callback, silent token refresh, reconnect detection |
 | **Connect (chat)** | Disclosure + explicit consent, QR pairing (whatsmeow), single-use connect links, same `notify_url` callback shape as mail |
-| **Read** | List/get emails, threads, folders (well-known roles), attachments, search, paging; list/get chats, messages, attendees — all served from the local store |
+| **Read** | List/get emails, threads, folders (well-known roles), attachments, search, paging; list/get chats, messages, attendees — all served from the local store. A message whose content has been evicted by the retention policy still lists, with `content_evicted: true` and an otherwise-empty body/subject/sender — search no longer matches it, since search runs over those same fields |
 | **Write** | Mail: send, **reply and reply-all in-thread**, forward, drafts, attachments, mark read/flagged. Chat: send, start a chat, edit, delete, react, mark read — with idempotent retries via `Idempotency-Key` |
 | **Sync** | Mail: bounded backfill, per-scope incremental cursors, push subscriptions with auto-renewal, polling as the safety net. Chat: one persistent socket per linked account with reconnect/backoff, capped account count |
-| **Events** | Mail: `mail_received`, `mail_sent`, `mail_updated`, `mail_deleted`. Chat: `chat_received`, `chat_sent`, `chat_updated`, `chat_reaction`, `chat_deleted`. Both: `account_status` — HMAC-signed, retried |
+| **Events** | Mail: `mail_received`, `mail_sent`, `mail_updated`, `mail_deleted`. Chat: `chat_received`, `chat_sent`, `chat_updated`, `chat_reaction`, `chat_deleted`. Both: `account_status` — HMAC-signed, retried. Message content is evicted the moment every subscribing webhook for it has accepted delivery |
+| **Retention** | Per-developer message-content retention, off by default: `PUT /api/v1/me/retention` (dashboard or API, session-only) sets a max age in seconds, `0` keeps content forever. Content is deleted once every subscribing webhook accepts it, and in no case kept past the configured age — permanently, with no recovery; for WhatsApp there is no history API to re-fetch a lost message from |
 
 Not included: calendar, contacts, open/click tracking, folder management, and
 any provider other than Outlook and WhatsApp. WhatsApp is text-only (no

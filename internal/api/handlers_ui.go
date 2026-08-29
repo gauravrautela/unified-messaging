@@ -1,66 +1,103 @@
 package api
 
 import (
-	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
+
+	"github.com/gauravrautela/unified-messaging/internal/model"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
 // This file holds the two screens a human being actually looks at.
 //
 // The landing page is end-user facing: it appears once, mid-OAuth, and has no
 // login of its own — its only authority is the single-use state token already
-// embedded in its URL. The dashboard is operator/developer facing: it requires
-// a signed-in browser session (the um_session cookie), and its own fetches
-// ride that same cookie, so account data stays gated by the API middleware.
+// embedded in its URL. It renders through the public layout (no nav, no
+// session), so an end user of somebody else's app sees a page that belongs to
+// the same product as the rest of it. The dashboard is operator/developer
+// facing: it requires a signed-in browser session (the um_session cookie), its
+// markup lives with the rest of the console in internal/web/templates, and its
+// own fetches ride that same cookie, so account data stays gated by the API
+// middleware.
 //
 // Both are plain html/template + vanilla JS. No build step, no framework, no
 // external assets — this ships inside the Go binary.
 
-// ---------- landing page ----------
+// ---------- hosted-auth landing page ----------
 
-type landingData struct {
-	Provider     string
-	AuthorizeURL string
+// scopeText turns a provider's scope vocabulary into a sentence the person
+// clicking Continue can actually act on. A scope string is an identifier the
+// provider chose for its own API surface, not copy: "Mail.ReadWrite" tells an
+// end user nothing about what an app is asking to do to their mailbox.
+//
+// It is keyed on the bare scope name, so a fully-qualified scope
+// ("https://graph.microsoft.com/Mail.Read") resolves through the same entry
+// as its short form — see scopeSentences.
+var scopeText = map[string]string{
+	"Mail.Read":      "Read your mail",
+	"Mail.ReadWrite": "Read, move and mark your mail",
+	"Mail.Send":      "Send mail as you",
+	"User.Read":      "See your name and email address",
+	"openid":         "See your name and email address",
+	"profile":        "See your name and email address",
+	"email":          "See your name and email address",
+	"offline_access": "Stay connected without asking again",
 }
 
-var landingTmpl = template.Must(template.New("landing").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect your {{.Provider}} account</title>
-<style>
-:root{--bg:#f7f7f8;--card:#fff;--text:#1a1a1a;--muted:#6b6b76;--border:#e6e6ea;--accent:#2563eb;--accent-text:#fff}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--text:#f0f0f2;--muted:#9a9aa5;--border:#2a2d36;--accent:#3b82f6;--accent-text:#fff}}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-  background:var(--bg);color:var(--text);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:1.5rem}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem 2rem;
-  max-width:26rem;width:100%;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-.badge{width:56px;height:56px;border-radius:14px;background:var(--accent);color:var(--accent-text);
-  display:flex;align-items:center;justify-content:center;margin:0 auto 1.25rem;font-size:1.5rem;font-weight:600}
-h1{font-size:1.25rem;margin:0 0 .5rem}
-p{color:var(--muted);margin:0 0 1.75rem;font-size:.95rem}
-.btn{display:inline-block;width:100%;padding:.75rem 1rem;border-radius:10px;background:var(--accent);
-  color:var(--accent-text);text-decoration:none;font-weight:600;font-size:.95rem}
-.btn:hover{opacity:.92}
-.fine{margin-top:1.25rem;font-size:.8rem;color:var(--muted)}
-</style></head>
-<body>
-  <div class="card">
-    <div class="badge">{{slice .Provider 0 1}}</div>
-    <h1>Connect your {{.Provider}} account</h1>
-    <p>You'll sign in on Microsoft's own page and choose what to share. We never see your password.</p>
-    <a class="btn" href="{{.AuthorizeURL}}">Continue with {{.Provider}}</a>
-    <p class="fine">You can disconnect this at any time.</p>
-  </div>
-</body></html>`))
+// scopeSentences renders scopes for the landing page: known scopes as
+// sentences, unknown ones verbatim rather than silently dropped — an end user
+// consenting to something we have no copy for should still see that it is
+// being asked for. Duplicates collapse, because several scopes routinely map
+// to the same sentence (openid/profile/User.Read all mean "who you are").
+func scopeSentences(scopes []string) []string {
+	out := make([]string, 0, len(scopes))
+	seen := make(map[string]bool, len(scopes))
+	for _, raw := range scopes {
+		name := raw
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		text, ok := scopeText[name]
+		if !ok {
+			text = raw
+		}
+		if seen[text] {
+			continue
+		}
+		seen[text] = true
+		out = append(out, text)
+	}
+	return out
+}
 
-func renderLanding(w http.ResponseWriter, d landingData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_ = landingTmpl.Execute(w, d)
+// renderConnectOAuth is the branded confirmation screen an end user sees
+// before being handed to the provider's own consent page. cancel is the
+// developer's failure redirect when they supplied one; with no such URL there
+// is nowhere honest to send someone who changed their mind, so the page says
+// so instead of offering a button that goes nowhere.
+func (s *Server) renderConnectOAuth(w http.ResponseWriter, display, authorizeURL, cancel string) {
+	s.renderPage(w, http.StatusOK, "connect_oauth", map[string]any{
+		"Shell":        web.Shell{Title: "Connect " + display, Version: web.Version, Styles: []string{"connect.css"}},
+		"Provider":     display,
+		"AuthorizeURL": authorizeURL,
+		"Scopes":       scopeSentences(s.cfg.Scopes),
+		"CancelURL":    cancel,
+	})
 }
 
 // ---------- dashboard ----------
+
+// webhookEvents is every event a hook can subscribe to, in the order the
+// dashboard's picker lists them: mail first, then chat, then the lifecycle
+// event. It is rendered into the page from these constants rather than
+// hard-coded in JavaScript, so adding an event name in internal/model is all
+// it takes for the picker to offer it.
+var webhookEvents = []string{
+	model.EventMailReceived, model.EventMailSent, model.EventMailUpdated, model.EventMailDeleted,
+	model.EventChatReceived, model.EventChatSent, model.EventChatUpdated, model.EventChatReaction, model.EventChatDeleted,
+	model.EventAccountError,
+}
 
 // handleDashboard requires a browser session. The page's own fetches then
 // ride the same cookie, so account data stays gated by the API middleware.
@@ -70,508 +107,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}
-	// The token has to be minted before anything is written, and the logout
-	// form below carries it as a hidden field.
+	// The token has to be minted before anything is written, and the layout's
+	// logout form carries it as a hidden field.
 	csrf := s.csrfToken(w, r)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_ = dashboardTmpl.Execute(w, struct{ Email, CSRF string }{dev.Email, csrf})
+	s.renderPage(w, http.StatusOK, "dashboard", map[string]any{
+		"Shell":               web.Shell{Title: "Dashboard", Version: web.Version, Email: dev.Email, CSRF: csrf, Nav: "dashboard"},
+		"Events":              webhookEvents,
+		"RetentionMaxAgeSecs": dev.RetentionMaxAgeSecs,
+	})
 }
-
-var dashboardTmpl = template.Must(template.New("dashboard").Parse(dashboardHTML))
-
-const dashboardHTML = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connected accounts</title>
-<style>
-:root{--bg:#f7f7f8;--card:#fff;--text:#1a1a1a;--muted:#6b6b76;--border:#e6e6ea;--accent:#2563eb;--accent-text:#fff;
-  --ok:#16a34a;--warn:#d97706;--danger:#dc2626;--danger-bg:#fef2f2}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--text:#f0f0f2;--muted:#9a9aa5;--border:#2a2d36;
-  --accent:#3b82f6;--accent-text:#fff;--ok:#4ade80;--warn:#fbbf24;--danger:#f87171;--danger-bg:#2a1418}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-.wrap{max-width:44rem;margin:0 auto;padding:2.5rem 1.5rem}
-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;gap:1rem;flex-wrap:wrap}
-h1{font-size:1.35rem;margin:0}
-.sub{color:var(--muted);font-size:.85rem;margin-top:.15rem}
-button,.btn{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--text);
-  padding:.5rem .9rem;border-radius:8px;text-decoration:none;font-size:.85rem}
-button:hover{border-color:var(--accent)}
-.primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
-.primary:hover{opacity:.92}
-.danger{color:var(--danger)}
-input{font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--card);
-  color:var(--text);width:100%}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.25rem}
-.row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;padding:.9rem 0;border-bottom:1px solid var(--border)}
-.row:last-child{border-bottom:none}
-.who{min-width:0}
-.email{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.meta{color:var(--muted);font-size:.8rem;margin-top:.15rem}
-.status{display:inline-flex;align-items:center;gap:.4rem;font-size:.8rem;font-weight:600;padding:.2rem .55rem;border-radius:999px}
-.status.ok{color:var(--ok);background:color-mix(in srgb, var(--ok) 15%, transparent)}
-.status.bad{color:var(--warn);background:color-mix(in srgb, var(--warn) 15%, transparent)}
-.kind{display:inline-block;font-size:.7rem;font-weight:600;text-transform:uppercase;color:var(--muted);
-  border:1px solid var(--border);border-radius:6px;padding:.05rem .35rem;margin-right:.4rem}
-.row-msg{flex-basis:100%;font-size:.8rem;color:var(--muted);margin-top:.3rem}
-.actions{display:flex;gap:.4rem;flex-shrink:0}
-.hook{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin-top:.6rem;
-  padding-top:.6rem;border-top:1px dashed var(--border);font-size:.8rem;color:var(--muted)}
-.hook code{color:var(--text);word-break:break-all}
-.hook input{font:inherit;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;
-  background:var(--bg);color:var(--text);min-width:0}
-.hook input[name=url]{flex:1 1 14rem}
-.hook input[name=secret]{flex:0 1 9rem}
-.hook button{padding:.35rem .7rem;font-size:.8rem}
-.empty{color:var(--muted);text-align:center;padding:3rem 1rem;font-size:.9rem}
-.err{color:var(--danger);background:var(--danger-bg);border-radius:8px;padding:.6rem .8rem;font-size:.85rem;margin-bottom:1rem}
-.hidden{display:none}
-.signout{font-size:.8rem;color:var(--muted);background:none;border:none;padding:0;text-decoration:underline}
-</style></head>
-<body>
-<div class="wrap">
-
-  <div id="app">
-    <header>
-      <div>
-        <h1>Connected accounts</h1>
-        <div class="sub" id="provider-line"></div>
-      </div>
-      <div style="display:flex;gap:.75rem;align-items:center">
-        <span class="sub">{{.Email}}</span>
-        <select id="provider" class="hidden"></select>
-        <button id="connect-btn" class="primary">+ Connect account</button>
-        <a class="btn" href="/docs">API docs</a>
-        <form id="logout-form" method="post" action="/logout" style="margin:0"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="signout" type="submit">Log out</button></form>
-      </div>
-    </header>
-    <p id="banner" class="err hidden" style="color:var(--ok);background:color-mix(in srgb, var(--ok) 12%, transparent)"></p>
-    <p id="list-err" class="err hidden"></p>
-    <div class="card">
-      <div id="list"></div>
-    </div>
-
-    <h2 style="font-size:1.05rem;margin:2rem 0 .5rem">API keys</h2>
-    <p class="sub" style="margin-bottom:.75rem">Use a key as <code>Authorization: Bearer &lt;key&gt;</code>. Keys are shown once.</p>
-    <div class="card">
-      <div id="new-key" class="hidden" style="margin-bottom:1rem">
-        <p class="sub">Copy this key now — it will not be shown again.</p>
-        <code id="new-key-value" style="display:block;padding:.6rem;border:1px dashed var(--border);border-radius:8px;word-break:break-all"></code>
-      </div>
-      <form id="key-form" style="display:flex;gap:.5rem;margin-bottom:1rem">
-        <input id="key-name" placeholder="Key name, e.g. production" required style="flex:1;font:inherit;padding:.5rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)">
-        <button class="primary" data-action="create-key" type="submit">Create key</button>
-      </form>
-      <div id="keys"></div>
-    </div>
-
-    <h2 style="font-size:1.05rem;margin:2rem 0 .5rem">Password</h2>
-    <p class="sub" style="margin-bottom:.75rem">Changing your password signs you out of every other browser.</p>
-    <div class="card">
-      <form id="password-form" style="display:flex;flex-direction:column;gap:.5rem;max-width:22rem">
-        <input id="current-password" type="password" autocomplete="current-password" placeholder="Current password" required>
-        <input id="new-password" type="password" autocomplete="new-password" minlength="10" placeholder="New password (10+ characters)" required>
-        <button class="primary" type="submit" style="align-self:flex-start">Change password</button>
-      </form>
-      <p id="password-msg" class="sub hidden" style="margin-top:.75rem"></p>
-    </div>
-
-    <h2 style="font-size:1.05rem;margin:2rem 0 .5rem">Settings</h2>
-    <p class="sub" style="margin-bottom:.75rem">Hosted-auth success/failure redirect URLs must land on one of these domains (one per line). Use <code>*.example.com</code> to cover every subdomain.</p>
-    <div class="card">
-      <form id="redirect-domains-form" style="display:flex;flex-direction:column;gap:.5rem;max-width:26rem">
-        <textarea id="redirect-domains" rows="4" placeholder="app.example.com&#10;*.example.com" style="font:inherit;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text);resize:vertical"></textarea>
-        <button class="primary" type="submit" style="align-self:flex-start">Save</button>
-      </form>
-      <p id="redirect-domains-msg" class="sub hidden" style="margin-top:.75rem"></p>
-    </div>
-  </div>
-
-</div>
-
-<script>
-const $ = (id) => document.getElementById(id);
-
-async function api(path, opts) {
-  const res = await fetch(path, Object.assign({ credentials: "same-origin" }, opts));
-  if (res.status === 401) { location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search); throw new Error("unauthorized"); }
-  if (!res.ok) {
-    let msg = res.statusText;
-    try { msg = (await res.json()).error.message; } catch (e) {}
-    throw new Error(msg);
-  }
-  if (res.status === 204) return null;
-  return res.json();
-}
-
-function statusBadge(status) {
-  const ok = status === "OK";
-  return '<span class="status ' + (ok ? "ok" : "bad") + '">' + (ok ? "Connected" : "Needs reconnect") + "</span>";
-}
-
-function fmtTime(iso) {
-  if (!iso) return "never synced";
-  const d = new Date(iso);
-  return "synced " + d.toLocaleString();
-}
-
-async function loadProviders() {
-  const data = await api("/api/v1/providers");
-  const items = data.items || [];
-  const names = items.map((p) => p.name.charAt(0) + p.name.slice(1).toLowerCase());
-  $("provider-line").textContent = names.length
-    ? "Providers: " + names.join(", ")
-    : "No providers configured";
-  const sel = $("provider");
-  sel.innerHTML = items.map((p) =>
-    '<option value="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + " (" + escapeHtml(p.kind) + ")</option>"
-  ).join("");
-  // A single provider still gets the element (a hidden <select> with one
-  // option), so the connect flow always has somewhere to read the choice
-  // from; only more than one option makes the picker worth showing.
-  sel.classList.toggle("hidden", items.length <= 1);
-}
-
-// Keeps the country code plus the first two and last three digits of a phone
-// number, masking the rest — e.g. "+91 88••• •855". This never leaves the
-// browser: the server-side account JSON keeps the real identifier, and this
-// function's whole job is making sure the page never shows it in full.
-function maskPhone(p) {
-  if (!p) return "";
-  const s = String(p);
-  const m = /^(\+\d{1,3})(\d+)$/.exec(s.replace(/[^\d+]/g, ""));
-  if (!m || m[2].length < 5) {
-    const n = s.length;
-    if (n <= 4) return s;
-    const keep = Math.max(1, Math.floor(n / 4));
-    return s.slice(0, keep) + "•".repeat(Math.max(3, n - keep * 2)) + s.slice(n - keep);
-  }
-  const cc = m[1], rest = m[2];
-  const first2 = rest.slice(0, 2), last3 = rest.slice(-3);
-  const midLen = Math.min(3, Math.max(1, rest.length - 5));
-  return cc + " " + first2 + "•".repeat(midLen) + " •" + last3;
-}
-
-async function loadAccounts() {
-  $("list-err").classList.add("hidden");
-  try {
-    const data = await api("/api/v1/accounts");
-    renderAccounts(data.items || []);
-  } catch (e) {
-    $("list-err").textContent = "Could not load accounts: " + e.message;
-    $("list-err").classList.remove("hidden");
-  }
-}
-
-function renderAccounts(items) {
-  const list = $("list");
-  if (!items.length) {
-    list.innerHTML = '<div class="empty">No accounts connected yet.</div>';
-    return;
-  }
-  list.innerHTML = items.map((a) => (a.kind === "chat" ? chatRow(a) : mailRow(a))).join("");
-  items.forEach((a) => loadWebhook(a.id));
-}
-
-function kindBadge(kind) {
-  return '<span class="kind">' + escapeHtml(kind || "") + "</span>";
-}
-
-function mailRow(a) {
-  return (
-    '<div class="row" data-id="' + a.id + '">' +
-      '<div class="who">' +
-        '<div class="email">' + escapeHtml(a.email) + "</div>" +
-        '<div class="meta">' + kindBadge(a.kind) + escapeHtml(a.provider) + " &middot; " + fmtTime(a.last_synced_at) + "</div>" +
-      "</div>" +
-      statusBadge(a.status) +
-      '<div class="actions">' +
-        '<a class="btn" href="/mail?account_id=' + a.id + '">View mail</a>' +
-        '<button data-action="resync">Resync</button>' +
-        '<button data-action="disconnect" class="danger">Disconnect</button>' +
-      "</div>" +
-      '<div class="hook" data-hook>Loading webhook&hellip;</div>' +
-    "</div>"
-  );
-}
-
-// A chat account has no email and no folder-based sync: its identifier is a
-// phone number (always masked before it touches the DOM), and its liveness
-// is the socket state the chat runtime reports rather than a last-sync time.
-function chatRow(a) {
-  const conn = a.connection || {};
-  const state = conn.state || "unknown";
-  const ok = state === "connected";
-  return (
-    '<div class="row" data-id="' + a.id + '">' +
-      '<div class="who">' +
-        '<div class="email">' + escapeHtml(a.name || maskPhone(a.identifier)) + "</div>" +
-        '<div class="meta">' + kindBadge(a.kind) + escapeHtml(a.provider) + " &middot; " + escapeHtml(maskPhone(a.identifier)) + "</div>" +
-      "</div>" +
-      '<span class="status ' + (ok ? "ok" : "bad") + '">' + escapeHtml(state) + "</span>" +
-      '<div class="actions">' +
-        '<a class="btn" href="/chat?account_id=' + a.id + '">View chat</a>' +
-        '<button data-action="reconnect">Reconnect</button>' +
-        '<button data-action="disconnect" class="danger">Disconnect</button>' +
-      "</div>" +
-      '<div class="row-msg hidden" data-msg></div>' +
-      '<div class="hook" data-hook>Loading webhook&hellip;</div>' +
-    "</div>"
-  );
-}
-
-function showRowMessage(id, text, isErr) {
-  const el = document.querySelector('.row[data-id="' + id + '"] [data-msg]');
-  if (!el) return;
-  el.textContent = text;
-  el.style.color = isErr ? "var(--danger)" : "var(--muted)";
-  el.classList.remove("hidden");
-}
-
-// Each account has at most one webhook from this UI: new mail for that user
-// is POSTed there. The API allows several; the dashboard keeps it simple.
-async function loadWebhook(id) {
-  const el = document.querySelector('.row[data-id="' + id + '"] [data-hook]');
-  if (!el) return;
-  try {
-    const data = await api("/api/v1/accounts/" + id + "/webhooks");
-    renderWebhook(el, (data.items || [])[0]);
-  } catch (e) {
-    el.textContent = "Could not load webhook: " + e.message;
-  }
-}
-
-// maskDiscordURL mirrors notify.MaskDiscordURL for the browser. A Discord
-// webhook URL is a bearer credential: the API returns it in full to its own
-// developer, but a dashboard ends up in screenshots and screen shares, and the
-// server-side log path is masked for exactly the same reason.
-function maskDiscordURL(u) {
-  return String(u).replace(
-    /^(https?:\/\/(?:[a-z0-9-]+\.)?discord(?:app)?\.com(?::\d+)?\/api\/webhooks\/\d+)\/[^\/\s"?]+/i,
-    "$1/•••");
-}
-
-function renderWebhook(el, hook) {
-  if (hook) {
-    var url = hook.kind === "discord" ? maskDiscordURL(hook.url || "") : (hook.url || "");
-    var where = hook.kind === "telegram" ? "chat " + escapeHtml((hook.telegram || {}).chat_id || "")
-                                          : "<code>" + escapeHtml(url) + "</code>";
-    el.innerHTML =
-      '<span class="kind">' + escapeHtml(hook.kind || "webhook") + "</span> " + where +
-      '<button data-action="remove-webhook" data-wid="' + hook.id + '" class="danger">Remove</button>';
-    return;
-  }
-  el.innerHTML =
-    '<select name="kind">' +
-      '<option value="webhook">Webhook (JSON)</option>' +
-      '<option value="discord">Discord channel</option>' +
-      '<option value="telegram">Telegram chat</option>' +
-    '</select>' +
-    '<span data-kind-fields="webhook">' +
-      '<input name="url" type="url" placeholder="https://your-app.example.com/hooks/mail">' +
-      '<input name="secret" type="text" placeholder="secret (optional)">' +
-    '</span>' +
-    '<span data-kind-fields="discord" hidden>' +
-      '<input name="discord_url" type="url" placeholder="https://discord.com/api/webhooks/&hellip;">' +
-    '</span>' +
-    '<span data-kind-fields="telegram" hidden>' +
-      '<input name="bot_token" type="password" placeholder="bot token from @BotFather" autocomplete="off">' +
-      '<input name="chat_id" type="text" placeholder="chat id, e.g. -1001234567890">' +
-    '</span>' +
-    '<button data-action="set-webhook">Set webhook</button>';
-  el.querySelector('select[name=kind]').addEventListener("change", function (e) {
-    el.querySelectorAll("[data-kind-fields]").forEach(function (span) {
-      span.hidden = span.dataset.kindFields !== e.target.value;
-    });
-  });
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-$("list").addEventListener("click", async (e) => {
-  const btn = e.target.closest("button[data-action]");
-  if (!btn) return;
-  const id = btn.closest(".row").dataset.id;
-  const action = btn.dataset.action;
-
-  if (action === "resync") {
-    btn.disabled = true;
-    try { await api("/api/v1/accounts/" + id + "/resync", { method: "POST", headers: { "Content-Type": "application/json" } }); }
-    catch (e) { alert("Resync failed: " + e.message); }
-    btn.disabled = false;
-    return;
-  }
-  if (action === "reconnect") {
-    btn.disabled = true;
-    try {
-      const res = await api("/api/v1/accounts/" + id + "/reconnect", { method: "POST", headers: { "Content-Type": "application/json" } });
-      showRowMessage(id, "Status: " + (res && res.status ? res.status : "reconnecting"), false);
-    } catch (e) {
-      showRowMessage(id, "Reconnect failed: " + e.message, true);
-    }
-    btn.disabled = false;
-    return;
-  }
-  if (action === "set-webhook") {
-    const box = btn.closest("[data-hook]");
-    const kind = box.querySelector('select[name=kind]').value;
-    const val = (n) => { const i = box.querySelector('input[name=' + n + ']'); return i ? i.value.trim() : ""; };
-    const body = { kind };
-    if (kind === "webhook") { body.url = val("url"); body.secret = val("secret"); if (!body.url) return; }
-    if (kind === "discord") { body.url = val("discord_url"); if (!body.url) return; }
-    if (kind === "telegram") { body.bot_token = val("bot_token"); body.chat_id = val("chat_id"); if (!body.bot_token || !body.chat_id) return; }
-    btn.disabled = true;
-    try {
-      await api("/api/v1/accounts/" + id + "/webhooks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      loadWebhook(id);
-    } catch (e) {
-      showRowMessage(id, "Could not set webhook: " + e.message, true);
-      btn.disabled = false;
-    }
-    return;
-  }
-  if (action === "remove-webhook") {
-    btn.disabled = true;
-    try {
-      await api("/api/v1/accounts/" + id + "/webhooks/" + btn.dataset.wid, { method: "DELETE" });
-      loadWebhook(id);
-    } catch (e) {
-      alert("Could not remove webhook: " + e.message);
-      btn.disabled = false;
-    }
-    return;
-  }
-  if (action === "disconnect") {
-    if (!confirm("Disconnect this account? Any app using it will lose access immediately.")) return;
-    btn.disabled = true;
-    try {
-      await api("/api/v1/accounts/" + id, { method: "DELETE" });
-      loadAccounts();
-    } catch (e) {
-      alert("Disconnect failed: " + e.message);
-      btn.disabled = false;
-    }
-  }
-});
-
-$("connect-btn").addEventListener("click", async () => {
-  $("connect-btn").disabled = true;
-  try {
-    const dest = location.origin + location.pathname + "?connected=1";
-    const body = { success_redirect_url: dest };
-    const providerVal = $("provider").value;
-    if (providerVal) body.provider = providerVal;
-    const data = await api("/api/v1/hosted-auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    location.href = data.url;
-  } catch (e) {
-    alert("Could not start connect flow: " + e.message);
-    $("connect-btn").disabled = false;
-  }
-});
-
-async function loadKeys() {
-  const data = await api("/api/v1/api-keys");
-  const items = data.items || [];
-  if (!items.length) { $("keys").innerHTML = '<div class="empty">No API keys yet.</div>'; return; }
-  $("keys").innerHTML = items.map((k) =>
-    '<div class="row" data-kid="' + k.id + '">' +
-      '<div class="who"><div class="email">' + escapeHtml(k.name) + '</div>' +
-      '<div class="meta"><code>' + escapeHtml(k.prefix) + '…</code> &middot; created ' + new Date(k.created_at).toLocaleDateString() +
-      (k.last_used_at ? ' &middot; last used ' + new Date(k.last_used_at).toLocaleString() : ' &middot; never used') + '</div></div>' +
-      (k.revoked_at ? '<span class="status bad">Revoked</span>' :
-        '<div class="actions"><button data-action="revoke-key" class="danger">Revoke</button></div>') +
-    '</div>').join("");
-}
-
-$("key-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const name = $("key-name").value.trim();
-  if (!name) return;
-  try {
-    const k = await api("/api/v1/api-keys", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-    $("new-key-value").textContent = k.key;
-    $("new-key").classList.remove("hidden");
-    $("key-name").value = "";
-    loadKeys();
-  } catch (err) { alert("Could not create key: " + err.message); }
-});
-
-$("keys").addEventListener("click", async (e) => {
-  const btn = e.target.closest('button[data-action="revoke-key"]');
-  if (!btn) return;
-  if (!confirm("Revoke this key? Anything using it stops working immediately.")) return;
-  btn.disabled = true;
-  try { await api("/api/v1/api-keys/" + btn.closest(".row").dataset.kid, { method: "DELETE" }); loadKeys(); }
-  catch (err) { alert("Could not revoke: " + err.message); btn.disabled = false; }
-});
-
-$("password-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const msg = $("password-msg");
-  msg.classList.remove("hidden");
-  msg.style.color = "var(--muted)";
-  msg.textContent = "Changing…";
-  try {
-    await api("/api/v1/me/password", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ current_password: $("current-password").value, new_password: $("new-password").value }),
-    });
-    $("current-password").value = "";
-    $("new-password").value = "";
-    msg.style.color = "var(--ok)";
-    msg.textContent = "Password changed. Every other browser has been signed out.";
-  } catch (err) {
-    msg.style.color = "var(--danger)";
-    msg.textContent = "Could not change the password: " + err.message;
-  }
-});
-
-async function loadRedirectDomains() {
-  const me = await api("/api/v1/me");
-  $("redirect-domains").value = (me.redirect_domains || []).join("\n");
-}
-
-$("redirect-domains-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const msg = $("redirect-domains-msg");
-  msg.classList.remove("hidden");
-  msg.style.color = "var(--muted)";
-  msg.textContent = "Saving…";
-  const domains = $("redirect-domains").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  try {
-    const res = await api("/api/v1/me/redirect-domains", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domains }),
-    });
-    $("redirect-domains").value = (res.redirect_domains || []).join("\n");
-    msg.style.color = "var(--ok)";
-    msg.textContent = "Saved.";
-  } catch (err) {
-    msg.style.color = "var(--danger)";
-    msg.textContent = "Could not save: " + err.message;
-  }
-});
-
-(async function init() {
-  if (new URLSearchParams(location.search).get("connected")) {
-    $("banner").textContent = "Account connected.";
-    $("banner").classList.remove("hidden");
-    history.replaceState(null, "", location.pathname);
-  }
-  await loadProviders();
-  await Promise.all([loadAccounts(), loadKeys(), loadRedirectDomains()]);
-})();
-</script>
-</body></html>`

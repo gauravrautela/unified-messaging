@@ -1,0 +1,26 @@
+{{define "layout_head"}}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{if .Shell.Title}}{{.Shell.Title}} · {{end}}Entropix</title>
+<link rel="stylesheet" href="/static/app.css?v={{.Shell.Version}}">
+{{range .Shell.Styles}}<link rel="stylesheet" href="/static/{{.}}?v={{$.Shell.Version}}">
+{{end}}<script src="/static/app.js?v={{.Shell.Version}}" defer></script>
+</head><body>{{end}}
+
+{{define "layout_start"}}{{template "layout_head" .}}
+<header class="topbar">
+  <a class="wordmark" href="/dashboard">Entro<b>pix</b></a>
+  <nav aria-label="Primary">
+    <a href="/dashboard" {{if eq .Shell.Nav "dashboard"}}aria-current="page"{{end}}>Dashboard</a>
+    <a href="/mail" {{if eq .Shell.Nav "mail"}}aria-current="page"{{end}}>Mail</a>
+    <a href="/chat" {{if eq .Shell.Nav "chat"}}aria-current="page"{{end}}>Chat</a>
+    <a href="/docs" {{if eq .Shell.Nav "docs"}}aria-current="page"{{end}}>Docs</a>
+  </nav>
+  <span class="spacer"></span>
+  {{if .Shell.Email}}<span class="who">{{.Shell.Email}}</span>
+  <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.Shell.CSRF}}"><button class="btn ghost sm" type="submit">Sign out</button></form>
+  {{else}}<a class="btn sm" href="/login">Sign in</a>{{end}}
+</header>
+{{end}}
+
+{{define "layout_end"}}<div id="notice" aria-live="polite"></div>
+</body></html>{{end}}

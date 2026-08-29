@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -20,6 +19,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/provider"
 	"github.com/gauravrautela/unified-messaging/internal/store"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
 // This file is the chat-provider counterpart of handlers_ui.go's OAuth
@@ -683,110 +683,21 @@ func (s *Server) forgetDeviceOnFailure(ctx context.Context, log *slog.Logger, pr
 
 // ---------- the linker connect page ----------
 
-type linkPageData struct {
-	Provider string
-	State    string
-}
-
-// linkTmpl is the QR counterpart of handlers_ui.go's OAuth landing page. It
-// never embeds the QR code itself server-side — the browser fetches it from
-// /qr only after consent, so a link nobody has accepted yet never even starts
-// a pairing session.
-var linkTmpl = template.Must(template.New("link").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect your {{.Provider}} account</title>
-<style>
-:root{--bg:#f7f7f8;--card:#fff;--text:#1a1a1a;--muted:#6b6b76;--border:#e6e6ea;--accent:#2563eb;--accent-text:#fff}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--text:#f0f0f2;--muted:#9a9aa5;--border:#2a2d36;--accent:#3b82f6;--accent-text:#fff}}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-  background:var(--bg);color:var(--text);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:1.5rem}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem 2rem;
-  max-width:26rem;width:100%;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-h1{font-size:1.25rem;margin:0 0 .5rem}
-p{color:var(--muted);margin:0 0 1rem;font-size:.95rem}
-label{display:flex;align-items:flex-start;gap:.6rem;text-align:left;font-size:.85rem;color:var(--muted);margin:1.25rem 0}
-.btn{display:inline-block;width:100%;padding:.75rem 1rem;border-radius:10px;background:var(--accent);
-  color:var(--accent-text);border:none;text-decoration:none;font-weight:600;font-size:.95rem;cursor:pointer}
-.btn:disabled{opacity:.5;cursor:not-allowed}
-#qr{display:none;width:220px;height:220px;margin:1.25rem auto 0;border-radius:8px}
-#status{margin-top:1rem;font-size:.85rem;color:var(--muted)}
-</style></head>
-<body>
-  <div class="card">
-    <h1>Connect your {{.Provider}} account</h1>
-    <p>Scanning the code below links your phone number to this app. We can see the
-    chats and contacts you give it access to, and we store your messages so the
-    app can show them to you. You can disconnect at any time.</p>
-    <label><input type="checkbox" name="consent" id="consent"> I understand and agree to share my {{.Provider}} data with this app.</label>
-    <button class="btn" id="show-qr" disabled>Show QR code</button>
-    <img id="qr" alt="QR code">
-    <p id="status"></p>
-  </div>
-<script>
-(function() {
-  var state = {{.State}};
-  var consent = document.getElementById("consent");
-  var showBtn = document.getElementById("show-qr");
-  var qr = document.getElementById("qr");
-  var status = document.getElementById("status");
-  var polling = false;
-
-  consent.addEventListener("change", function() { showBtn.disabled = !consent.checked; });
-
-  showBtn.addEventListener("click", function() {
-    showBtn.disabled = true;
-    fetch("/connect/" + state + "/consent", { method: "POST" })
-      .then(function() { status.textContent = "Waiting for scan…"; poll(); })
-      .catch(function() { status.textContent = "Could not start; reload and try again."; });
-  });
-
-  function poll() {
-    if (polling) return;
-    polling = true;
-    fetch("/connect/" + state + "/qr").then(function(r) {
-      return r.json().then(function(data) { return { ok: r.ok, data: data }; });
-    }).then(function(result) {
-      polling = false;
-      var data = result.data;
-      if (!result.ok) {
-        // A non-2xx /qr response ({error:{code,message}}) means the pairing
-        // attempt itself failed server-side (e.g. the provider dial errored)
-        // — terminal, like "failed"/"expired" below, not something another
-        // poll will resolve.
-        status.textContent = (data.error && data.error.message) || "Could not connect. Reload the page to try again.";
-        return;
-      }
-      if (data.png_base64) {
-        qr.src = "data:image/png;base64," + data.png_base64;
-        qr.style.display = "block";
-      }
-      if (data.status === "paired") {
-        status.textContent = "Connected.";
-        if (data.redirect) { location.href = data.redirect; }
-        return;
-      }
-      if (data.status === "expired") {
-        status.textContent = "This link expired. Reload the page to try again.";
-        return;
-      }
-      if (data.status === "failed") {
-        status.textContent = "Could not connect. Reload the page to try again.";
-        return;
-      }
-      status.textContent = "Waiting for scan…";
-      setTimeout(poll, 2000);
-    }).catch(function() {
-      polling = false;
-      setTimeout(poll, 2000);
-    });
-  }
-})();
-</script>
-</body></html>`))
-
-func renderLink(w http.ResponseWriter, d linkPageData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_ = linkTmpl.Execute(w, d)
+// renderConnectQR is the QR counterpart of handlers_ui.go's OAuth landing
+// page. It never embeds the QR code itself server-side — the browser fetches
+// it from /qr only after consent, so a link nobody has accepted yet never even
+// starts a pairing session.
+//
+// There is no CSRF token on this page: /connect/{state}/consent takes no
+// session and is not protected by one. What binds the POST to this browser is
+// the SameSite=Strict, HttpOnly um_link cookie ensureLinkCookie has just
+// issued, which handleConsent then claims for the state (see
+// linkRegistry.claim) — a cross-site POST carries no such cookie at all.
+func (s *Server) renderConnectQR(w http.ResponseWriter, providerName, state string) {
+	display := provider.DisplayName(providerName)
+	s.renderPage(w, http.StatusOK, "connect_qr", map[string]any{
+		"Shell":    web.Shell{Title: "Connect " + display, Version: web.Version, Styles: []string{"connect.css"}},
+		"Provider": display,
+		"State":    state,
+	})
 }

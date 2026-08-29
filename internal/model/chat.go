@@ -21,7 +21,7 @@ type Connection struct {
 type Chat struct {
 	ID            string     `json:"id"`
 	AccountID     string     `json:"account_id"`
-	Kind          string     `json:"kind"` // direct | group
+	Kind          string     `json:"kind"` // direct | group | status | channel
 	Name          string     `json:"name"`
 	UnreadCount   int        `json:"unread_count"`
 	LastMessageAt *time.Time `json:"last_message_at,omitempty"`
@@ -64,7 +64,13 @@ type ChatMessage struct {
 	EditedAt        *time.Time `json:"edited_at,omitempty"`
 	Deleted         bool       `json:"deleted"`
 	Status          string     `json:"status,omitempty"` // own messages: sending | sent | delivered | read
-	Reactions       []Reaction `json:"reactions"`
+
+	// ContentEvicted reports that this message's text was removed by the
+	// owning developer's retention policy. See model.Email.ContentEvicted for
+	// why the flag is negative.
+	ContentEvicted bool `json:"content_evicted"`
+
+	Reactions []Reaction `json:"reactions"`
 }
 
 // Chat event names.

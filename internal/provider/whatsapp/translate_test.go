@@ -82,6 +82,48 @@ func TestMessageFromTextQuoteReactionRevokeEditMedia(t *testing.T) {
 	}
 }
 
+// senderKeyDistributionMessage is E2E session-bootstrapping machinery, never
+// something a WhatsApp client shows. A message that carries nothing else must
+// be dropped the same way an app-state key share is: an empty kind.
+func TestMessageFromDropsBareSenderKeyDistribution(t *testing.T) {
+	chat := types.NewJID("120363000000000000", types.GroupServer)
+	_, kind := messageFrom(evt(chat, "J", &waE2E.Message{
+		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{GroupID: proto.String("g1")},
+	}))
+	if kind != "" {
+		t.Fatalf("bare SKDM kind = %q, want \"\"", kind)
+	}
+}
+
+// WhatsApp routinely piggybacks a senderKeyDistributionMessage on an ordinary
+// group send. Dropping whenever an SKDM is merely present — rather than
+// whenever it is the ONLY thing present — would silently discard real
+// messages, which is worse than the bug being fixed. This is the regression
+// guard for that trap.
+func TestMessageFromKeepsConversationAlongsideSenderKeyDistribution(t *testing.T) {
+	chat := types.NewJID("120363000000000000", types.GroupServer)
+	m, kind := messageFrom(evt(chat, "K", &waE2E.Message{
+		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{GroupID: proto.String("g1")},
+		Conversation:                 proto.String("hi team"),
+	}))
+	if kind != "message" || m.Text != "hi team" || m.Kind != "text" {
+		t.Fatalf("SKDM + conversation = %+v kind=%s, want text kept", m, kind)
+	}
+}
+
+// An SKDM riding alongside real media content (not just text) must likewise
+// still be stored — the "drop" path is for pure machinery only.
+func TestMessageFromKeepsMediaAlongsideSenderKeyDistribution(t *testing.T) {
+	chat := types.NewJID("120363000000000000", types.GroupServer)
+	m, kind := messageFrom(evt(chat, "L", &waE2E.Message{
+		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{GroupID: proto.String("g1")},
+		VideoMessage:                 &waE2E.VideoMessage{},
+	}))
+	if kind != "message" || m.Kind != "unsupported" || m.Text != "[video]" {
+		t.Fatalf("SKDM + video = %+v kind=%s, want unsupported video kept", m, kind)
+	}
+}
+
 // Group chat ids are opaque and log verbatim; a direct chat id is the other
 // party's phone number and must only appear as a digest.
 func TestLogChatID(t *testing.T) {
@@ -151,5 +193,40 @@ func TestMessageFromUnwrapsEphemeralAndViewOnce(t *testing.T) {
 		Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{}}}}))
 	if m.Kind != "unsupported" || m.Text != "[image]" {
 		t.Fatalf("view-once image: kind=%q text=%q", m.Kind, m.Text)
+	}
+}
+
+func TestChatKindStatusAndChannel(t *testing.T) {
+	if got := chatKind(types.StatusBroadcastJID); got != "status" {
+		t.Fatalf("status = %q", got)
+	}
+	if got := chatKind(types.NewJID("120363179221369609", types.NewsletterServer)); got != "channel" {
+		t.Fatalf("channel = %q", got)
+	}
+}
+
+// Media that is not text still tells the reader what it was, and carries the
+// caption when there is one. The generic fallback names the proto field so
+// a new kind of message is diagnosable from a log line.
+func TestMediaLabelsAndCaptions(t *testing.T) {
+	cases := []struct {
+		msg  *waE2E.Message
+		want string
+	}{
+		{&waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("look")}}, "[image] look"},
+		{&waE2E.Message{VideoMessage: &waE2E.VideoMessage{GifPlayback: proto.Bool(true)}}, "[gif]"},
+		{&waE2E.Message{PtvMessage: &waE2E.VideoMessage{}}, "[video note]"},
+		{&waE2E.Message{AlbumMessage: &waE2E.AlbumMessage{ExpectedImageCount: proto.Uint32(4)}}, "[album: 4 photos]"},
+		{&waE2E.Message{EventMessage: &waE2E.EventMessage{Name: proto.String("Offsite")}}, "[event] Offsite"},
+		{&waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}}, "[poll vote]"},
+		{&waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("q3.pdf")}}, "[document] q3.pdf"},
+		{&waE2E.Message{GroupInviteMessage: &waE2E.GroupInviteMessage{GroupName: proto.String("Founders")}}, "[group invite] Founders"},
+		{&waE2E.Message{StickerMessage: &waE2E.StickerMessage{}}, "[sticker]"},
+		{&waE2E.Message{KeepInChatMessage: &waE2E.KeepInChatMessage{}}, "[unsupported: keepInChatMessage]"},
+	}
+	for _, c := range cases {
+		if got := mediaLabel(c.msg); got != c.want {
+			t.Errorf("mediaLabel = %q, want %q", got, c.want)
+		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -540,11 +541,17 @@ func TestHostedAuthMintsSingleUseConnectLink(t *testing.T) {
 	}
 	body := rec.Body.String()
 
-	start := strings.Index(body, `href="`)
+	// The landing page renders through the shared public layout now, so the
+	// first href in the document is the stylesheet's. The authorize URL is the
+	// one the Continue button carries, and pinning it to that button is also
+	// what keeps this test honest: it asserts the link the end user actually
+	// clicks, not whichever href happens to come first in the markup.
+	const continueHref = `<a class="btn primary" href="`
+	start := strings.Index(body, continueHref)
 	if start == -1 {
-		t.Fatalf("no link found in landing page: %s", body)
+		t.Fatalf("no authorize link found in landing page: %s", body)
 	}
-	start += len(`href="`)
+	start += len(continueHref)
 	end := strings.Index(body[start:], `"`)
 	if end == -1 {
 		t.Fatalf("malformed href in landing page: %s", body)
@@ -600,24 +607,116 @@ func TestPagesRedirectToLoginWithoutSession(t *testing.T) {
 	}
 }
 
-// The dashboard shows which developer is signed in and lets them manage their
-// own API keys; it no longer carries the client-side localStorage key gate.
+// The dashboard shows which developer is signed in and sections them through
+// the shared design system: every panel is addressable by hash, the shared
+// stylesheet and helpers are loaded from /static, and nothing on the page
+// falls back to a browser dialog or to client-side credential storage.
 func TestDashboardShowsDeveloperAndKeysPanel(t *testing.T) {
 	s, _ := newTestServer(t)
-	dev, _ := seedDev(t, s, "dev@x.com")
+	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"dev@x.com", `id="keys"`, `data-action="create-key"`, `id="logout-form"`, "/api/v1/api-keys"} {
+	for _, want := range []string{
+		"a@x.com", `href="#api-keys"`, `id="api-keys"`, `id="webhooks"`, `id="settings"`,
+		"/static/app.js", `aria-current="page"`, "Entropix", "/api/v1/api-keys",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("dashboard missing %q", want)
 		}
 	}
-	if strings.Contains(body, "um_api_key") || strings.Contains(body, `id="gate-form"`) {
-		t.Fatal("dashboard still has the localStorage API-key gate")
+	// A native browser dialog blocks the page and cannot be styled, and a
+	// credential in localStorage outlives the session cookie. The design
+	// system has um.notice and um.confirm instead — so the check is for a
+	// *bare* alert()/confirm(), not for the um.-qualified helpers a page is
+	// meant to call.
+	for _, re := range nativeDialogCalls {
+		if hit := re.FindString(body); hit != "" {
+			t.Fatalf("dashboard calls a native browser dialog: %q", strings.TrimSpace(hit))
+		}
+	}
+	if strings.Contains(body, "localStorage") {
+		t.Fatal("dashboard still uses localStorage")
+	}
+}
+
+// nativeDialogCalls match window.alert(/alert(/confirm( but not um.alert( or
+// um.confirm(: the leading class rejects a "." before the name, so only an
+// unqualified call (or an explicit window.-qualified one) trips them.
+var nativeDialogCalls = []*regexp.Regexp{
+	regexp.MustCompile(`(?:^|[^.\w])(?:window\.)?alert\(`),
+	regexp.MustCompile(`(?:^|[^.\w])(?:window\.)?confirm\(`),
+}
+
+// app.js is loaded with defer, so it has not run while the inline script is
+// being evaluated: window.um does not exist yet, and #notice (in layout_end)
+// has not been parsed either. Everything the page does therefore has to wait
+// for DOMContentLoaded — reading um at the top level would throw a
+// ReferenceError and leave the page inert.
+//
+// Every page with an inline script is checked, not just the dashboard: the
+// rule is a property of the shared layout, so a new page inheriting it is
+// exactly where the mistake would reappear.
+func TestPageScriptsWaitForDeferredHelpers(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	// The QR connect page needs a live link state to render; nothing else
+	// here needs any setup at all.
+	if err := db.SaveOAuthState(store.OAuthState{
+		State: "st_defer", DeveloperID: dev.ID, Provider: "FAKECHAT",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		path    string
+		session bool
+	}{
+		{"/dashboard", true},
+		{"/mail", true},
+		{"/chat", true},
+		{"/docs", true},
+		{"/docs", false},
+		{"/login", false},
+		{"/", false},
+		{"/connect/st_defer", false},
+	} {
+		name := tc.path
+		if tc.session {
+			name += " (signed in)"
+		}
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.session {
+				req = withSession(t, s, req, dev.ID)
+			}
+			rec := httptest.NewRecorder()
+			s.Routes().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			body := rec.Body.String()
+
+			if !strings.Contains(body, `src="/static/app.js?v=`) || !strings.Contains(body, "defer") {
+				t.Fatal("page does not load app.js with defer; this test's premise no longer holds")
+			}
+			start := strings.Index(body, "<script>")
+			if start < 0 {
+				t.Skip("page has no inline script")
+			}
+			script := body[start:]
+			ready := strings.Index(script, "DOMContentLoaded")
+			if ready < 0 {
+				t.Fatal("page script never waits for DOMContentLoaded, so it runs before the deferred app.js")
+			}
+			if strings.Contains(script[:ready], "= um") {
+				t.Fatal("page script reads um before DOMContentLoaded, when app.js has not run yet")
+			}
+		})
 	}
 }
 
@@ -646,15 +745,20 @@ func TestDashboardLinksToMailPage(t *testing.T) {
 	dev, _ := seedDev(t, s, "a@x.com")
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
-
-	if !strings.Contains(rec.Body.String(), `"/mail`) {
-		t.Fatal("dashboard has no link to the mail viewer")
+	body := rec.Body.String()
+	// Top-level nav reaches mail and chat even with zero accounts.
+	for _, want := range []string{`href="/mail"`, `href="/chat"`, `href="/docs"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard nav missing %q", want)
+		}
 	}
 }
 
 // The dashboard offers a provider picker for the connect flow and renders
 // chat accounts with a Reconnect action, a masked-phone helper, and a link
-// into the chat viewer.
+// into the chat viewer. The status badge is never the raw socket state: the
+// human mapping is um.accountState in app.js, which the chat page reuses, so
+// no "c.state" branch may appear in the page itself.
 func TestDashboardShowsProviderPickerAndChatCards(t *testing.T) {
 	s, db := newTestServer(t)
 	dev, _ := seedDev(t, s, "a@x.com")
@@ -662,9 +766,14 @@ func TestDashboardShowsProviderPickerAndChatCards(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest("GET", "/dashboard", nil), dev.ID))
 	body := rec.Body.String()
-	for _, want := range []string{`id="provider"`, `data-action="reconnect"`, `/chat?account_id=`, `maskPhone(`} {
+	for _, want := range []string{`id="connect-dialog"`, `um.accountState(`, `data-action="reconnect"`, `/chat?account_id=`, `um.maskPhone(`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)
+		}
+	}
+	for _, never := range []string{"c.state", "connection.state"} {
+		if strings.Contains(body, never) {
+			t.Errorf("dashboard interpolates %q instead of going through um.accountState", never)
 		}
 	}
 }
@@ -895,6 +1004,16 @@ func TestDashboardRendersWebhookForm(t *testing.T) {
 	for _, want := range []string{`name="kind"`, `value="discord"`, `value="telegram"`, `name="bot_token"`, `name="chat_id"`, `data-kind-fields`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)
+		}
+	}
+	// The event checkboxes are rendered from the Go constants, so a new event
+	// name cannot go missing from the picker.
+	for _, e := range webhookEvents {
+		if !model.KnownEvent(e) {
+			t.Errorf("webhookEvents lists %q, which the API rejects", e)
+		}
+		if !strings.Contains(body, `value="`+e+`"`) {
+			t.Errorf("dashboard event picker missing %q", e)
 		}
 	}
 	// A Discord webhook URL is a bearer credential, and a dashboard ends up in
@@ -2239,6 +2358,60 @@ func TestChatRoutesHappyPath(t *testing.T) {
 	_ = db.UpsertAccount(model.Account{ID: "acc_mail", DeveloperID: dev.ID, Provider: "OUTLOOK", Email: "m@x.com", Status: model.AccountOK})
 	if rec := j("GET", "/api/v1/chats?account_id=acc_mail", ""); rec.Code != 400 || !strings.Contains(rec.Body.String(), "unsupported_for_kind") {
 		t.Fatalf("mail on chat route: %d", rec.Code)
+	}
+}
+
+// C1: the public API edit handler must refuse to write over an evicted
+// message rather than resurrecting its content — mirroring the guard already
+// in place on the WhatsApp inbound edit path (chatsync/sink.go). The refusal
+// must happen before the provider is called, not after: a half-performed
+// edit (sent to WhatsApp but not recorded) is worse than refusing outright.
+func TestPatchChatMessageRefusesEvictedContent(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	h := s.Routes()
+	j := func(method, path, body string) *httptest.ResponseRecorder {
+		req := withKey(httptest.NewRequest(method, path, strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "EVICTED1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "gone", SentAt: time.Now(), Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EvictChatMessageContent(acc, "EVICTED1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := j("PATCH", "/api/v1/chats/c1/messages/EVICTED1?account_id="+acc, `{"text":"resurrected"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "content_evicted") {
+		t.Fatalf("edit evicted message: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.fake().Commands(); len(got) != 0 {
+		t.Fatalf("provider was called for a refused edit: %d commands", len(got))
+	}
+	got, err := db.GetChatMessage(acc, "EVICTED1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "" {
+		t.Fatalf("text = %q after a refused edit, want it to stay blank", got.Text)
+	}
+
+	// The same request against a normal own-message still succeeds.
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "NORMAL1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "hi", SentAt: time.Now(), Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = j("PATCH", "/api/v1/chats/c1/messages/NORMAL1?account_id="+acc, `{"text":"hi!"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edit normal message: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -3661,6 +3834,60 @@ func TestMirrorMissIsNegativelyCached(t *testing.T) {
 	}
 }
 
+// Server.complete lazily fetches attachment metadata from the provider and
+// caches it on the row. On an evicted message the store write is already
+// refused by UpsertEmail's guard, but the response would still carry the
+// filenames — and a filename is as revealing as a subject line.
+func TestGetEmailDoesNotFetchAttachmentsForEvictedMessage(t *testing.T) {
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	fm.Attachments = []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}}
+	s, db := newTestServerWithProviders(t, fm)
+	_, key, acctID := seedFakeMailAccount(t, s, db)
+
+	if err := db.UpsertEmail(model.Email{
+		AccountID: acctID, ID: "M1", Subject: "quarterly numbers",
+		From: model.Recipient{Email: "alice@example.com"},
+		Body: "<p>secret</p>", BodyType: "html", Date: time.Now().UTC(),
+		HasAttachments: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A normal read fetches and caches the metadata: the baseline that proves
+	// the assertion below is about eviction and not about a broken fixture.
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/emails/M1?account_id="+acctID, nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "payroll.xlsx") {
+		t.Fatalf("baseline read did not return attachment metadata: %s", rec.Body.String())
+	}
+
+	if err := db.EvictEmailContent(acctID, "M1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := fm.AttachmentCalls.Load()
+
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/emails/M1?account_id="+acctID, nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "payroll.xlsx") {
+		t.Errorf("evicted message returned attachment filenames: %s", body)
+	}
+	if !strings.Contains(body, `"content_evicted":true`) {
+		t.Errorf("evicted message not flagged: %s", body)
+	}
+	if got := fm.AttachmentCalls.Load(); got != before {
+		t.Errorf("ListAttachments called %d extra times for an evicted message, want 0", got-before)
+	}
+}
+
 // TestNotificationHandlingIsBounded fires 100 concurrent notifications whose
 // ParseNotifications call blocks, and checks that at most 32 of them are
 // ever running inside the dedicated goroutine dispatchNotification spawns
@@ -4013,5 +4240,86 @@ func TestNotifyFailureScrubsTheTargetURL(t *testing.T) {
 	}
 	if !recs.Contains("bot•••") {
 		t.Fatalf("the logged notify_url was not scrubbed: %v", recs.All())
+	}
+}
+
+func TestRootServesWebsiteAndStaticIsCacheable(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Entropix") {
+		t.Fatalf("GET / = %d %q", rec.Code, rec.Body.String()[:min(200, rec.Body.Len())])
+	}
+	if rec.Header().Get("Content-Security-Policy") == "" {
+		t.Fatal("website served without CSP")
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/app.js", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("static: %d cache=%q", rec.Code, rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestSetRetention(t *testing.T) {
+	s, db := newTestServer(t)
+	h := s.Routes()
+	dev, key := seedDev(t, s, "a@x.com")
+
+	put := func(t *testing.T, body string, mod func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/me/retention", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, mod(req))
+		return rec
+	}
+	session := func(req *http.Request) *http.Request { return withSession(t, s, req, dev.ID) }
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"an hour", `{"retention_max_age_secs":3600}`, http.StatusOK},
+		{"zero disables", `{"retention_max_age_secs":0}`, http.StatusOK},
+		{"negative rejected", `{"retention_max_age_secs":-1}`, http.StatusBadRequest},
+		{"over a year rejected", `{"retention_max_age_secs":31536001}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := put(t, tc.body, session); rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+
+	// The value actually persists, and GET /api/v1/me reports it back.
+	if rec := put(t, `{"retention_max_age_secs":3600}`, session); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got, err := db.RetentionMaxAge(dev.ID); err != nil || got != time.Hour {
+		t.Fatalf("RetentionMaxAge = %v, %v; want 1h", got, err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), key))
+	if !strings.Contains(rec.Body.String(), `"retention_max_age_secs":3600`) {
+		t.Fatalf("GET /api/v1/me does not report the policy: %s", rec.Body.String())
+	}
+}
+
+// An API key must not be able to change how long its developer's content is
+// kept — in either direction. Shortening it destroys content; lengthening it
+// defeats the policy. Same rule as the other account settings.
+func TestSetRetentionIsSessionOnly(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/me/retention", strings.NewReader(`{"retention_max_age_secs":3600}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(req, key))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 }

@@ -1,0 +1,135 @@
+/* Entropix public website. Loaded after app.css, so it inherits the design
+   system's tokens and components (.btn, .card, .pill, .badge) and only adds
+   what a marketing page needs on top: a dark hero, the section bands, the
+   tabbed code block, and the card grid. */
+
+/* ---- page frame ---------------------------------------------------- */
+
+/* The site is full-bleed (bands paint edge to edge); band-in is what holds
+   the readable column. main.page is deliberately not used here. */
+main.site{display:block}
+.band-in{max-width:68rem;margin:0 auto;padding:var(--s8) var(--s5)}
+/* Alternating bands separate the sections; the plain sections in between
+   sit on --bg, so no extra rules are needed for them. */
+.band{background:var(--surface);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+/* The site header is sticky (52px), so an anchor jump must stop short of it
+   or the section heading lands underneath the bar. */
+main.site > section{scroll-margin-top:60px}
+
+/* Inline code in prose is long enough (an endpoint path with a {param}) to
+   push a 360px viewport into horizontal scroll if it is allowed to stay on
+   one line. */
+main.site code{overflow-wrap:anywhere}
+
+.section-h{font-size:clamp(20px,3.2vw,28px);letter-spacing:-.02em;margin:0 0 var(--s2)}
+.section-sub{max-width:44rem;margin:0 0 var(--s6);font-size:15px}
+
+/* ---- hero ----------------------------------------------------------- */
+
+/* The hero is dark in both schemes on purpose: it is the one surface that
+   should look the same in a screenshot regardless of the reader's OS. It
+   redefines the design tokens rather than restyling each child, so .btn,
+   pre and .badge inside it come out dark for free. */
+.hero{
+  --surface:#14171d;--surface-2:#1b1f27;--border:#262b35;
+  --text:#eceef2;--muted:#9aa2b1;--accent:#5b8def;--accent-text:#0c0e12;--accent-bg:#172343;
+  --code-bg:#0f1218;--shadow:none;
+  background:#0c0e12;color:#eceef2;border-bottom:1px solid #262b35;
+}
+.hero-in{max-width:72rem;margin:0 auto;padding:var(--s8) var(--s5);
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:var(--s7);align-items:center}
+.hero-copy{min-width:0}
+.hero-h{font-size:clamp(30px,6vw,52px);line-height:1.08;letter-spacing:-.03em;margin:0 0 var(--s4);color:#eceef2}
+/* Gradient text, with the flat colour above as the fallback: a browser
+   without background-clip:text keeps a readable headline instead of an
+   invisible one. */
+@supports (background-clip:text) or (-webkit-background-clip:text){
+  .hero-h{
+    background-image:linear-gradient(100deg,#eceef2 0%,#eceef2 30%,#8ab4ff 65%,#c9a7ff 100%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+}
+.hero-sub{font-size:clamp(15px,1.6vw,18px);line-height:1.55;color:#b9c0cd;margin:0 0 var(--s5);max-width:34rem}
+.hero-cta{display:flex;flex-wrap:wrap;gap:var(--s3);margin:0 0 var(--s3)}
+.hero-fine{color:#7f8798;font-size:13px;margin:0}
+.btn.lg{padding:11px 18px;font-size:15px}
+.hero-code{min-width:0}
+
+/* ---- code blocks ---------------------------------------------------- */
+
+.codeblock{border:1px solid var(--border);border-radius:var(--r2);background:var(--code-bg);overflow:hidden}
+.code-head{display:flex;align-items:center;gap:var(--s2);padding:var(--s2) var(--s2) var(--s2) var(--s3);
+  border-bottom:1px solid var(--border);background:var(--surface-2)}
+.code-head .copy{margin-left:auto}
+.langs{display:flex;gap:2px;min-width:0;overflow-x:auto}
+.lang{background:none;border:0;color:var(--muted);font:inherit;font-size:13px;padding:4px 10px;border-radius:var(--r1);cursor:pointer;white-space:nowrap}
+.lang:hover{color:var(--text)}
+.lang[aria-pressed=true]{background:var(--surface);color:var(--text);font-weight:600}
+.lang-label{color:var(--muted);font-family:var(--mono);font-size:12px}
+/* Code scrolls inside its own box; the page never scrolls sideways. */
+.codeblock pre{margin:0;border:0;border-radius:0;background:transparent;max-height:22rem;overflow:auto;font-size:12.5px;line-height:1.55}
+.codeblock pre[hidden]{display:none}
+
+/* ---- grids ---------------------------------------------------------- */
+
+.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--s4)}
+
+/* ---- how it works --------------------------------------------------- */
+
+.step{min-width:0;display:flex;flex-direction:column;gap:var(--s3)}
+.step-head{display:flex;align-items:center;gap:var(--s3)}
+.step-head h3{margin:0}
+.step-n{flex:none;width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+  background:var(--accent-bg);color:var(--accent);font-weight:700;font-size:13px}
+.step p{margin:0}
+.step .codeblock{margin-top:auto}
+.steps .codeblock pre{max-height:16rem}
+
+/* ---- providers ------------------------------------------------------ */
+
+.provider{min-width:0}
+.provider-head{display:flex;align-items:center;gap:var(--s2);margin-bottom:var(--s3)}
+.provider-head h3{margin:0}
+.caps{list-style:none;display:flex;flex-wrap:wrap;gap:var(--s1) var(--s2);margin:0;padding:0}
+.caps li{font-size:12px;color:var(--muted);background:var(--surface-2);border-radius:999px;padding:2px 9px}
+.provider .note{margin:var(--s3) 0 0;color:var(--warn);background:var(--warn-bg);
+  border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);border-radius:var(--r1);padding:var(--s2) var(--s3)}
+.provider.soon{border-style:dashed;box-shadow:none;background:transparent}
+.provider.soon h3{color:var(--muted)}
+
+/* ---- features ------------------------------------------------------- */
+
+.feature{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--r2);padding:var(--s5);box-shadow:var(--shadow)}
+.band .feature{background:var(--bg)}
+.feature h3{margin:0 0 var(--s2)}
+.feature p{margin:0}
+
+/* ---- events --------------------------------------------------------- */
+
+.chips{display:flex;flex-wrap:wrap;gap:var(--s2)}
+/* The status dot app.css gives .pill reads as decoration on a status badge
+   and as noise on a link, so links drop it and gain a hover affordance. */
+a.pill{text-decoration:none;font-family:var(--mono);font-weight:500;padding:5px 11px;border:1px solid var(--border)}
+a.pill::before{display:none}
+a.pill:hover{background:var(--accent-bg);color:var(--accent);border-color:var(--accent)}
+
+/* ---- footer --------------------------------------------------------- */
+
+.site-foot{border-top:1px solid var(--border);background:var(--surface)}
+.foot-in{display:flex;align-items:center;flex-wrap:wrap;gap:var(--s3) var(--s5);padding-top:var(--s5);padding-bottom:var(--s5)}
+.foot-in nav{display:flex;gap:var(--s4);flex-wrap:wrap}
+.foot-in nav a{color:var(--muted);text-decoration:none}
+.foot-in nav a:hover{color:var(--text)}
+.foot-in p{margin-left:auto}
+
+/* ---- responsive ----------------------------------------------------- */
+
+@media (max-width:60rem){
+  .hero-in{grid-template-columns:minmax(0,1fr);gap:var(--s6)}
+  .grid-3{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:48rem){
+  .grid-3{grid-template-columns:minmax(0,1fr)}
+  .band-in,.hero-in{padding:var(--s6) var(--s4)}
+  .foot-in p{margin-left:0}
+}

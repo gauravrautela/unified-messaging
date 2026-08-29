@@ -1,0 +1,427 @@
+{{define "mail"}}{{template "layout_start" .}}{{template "mail_content" .}}{{template "layout_end" .}}{{end}}
+
+{{define "mail_content"}}
+<main class="page wide">
+  <div class="split">
+    <aside class="side" id="side">
+      <div class="side-head">
+        <label class="sr-only" for="acct">Account</label>
+        <select id="acct"></select>
+        <input id="q" type="search" placeholder="Search mail" aria-label="Search mail">
+        <label class="check small"><input type="checkbox" id="unread"> Unread only</label>
+      </div>
+      <div class="side-list">
+        <ul class="list" role="listbox" id="folders" aria-label="Folders"></ul>
+      </div>
+    </aside>
+
+    <section class="main" id="main">
+      <div class="side-head actions">
+        <button class="menu-btn btn ghost sm" type="button" id="menu" aria-label="Folders" aria-expanded="false">☰</button>
+        <span id="page-info" class="muted small"></span>
+        <span class="spacer"></span>
+        <button class="btn sm" type="button" id="newer" disabled>Newer</button>
+        <button class="btn sm" type="button" id="older" disabled>Older</button>
+      </div>
+
+      <div id="panes">
+        <div id="messages">
+          <ul class="list" role="listbox" id="list" aria-label="Messages"></ul>
+        </div>
+        <article id="reader" aria-label="Message">
+          <div class="reader-bar">
+            <button class="back-btn btn ghost sm" type="button" id="back">← Messages</button>
+          </div>
+          <div id="reader-body"><div class="empty">Select a message</div></div>
+        </article>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+// The mail viewer is a viewer: it reads the synced mirror through the same
+// REST API a customer's integration uses, riding the browser session cookie.
+// Nothing here is server-rendered but the shell, so this file is the whole
+// client.
+//
+// app.js is loaded with defer, so window.um does not exist while this script
+// is being parsed — every reference to it lives inside DOMContentLoaded.
+document.addEventListener("DOMContentLoaded", () => {
+  const { $, esc, api, notice, relTime } = um;
+
+  const PAGE = 50;
+  // The order a person expects their folders in. Anything the provider does
+  // not give a well-known role to sorts after these, alphabetically.
+  const ROLE_ORDER = { inbox: 0, drafts: 1, sent: 2, archive: 3, junk: 4, trash: 5 };
+
+  const state = { account: "", folder: "", q: "", unread: false, offset: 0, selected: "" };
+
+  const fail = (e) => notice("error", (e && e.message) ? e.message : String(e));
+  const narrow = () => window.matchMedia("(max-width: 48rem)").matches;
+  const side = $("side"), panes = $("panes"), main = $("main");
+
+  // Under 48rem the two panes share the screen, so opening a message swaps the
+  // list out for the reader instead of showing both.
+  function setReading(on) {
+    panes.classList.toggle("reading", on);
+    main.classList.toggle("reading", on);
+  }
+  function openSide(on) {
+    side.classList.toggle("open", on);
+    $("menu").setAttribute("aria-expanded", String(on));
+  }
+
+  function skeleton(host, n) {
+    host.innerHTML = Array.from({ length: n }, () =>
+      '<li class="sk"><div class="skeleton" style="width:60%"></div><div class="skeleton" style="width:85%;margin-top:6px"></div></li>').join("");
+  }
+
+  function optionFor(host, id) {
+    return [...host.querySelectorAll("[role=option]")].find((b) => b.dataset.id === id) || null;
+  }
+
+  function emptyRow(host, title, detail) {
+    const li = document.createElement("li");
+    const box = document.createElement("div");
+    box.className = "empty";
+    const h = document.createElement("div");
+    h.className = "title";
+    h.textContent = title;
+    box.append(h);
+    if (detail) { const p = document.createElement("div"); p.append(detail); box.append(p); }
+    li.append(box);
+    host.replaceChildren(li);
+  }
+
+  // ---- accounts ----
+
+  function accountLabel(a) {
+    return (a.email || a.name || a.identifier || a.id) + (a.status === "OK" ? "" : " (needs reconnect)");
+  }
+
+  async function loadAccounts() {
+    const data = await api("/api/v1/accounts");
+    const items = (data.items || []).filter((a) => a.kind === "mail");
+    const sel = $("acct");
+    sel.replaceChildren(...items.map((a) => {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = accountLabel(a);
+      return o;
+    }));
+    if (!items.length) return false;
+    const wanted = new URLSearchParams(location.search).get("account_id");
+    state.account = items.some((a) => a.id === wanted) ? wanted : items[0].id;
+    sel.value = state.account;
+    return true;
+  }
+
+  // A load that fails must not leave the skeletons shimmering for ever: say
+  // what went wrong where the rows would have been, and offer the one action
+  // that helps.
+  function errorRow(host, e, retry) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn sm";
+    btn.textContent = "Retry";
+    btn.addEventListener("click", retry);
+    const detail = document.createElement("span");
+    detail.append(((e && e.message) ? e.message : String(e)) + " ", btn);
+    emptyRow(host, "Could not load", detail);
+  }
+
+  // ---- folders ----
+
+  // loadFolders and loadMessages report their own failures inline and never
+  // reject: an account switch or a second search can land while a request is
+  // in flight, and the answer to a stale one is to drop it, not to paint it
+  // over the account the reader is actually looking at.
+  async function loadFolders() {
+    const host = $("folders"), account = state.account;
+    skeleton(host, 5);
+    let data;
+    try {
+      data = await api("/api/v1/folders?account_id=" + encodeURIComponent(account));
+    } catch (e) {
+      if (state.account === account) errorRow(host, e, loadFolders);
+      return;
+    }
+    if (state.account !== account) return; // the account changed under this request
+    const items = (data.items || []).slice().sort((a, b) => {
+      const ra = a.role in ROLE_ORDER ? ROLE_ORDER[a.role] : 99;
+      const rb = b.role in ROLE_ORDER ? ROLE_ORDER[b.role] : 99;
+      return ra - rb || String(a.name).localeCompare(String(b.name));
+    });
+    if (!state.folder || !items.some((f) => f.id === state.folder)) {
+      const inbox = items.find((f) => f.role === "inbox");
+      state.folder = inbox ? inbox.id : (items[0] ? items[0].id : "");
+    }
+    if (!items.length) { emptyRow(host, "No folders", "This account has not finished its first sync."); return; }
+    host.innerHTML = items.map((f) =>
+      '<li><button type="button" role="option" data-id="' + esc(f.id) + '" aria-selected="' + (f.id === state.folder) + '">' +
+        '<span class="top"><span class="title">' + esc(f.name) + '</span>' +
+        (f.unread_count ? '<span class="muted small">' + esc(f.unread_count) + '</span>' : '') +
+        '</span></button></li>').join("");
+  }
+
+  // ---- message list ----
+
+  function listRow(m) {
+    // An evicted message has had its subject, snippet and sender blanked by
+    // the retention policy (store/retention.go). Left alone that renders as
+    // an empty row with no sender, which reads as a bug rather than a
+    // deliberate, permanent removal — so it gets its own explicit label.
+    if (m.content_evicted) {
+      return '<li><button type="button" role="option" data-id="' + esc(m.id) + '"' +
+        ' class="' + (m.read ? "" : "unread") + '" aria-selected="' + (m.id === state.selected) + '">' +
+          '<span class="top"><span class="title">(content removed by retention policy)</span>' +
+          '<span class="muted small when">' + esc(relTime(m.date)) + '</span></span>' +
+          '<span class="sub muted">Evicted — subject, sender and body are gone for good.</span>' +
+        '</button></li>';
+    }
+    const who = (m.from && (m.from.name || m.from.email)) || "(unknown)";
+    const marks = (m.flagged ? " ⚑" : "") + (m.has_attachments ? " 📎" : "") + (m.draft ? " [draft]" : "");
+    return '<li><button type="button" role="option" data-id="' + esc(m.id) + '"' +
+      ' class="' + (m.read ? "" : "unread") + '" aria-selected="' + (m.id === state.selected) + '">' +
+        '<span class="top"><span class="title">' + esc(who) + '</span>' +
+        '<span class="muted small when">' + esc(relTime(m.date)) + '</span></span>' +
+        '<span class="sub">' + esc((m.subject || "(no subject)") + marks) + '</span>' +
+        '<span class="sub">' + esc(m.snippet || "") + '</span>' +
+      '</button></li>';
+  }
+
+  let listSeq = 0;
+
+  async function loadMessages() {
+    const host = $("list"), account = state.account, seq = ++listSeq;
+    skeleton(host, 8);
+    const p = new URLSearchParams({ account_id: account, limit: String(PAGE), offset: String(state.offset) });
+    // A search runs across the whole account; folder scoping applies otherwise.
+    if (state.q) p.set("q", state.q);
+    else if (state.folder) p.set("folder_id", state.folder);
+    if (state.unread) p.set("unread", "true");
+
+    let data;
+    try {
+      data = await api("/api/v1/emails?" + p.toString());
+    } catch (e) {
+      // Only the newest request owns the pane; an older one that failed says
+      // nothing, because its answer is no longer what is being asked.
+      if (seq === listSeq && state.account === account) errorRow(host, e, loadMessages);
+      return;
+    }
+    if (seq !== listSeq || state.account !== account) return;
+    const items = data.items || [];
+    if (items.length) host.innerHTML = items.map(listRow).join("");
+    else if (state.q) emptyRow(host, "No results", "Nothing in this account matches that search.");
+    else emptyRow(host, "Nothing here yet", state.unread ? "No unread messages in this folder." : "This folder is empty.");
+
+    $("newer").disabled = state.offset === 0;
+    $("older").disabled = items.length < PAGE;
+    $("page-info").textContent = items.length ? (state.offset + 1) + "–" + (state.offset + items.length) : "";
+  }
+
+  function reload() {
+    state.offset = 0;
+    loadMessages();
+  }
+
+  // ---- reader ----
+
+  async function openMessage(id) {
+    state.selected = id;
+    [...$("list").querySelectorAll("[role=option]")].forEach((b) => b.setAttribute("aria-selected", String(b.dataset.id === id)));
+    if (narrow()) setReading(true);
+
+    const body = $("reader-body");
+    body.innerHTML = '<div class="empty">Loading…</div>';
+    let m;
+    try {
+      m = await api("/api/v1/emails/" + encodeURIComponent(id) + "?account_id=" + encodeURIComponent(state.account));
+    } catch (e) {
+      emptyBody("Could not load message", (e && e.message) || String(e));
+      return;
+    }
+    if (state.selected !== id) return; // the reader moved on while this was in flight
+
+    if (m.content_evicted) {
+      emptyBody(
+        "Content removed by your retention policy",
+        "This message's subject, sender and body were deleted once every subscribing webhook accepted it (or when the " +
+        "retention limit was reached). Attachments are gone too. This cannot be undone — there is no copy left to restore.");
+      return;
+    }
+
+    const line = (label, rs) => (rs && rs.length)
+      ? '<div class="addr"><b>' + label + ':</b> ' +
+        rs.map((r) => esc(r.name ? r.name + " <" + r.email + ">" : r.email)).join(", ") + '</div>'
+      : "";
+
+    body.innerHTML =
+      '<div class="reader-head">' +
+        '<h2>' + esc(m.subject || "(no subject)") + '</h2>' +
+        line("From", m.from ? [m.from] : []) + line("To", m.to) + line("Cc", m.cc) +
+        '<div class="addr muted small">' + esc(new Date(m.date).toLocaleString()) + '</div>' +
+        '<div class="atts actions" id="atts"></div>' +
+      '</div>' +
+      '<iframe id="body-frame" title="Message body" sandbox=""></iframe>';
+
+    // The iframe is sandboxed with no permissions at all, so HTML mail cannot
+    // run scripts, navigate, or reach this page's storage or cookies.
+    const frame = $("body-frame");
+    frame.srcdoc = m.body_type === "html"
+      ? m.body
+      : "<pre style=\"font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;margin:1rem\">" + esc(m.body || "") + "</pre>";
+
+    if (m.has_attachments) loadAttachments(m.id).catch(() => { /* the chips just stay absent */ });
+    // Reading a message is what marks it read — the same PATCH an integration
+    // would send, so the mirror and the provider agree.
+    if (!m.read) markRead(m.id);
+  }
+
+  function emptyBody(title, detail) {
+    const box = document.createElement("div");
+    box.className = "empty";
+    const h = document.createElement("div");
+    h.className = "title";
+    h.textContent = title;
+    box.append(h);
+    if (detail) { const p = document.createElement("div"); p.textContent = detail; box.append(p); }
+    $("reader-body").replaceChildren(box);
+  }
+
+  function markRead(id) {
+    api("/api/v1/emails/" + encodeURIComponent(id) + "?account_id=" + encodeURIComponent(state.account),
+      { method: "PATCH", body: { read: true } })
+      .then(() => { const b = optionFor($("list"), id); if (b) b.classList.remove("unread"); })
+      .catch(fail);
+  }
+
+  async function loadAttachments(id) {
+    const account = state.account;
+    const data = await api("/api/v1/emails/" + encodeURIComponent(id) +
+      "/attachments?account_id=" + encodeURIComponent(account));
+    // The reader can have moved on while this was in flight, and #atts is
+    // whatever the reader holds *now* — hanging one message's attachments (and
+    // its download handler) under another one is how you send the wrong file.
+    if (state.selected !== id || state.account !== account) return;
+    const atts = (data.items || []).filter((a) => !a.is_inline);
+    const host = $("atts");
+    if (!host || !atts.length) return;
+    host.innerHTML = atts.map((a) =>
+      '<button type="button" class="btn sm" data-aid="' + esc(a.id) + '">📎 ' + esc(a.name) +
+      ' (' + esc(Math.max(1, Math.round(a.size / 1024))) + ' KB)</button>').join("");
+    host.addEventListener("click", async (e) => {
+      const btn = e.target.closest("button[data-aid]");
+      if (!btn) return;
+      const att = atts.find((a) => a.id === btn.dataset.aid);
+      if (!att) return;
+      btn.disabled = true;
+      try {
+        // The download rides the session cookie, so it goes through fetch and
+        // reaches the disk as a blob rather than as a bare navigation.
+        const res = await api.raw("/api/v1/emails/" + encodeURIComponent(id) +
+          "/attachments/" + encodeURIComponent(att.id) +
+          "?account_id=" + encodeURIComponent(account));
+        if (!res.ok) throw new Error("download failed (" + res.status + ")");
+        const url = URL.createObjectURL(await res.blob());
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = att.name; // a property, never markup
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        notice("error", "Download failed: " + ((err && err.message) || err));
+      }
+      btn.disabled = false;
+    });
+  }
+
+  // ---- wiring ----
+
+  // Keyboard nav for both listboxes: ↑/↓ and j/k move, Enter opens (the rows
+  // are real buttons, so Enter is the browser's own behaviour).
+  um.listNav($("folders"));
+  um.listNav($("list"));
+
+  $("menu").addEventListener("click", () => openSide(!side.classList.contains("open")));
+  $("back").addEventListener("click", () => {
+    setReading(false);
+    const b = optionFor($("list"), state.selected);
+    if (b) b.focus();
+  });
+
+  $("folders").addEventListener("click", (e) => {
+    const b = e.target.closest("[role=option]");
+    if (!b) return;
+    state.folder = b.dataset.id;
+    state.q = "";
+    $("q").value = "";
+    [...$("folders").querySelectorAll("[role=option]")].forEach((o) => o.setAttribute("aria-selected", String(o === b)));
+    openSide(false);
+    reload();
+  });
+
+  $("list").addEventListener("click", (e) => {
+    const b = e.target.closest("[role=option]");
+    if (b) openMessage(b.dataset.id);
+  });
+
+  $("acct").addEventListener("change", async () => {
+    state.account = $("acct").value;
+    state.folder = "";
+    state.selected = "";
+    setReading(false);
+    $("reader-body").innerHTML = '<div class="empty">Select a message</div>';
+    history.replaceState(null, "", "?account_id=" + encodeURIComponent(state.account));
+    await loadFolders();
+    reload();
+  });
+
+  let searchTimer;
+  $("q").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.q = $("q").value.trim();
+      reload();
+    }, 300);
+  });
+
+  $("unread").addEventListener("change", () => {
+    state.unread = $("unread").checked;
+    reload();
+  });
+
+  $("newer").addEventListener("click", () => {
+    state.offset = Math.max(0, state.offset - PAGE);
+    loadMessages();
+  });
+  $("older").addEventListener("click", () => {
+    state.offset += PAGE;
+    loadMessages();
+  });
+
+  // ---- boot ----
+
+  (async function init() {
+    try {
+      if (!(await loadAccounts())) {
+        const detail = document.createElement("span");
+        const a = document.createElement("a");
+        a.href = "/dashboard";
+        a.textContent = "dashboard";
+        detail.append("Connect one on the ", a, ".");
+        emptyRow($("folders"), "No folders", "");
+        emptyRow($("list"), "No mail accounts", detail);
+        return;
+      }
+      await loadFolders();
+      await loadMessages();
+    } catch (e) {
+      fail(e);
+    }
+  })();
+});
+</script>
+{{end}}

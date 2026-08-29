@@ -3,7 +3,6 @@ package api
 import (
 	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -15,6 +14,7 @@ import (
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/store"
+	"github.com/gauravrautela/unified-messaging/internal/web"
 )
 
 // ---- cookies ----
@@ -117,39 +117,15 @@ func safeNext(raw string) string {
 
 // ---- pages ----
 
-var authTmpl = template.Must(template.New("auth").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Title}}</title>
-<style>
-:root{--bg:#f7f7f8;--card:#fff;--text:#1a1a1a;--muted:#6b6b76;--border:#e6e6ea;--accent:#2563eb;--accent-text:#fff;--danger:#dc2626;--danger-bg:#fef2f2}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--text:#f0f0f2;--muted:#9a9aa5;--border:#2a2d36;--danger-bg:#2a1414}}
-body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text)}
-.card{max-width:24rem;margin:4rem auto;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2rem}
-h1{font-size:1.35rem;margin:0 0 .25rem}
-p{color:var(--muted);font-size:.9rem;margin:.25rem 0 1rem}
-form{display:flex;flex-direction:column;gap:.75rem}
-input{font:inherit;padding:.6rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text)}
-button{font:inherit;cursor:pointer;padding:.6rem .9rem;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-text)}
-.err{color:var(--danger);background:var(--danger-bg);border-radius:8px;padding:.6rem .8rem;font-size:.85rem}
-a{color:var(--accent)}
-</style></head><body>
-<div class="card">
-  <h1>{{.Title}}</h1>
-  <p>{{.Lead}}</p>
-  {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
-  <form method="post" action="{{.Action}}">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <input name="email" type="email" placeholder="Email" value="{{.Email}}" required autofocus>
-    <input name="password" type="password" placeholder="Password{{if .Signup}} (10+ characters){{end}}" required minlength="{{if .Signup}}10{{else}}1{{end}}">
-    {{if .Signup}}<input name="name" type="text" placeholder="Your name (optional)">{{end}}
-    <button type="submit">{{.Button}}</button>
-  </form>
-  <p>{{.AltLead}} <a href="{{.AltHref}}">{{.AltText}}</a></p>
-</div>
-</body></html>`))
-
+// authPage is everything the sign-in and sign-up forms differ by. Both are
+// the one "login" template on the public shell: the pages are the same form
+// with different words, and two templates would only let the two drift.
 type authPage struct {
 	Title, Lead, Action, Button, AltLead, AltHref, AltText, Email, Error string
+	// Pending is what the submit button says once it has been pressed, so a
+	// slow round trip does not look like a dead page (and cannot be pressed
+	// twice).
+	Pending string
 	// CSRF is filled in by renderAuth, never by the page constructors, so no
 	// path can render a form without it.
 	CSRF   string
@@ -165,25 +141,35 @@ func loginPage(next, email, errMsg string) authPage {
 	if next != "" {
 		action += "?next=" + url.QueryEscape(next)
 	}
-	return authPage{Title: "Sign in", Lead: "Sign in to manage connected accounts and API keys.",
-		Action: action, Button: "Sign in", AltLead: "New here?", AltHref: "/signup", AltText: "Create an account",
+	// Title is the page title as well as the form's heading, and layout_head
+	// already appends "· Entropix" — naming the brand here too would render
+	// "Sign in to Entropix · Entropix".
+	return authPage{Title: "Sign in", Lead: "Manage connected accounts, webhooks and API keys.",
+		Action: action, Button: "Sign in", Pending: "Signing in…",
+		AltLead: "New here?", AltHref: "/signup", AltText: "Create an account",
 		Email: email, Error: errMsg}
 }
 
 func signupPage(email, errMsg string) authPage {
-	return authPage{Title: "Create your account", Lead: "One account per developer. You will get API keys next.",
-		Action: "/signup", Button: "Create account", AltLead: "Already have one?", AltHref: "/login", AltText: "Sign in",
+	return authPage{Title: "Create account", Lead: "One account per developer. You will get API keys next.",
+		Action: "/signup", Button: "Create account", Pending: "Creating account…",
+		AltLead: "Already have one?", AltHref: "/login", AltText: "Sign in",
 		Email: email, Error: errMsg, Signup: true}
 }
 
 // renderAuth is a method so that every rendering of a form — the happy path
 // and all six error paths — mints or refreshes the CSRF cookie and embeds the
 // matching field. A page rendered without one would 403 on submit.
+//
+// Everything past the token — buffering, the Content-Type, the status — is
+// renderPage's job: an auth form renders under five different statuses (200,
+// 400, 401, 403, 500) and renderPage takes the status as a parameter.
 func (s *Server) renderAuth(w http.ResponseWriter, r *http.Request, status int, p authPage) {
 	p.CSRF = s.csrfToken(w, r)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_ = authTmpl.Execute(w, p)
+	s.renderPage(w, status, "login", map[string]any{
+		"Shell": web.Shell{Title: p.Title, Version: web.Version},
+		"P":     p,
+	})
 }
 
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
@@ -490,4 +476,42 @@ func (s *Server) handleSetRedirectDomains(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"redirect_domains": domains})
+}
+
+// ---- message retention policy ----
+
+type setRetentionRequest struct {
+	MaxAgeSecs int64 `json:"retention_max_age_secs"`
+}
+
+// maxRetentionSecs is a year. Anything longer is indistinguishable from "keep
+// forever", which is what 0 already means, and a bound keeps a typo from
+// setting a policy that silently never fires.
+const maxRetentionSecs = 365 * 24 * 60 * 60
+
+// handleSetRetention is session-only, like the other account-settings
+// mutations: a leaked API key must not be able to change how long its
+// developer's message content is kept — in either direction. Shortening it
+// destroys content; lengthening it defeats the policy.
+func (s *Server) handleSetRetention(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSession(w, r) {
+		return
+	}
+	dev, _ := developerFrom(r.Context())
+	var req setRetentionRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.MaxAgeSecs < 0 || req.MaxAgeSecs > maxRetentionSecs {
+		writeError(w, http.StatusBadRequest, "invalid_body",
+			"retention_max_age_secs must be between 0 (keep forever) and 31536000 (one year)")
+		return
+	}
+	if err := s.store.SetRetentionMaxAge(dev.ID, req.MaxAgeSecs); err != nil {
+		logx.From(r.Context()).Error("setting retention", "developer_id", dev.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "could not save the retention policy")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"retention_max_age_secs": req.MaxAgeSecs})
 }

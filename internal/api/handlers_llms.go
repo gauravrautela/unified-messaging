@@ -23,7 +23,7 @@ func (s *Server) handleLLMsTxt(w http.ResponseWriter, r *http.Request) {
 
 var llmsTmpl = template.Must(template.New("llms").Parse(llmsTxt))
 
-const llmsTxt = `# Unified Messaging API
+const llmsTxt = `# Entropix API
 
 > One REST API to connect end users' mailboxes (Outlook / Microsoft 365) and WhatsApp numbers, read and send mail or chat messages in a provider-neutral shape, and receive signed webhooks when something arrives. Multi-tenant: every resource belongs to exactly one developer.
 
@@ -52,6 +52,7 @@ Spec version: v1
 - Key management (` + "`POST`" + `/` + "`DELETE /api/v1/api-keys`" + `) is session-only: an API key gets ` + "`403 session_required`" + `.
 - ` + "`POST /api/v1/me/password`" + ` (session-only) body ` + "`{current_password, new_password}`" + ` -> 204; changes the password and signs out every other session. ` + "`400 invalid_credentials`" + ` on a wrong current password, ` + "`400 invalid_body`" + ` if the new one is under 10 characters.
 - ` + "`PUT /api/v1/me/redirect-domains`" + ` (session-only) body ` + "`{domains: [\"app.example.com\", \"*.example.com\"]}`" + ` (max 20, ` + "`*.`" + ` covers subdomains) -> ` + "`{redirect_domains: [...]}`" + `. ` + "`success_redirect_url`" + `/` + "`failure_redirect_url`" + ` on ` + "`hosted-auth`" + ` must be this server's own origin or on this list, else ` + "`400 invalid_url`" + `.
+- ` + "`PUT /api/v1/me/retention`" + ` (session-only) body ` + "`{retention_max_age_secs: 0-31536000}`" + ` -> ` + "`{retention_max_age_secs}`" + `. Off (` + "`0`" + `) by default. Message content is deleted the moment every subscribing webhook has accepted it, and in no case kept past this many seconds — see ` + "`content_evicted`" + ` on Email and ChatMessage below.
 
 ## Objects
 
@@ -75,8 +76,9 @@ Attendee:
 ChatMessage:
 ` + "```" + `
 {id, account_id, chat_id, sender: Attendee, is_from_me, kind: "text"|"unsupported", text,
- quoted_message_id?, sent_at, edited_at?, deleted, status?: "sending"|"sent"|"delivered"|"read", reactions: [Reaction]}
+ quoted_message_id?, sent_at, edited_at?, deleted, content_evicted, status?: "sending"|"sent"|"delivered"|"read", reactions: [Reaction]}
 ` + "```" + `
+` + "`content_evicted`" + ` is true once the sender's retention policy has deleted this message's text; ` + "`text`" + ` is then always ` + "`\"\"`" + `. The chat and its attendees are unaffected — retention only ever touches message content.
 
 Reaction:
 ` + "```" + `
@@ -88,10 +90,11 @@ Email (complete form, returned by GET /api/v1/emails/{id} and inside events; lis
 {id, account_id, thread_id, folder_id, role?: "inbox"|"sentitems"|"drafts"|...,
  subject, from: {name?, email}, to: [{name?, email}], cc?: [...], bcc?: [...], reply_to?: [...],
  date (RFC3339), snippet, body?, body_type?: "html"|"text", body_plain?,
- read, flagged, draft, has_attachments,
+ read, flagged, draft, has_attachments, content_evicted,
  attachments?: [{id, name, mime_type, size, is_inline, content_id?}],
  internet_message_id?}
 ` + "```" + `
+` + "`content_evicted`" + ` is true once the sender's retention policy has deleted this message's content; ` + "`subject`" + `, ` + "`snippet`" + `, ` + "`body`" + `, ` + "`from`" + `, ` + "`to`" + `/` + "`cc`" + `/` + "`bcc`" + `/` + "`reply_to`" + ` and ` + "`attachments`" + ` are then all empty, permanently. ` + "`has_attachments`" + ` still reflects whether the message originally had any. This also means ` + "`GET /api/v1/emails?q=`" + ` can no longer match an evicted message, since search runs against ` + "`subject`" + `, ` + "`snippet`" + ` and the sender address.
 
 Webhook:
 ` + "```" + `

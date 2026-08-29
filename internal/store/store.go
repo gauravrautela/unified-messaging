@@ -455,28 +455,61 @@ func (s *Store) UpsertEmail(e model.Email) error {
 	_, err := s.db.Exec(s.q(`
 		INSERT INTO emails (account_id, id, thread_id, folder_id, subject, from_name, from_email,
 		  to_json, cc_json, bcc_json, reply_to_json, date, snippet, body, body_type,
-		  read, flagged, draft, has_attachments, internet_message_id, attachments_json)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		  read, flagged, draft, has_attachments, internet_message_id, attachments_json, stored_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id, id) DO UPDATE SET
 		  thread_id = excluded.thread_id, folder_id = excluded.folder_id,
-		  subject = excluded.subject, from_name = excluded.from_name,
-		  from_email = excluded.from_email, to_json = excluded.to_json,
-		  cc_json = excluded.cc_json, bcc_json = excluded.bcc_json,
-		  reply_to_json = excluded.reply_to_json, date = excluded.date,
-		  snippet = excluded.snippet,
+		  -- Content and participants freeze once evicted. A resync, or any
+		  -- delta carrying full message properties, would otherwise refill a
+		  -- row the tenant's retention policy has already emptied — silently,
+		  -- unattended, for every message.
+		  subject       = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.subject       ELSE excluded.subject END,
+		  from_name     = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.from_name     ELSE excluded.from_name END,
+		  from_email    = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.from_email    ELSE excluded.from_email END,
+		  to_json       = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.to_json       ELSE excluded.to_json END,
+		  cc_json       = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.cc_json       ELSE excluded.cc_json END,
+		  bcc_json      = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.bcc_json      ELSE excluded.bcc_json END,
+		  reply_to_json = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.reply_to_json ELSE excluded.reply_to_json END,
+		  snippet       = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.snippet       ELSE excluded.snippet END,
+		  date = excluded.date,
 		  -- a delta "updated" event may carry only changed fields; never blank a
 		  -- body we already have just because this page omitted it
-		  body = CASE WHEN excluded.body = '' THEN emails.body ELSE excluded.body END,
-		  body_type = CASE WHEN excluded.body_type = '' THEN emails.body_type ELSE excluded.body_type END,
+		  body = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.body
+		              WHEN excluded.body = '' THEN emails.body ELSE excluded.body END,
+		  body_type = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.body_type
+		                   WHEN excluded.body_type = '' THEN emails.body_type ELSE excluded.body_type END,
 		  read = excluded.read, flagged = excluded.flagged, draft = excluded.draft,
 		  has_attachments = excluded.has_attachments,
 		  internet_message_id = excluded.internet_message_id,
-		  attachments_json = CASE WHEN excluded.attachments_json = '[]'
-		    THEN emails.attachments_json ELSE excluded.attachments_json END`),
+		  attachments_json = CASE WHEN emails.content_evicted_at IS NOT NULL THEN emails.attachments_json
+		                          WHEN excluded.attachments_json = '[]' THEN emails.attachments_json
+		                          ELSE excluded.attachments_json END`),
 		e.AccountID, e.ID, e.ThreadID, e.FolderID, e.Subject, e.From.Name, e.From.Email,
 		string(to), string(cc), string(bcc), string(rt), e.Date.Unix(), e.Snippet, e.Body,
 		e.BodyType, b2i(e.Read), b2i(e.Flagged), b2i(e.Draft), b2i(e.HasAttachments),
-		e.InternetMessageID, string(att))
+		e.InternetMessageID, string(att), time.Now().Unix())
+	return err
+}
+
+// EvictEmailContent blanks a message's content and its participants, keeping
+// the identifiers, timestamps and flags that sync depends on — EmailExists in
+// particular, which is the only thing stopping a resync from re-firing
+// mail_received for a mailbox we have already delivered.
+//
+// The `content_evicted_at IS NULL` clause makes it idempotent and preserves the
+// original eviction time, so a second call cannot quietly extend the audit
+// trail forward.
+func (s *Store) EvictEmailContent(accountID, id string, at time.Time) error {
+	defer s.trace("EvictEmailContent", time.Now(), "account_id", accountID, "email_id", id)
+	_, err := s.db.Exec(s.q(`
+		UPDATE emails SET
+		  subject = '', snippet = '', body = '', body_type = '',
+		  from_name = '', from_email = '',
+		  to_json = '[]', cc_json = '[]', bcc_json = '[]', reply_to_json = '[]',
+		  attachments_json = '[]',
+		  content_evicted_at = ?
+		WHERE account_id = ? AND id = ? AND content_evicted_at IS NULL`),
+		at.Unix(), accountID, id)
 	return err
 }
 
@@ -595,7 +628,8 @@ func (s *Store) ListThreads(accountID string, limit, offset int) ([]model.Thread
 const emailSelect = `
 SELECT account_id, id, thread_id, folder_id, subject, from_name, from_email,
        to_json, cc_json, bcc_json, reply_to_json, date, snippet, body, body_type,
-       read, flagged, draft, has_attachments, internet_message_id, attachments_json
+       read, flagged, draft, has_attachments, internet_message_id, attachments_json,
+       content_evicted_at
 FROM emails`
 
 func scanEmail(r scanner) (model.Email, error) {
@@ -603,10 +637,11 @@ func scanEmail(r scanner) (model.Email, error) {
 	var toJ, ccJ, bccJ, rtJ, attJ string
 	var date int64
 	var read, flagged, draft, hasAtt int
+	var evictedAt sql.NullInt64
 	err := r.Scan(&e.AccountID, &e.ID, &e.ThreadID, &e.FolderID, &e.Subject,
 		&e.From.Name, &e.From.Email, &toJ, &ccJ, &bccJ, &rtJ, &date, &e.Snippet,
 		&e.Body, &e.BodyType, &read, &flagged, &draft, &hasAtt,
-		&e.InternetMessageID, &attJ)
+		&e.InternetMessageID, &attJ, &evictedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return e, ErrNotFound
 	}
@@ -623,6 +658,7 @@ func scanEmail(r scanner) (model.Email, error) {
 	}
 	e.Date = time.Unix(date, 0).UTC()
 	e.Read, e.Flagged, e.Draft, e.HasAttachments = read == 1, flagged == 1, draft == 1, hasAtt == 1
+	e.ContentEvicted = evictedAt.Valid
 	return e, nil
 }
 

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/model"
@@ -351,4 +352,19 @@ func (r *Registry) Default() (Provider, error) {
 		return p, nil
 	}
 	return nil, errors.New("provider: none registered")
+}
+
+// DisplayName is how a provider is named to a human. Names() are stable
+// identifiers, not copy.
+func DisplayName(name string) string {
+	switch name {
+	case "OUTLOOK":
+		return "Outlook"
+	case "WHATSAPP":
+		return "WhatsApp"
+	}
+	if name == "" {
+		return ""
+	}
+	return strings.ToUpper(name[:1]) + strings.ToLower(name[1:])
 }

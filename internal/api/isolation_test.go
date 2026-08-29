@@ -102,6 +102,7 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		{"DELETE /api/v1/api-keys/{id}", "DELETE", "/api/v1/api-keys/" + keysA[0].ID, "", 403},
 		{"POST /api/v1/me/password", "POST", "/api/v1/me/password", `{"current_password":"longenoughpassword","new_password":"another strong one"}`, 403},
 		{"PUT /api/v1/me/redirect-domains", "PUT", "/api/v1/me/redirect-domains", `{"domains":[]}`, 403},
+		{"PUT /api/v1/me/retention", "PUT", "/api/v1/me/retention", `{"retention_max_age_secs":3600}`, 403},
 	}
 	// buildRequest constructs a fresh request for tc each time it is called,
 	// so the same table can be driven once per credential kind: an
@@ -156,6 +157,9 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		// Sets B's own redirect-domain allowlist; 200 with B's own (empty)
 		// list back, never A's.
 		"PUT /api/v1/me/redirect-domains": 200,
+		// Sets B's own message retention policy; 200 with the value back,
+		// never A's.
+		"PUT /api/v1/me/retention": 200,
 	}
 	for _, tc := range cases {
 		want := tc.want
@@ -315,6 +319,27 @@ func TestBrowserRoutesIsolation(t *testing.T) {
 			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
 				if rec.Code != http.StatusForbidden {
 					t.Errorf("login without csrf: status=%d, want 403 (body %s)", rec.Code, rec.Body.String())
+				}
+			},
+		},
+		{
+			name: "root serves the public site and carries no tenant data", route: "GET /{$}",
+			req: httptest.NewRequest(http.MethodGet, "/", nil),
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				if rec.Code != http.StatusOK {
+					t.Errorf("GET /: status=%d, want 200 (body %s)", rec.Code, rec.Body.String())
+				}
+				if strings.Contains(rec.Body.String(), devA.Email) || strings.Contains(rec.Body.String(), devA.ID) {
+					t.Errorf("GET / leaked A's identity: %s", rec.Body.String())
+				}
+			},
+		},
+		{
+			name: "static assets are served without a session", route: "GET /static/",
+			req: httptest.NewRequest(http.MethodGet, "/static/app.css", nil),
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				if rec.Code != http.StatusOK {
+					t.Errorf("GET /static/app.css: status=%d, want 200", rec.Code)
 				}
 			},
 		},
