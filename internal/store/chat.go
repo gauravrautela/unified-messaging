@@ -318,11 +318,11 @@ func (s *Store) UpsertChatMessage(m model.ChatMessage) (bool, error) {
 	}
 	rj, _ := json.Marshal(m.Reactions)
 	res, err := s.db.Exec(s.q(`
-		INSERT INTO chat_messages (account_id, id, chat_id, sender_id, is_from_me, kind, text, quoted_id, sent_at, edited_at, deleted, status, reactions_json)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO chat_messages (account_id, id, chat_id, sender_id, is_from_me, kind, text, quoted_id, sent_at, edited_at, deleted, status, reactions_json, stored_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id, id) DO NOTHING`),
 		m.AccountID, m.ID, m.ChatID, m.Sender.ID, b2i(m.IsFromMe), m.Kind, m.Text, m.QuotedMessageID, m.SentAt.Unix(),
-		nullUnix(m.EditedAt), b2i(m.Deleted), m.Status, string(rj))
+		nullUnix(m.EditedAt), b2i(m.Deleted), m.Status, string(rj), time.Now().Unix())
 	if err != nil {
 		return false, err
 	}

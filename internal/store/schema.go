@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS developers (
   password_hash         TEXT NOT NULL,
   name                  TEXT NOT NULL DEFAULT '',
   created_at            {{BIGINT}} NOT NULL,
-  redirect_domains_json TEXT NOT NULL DEFAULT '[]'
+  redirect_domains_json TEXT NOT NULL DEFAULT '[]',
+  retention_max_age_secs {{BIGINT}} NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -111,6 +112,8 @@ CREATE TABLE IF NOT EXISTS emails (
   has_attachments     INTEGER NOT NULL DEFAULT 0,
   internet_message_id TEXT NOT NULL DEFAULT '',
   attachments_json    TEXT NOT NULL DEFAULT '[]',
+  stored_at           {{BIGINT}} NOT NULL DEFAULT 0,
+  content_evicted_at  {{BIGINT}},
   PRIMARY KEY (account_id, id)
 );
 CREATE INDEX IF NOT EXISTS emails_by_date   ON emails(account_id, date DESC);
@@ -228,6 +231,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   deleted        INTEGER NOT NULL DEFAULT 0,
   status         TEXT NOT NULL DEFAULT '',
   reactions_json TEXT NOT NULL DEFAULT '[]',
+  stored_at          {{BIGINT}} NOT NULL DEFAULT 0,
+  content_evicted_at {{BIGINT}},
   PRIMARY KEY (account_id, id)
 );
 CREATE INDEX IF NOT EXISTS chat_messages_by_chat ON chat_messages(account_id, chat_id, sent_at DESC, id DESC);
@@ -265,6 +270,18 @@ var sqliteMigrations = []string{
 	// taken before the upgrade. Keyed on length rather than a blanket DELETE so
 	// an upgrade does not sign out every developer who is currently signed in.
 	`DELETE FROM sessions WHERE length(id) <> 64`,
+	`ALTER TABLE developers ADD COLUMN retention_max_age_secs INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE emails ADD COLUMN stored_at INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE emails ADD COLUMN content_evicted_at INTEGER`,
+	`ALTER TABLE chat_messages ADD COLUMN stored_at INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE chat_messages ADD COLUMN content_evicted_at INTEGER`,
+	// Rows written before stored_at existed start their retention clock at the
+	// upgrade, not at the epoch — otherwise the first sweep after enabling a
+	// policy would evict the entire existing mirror at once. Idempotent: once
+	// stamped, no row matches stored_at = 0 again, because every insert path
+	// now sets it.
+	`UPDATE emails SET stored_at = CAST(strftime('%s','now') AS INTEGER) WHERE stored_at = 0`,
+	`UPDATE chat_messages SET stored_at = CAST(strftime('%s','now') AS INTEGER) WHERE stored_at = 0`,
 }
 
 // postgresMigrations are the same additive changes for Postgres, where
@@ -280,4 +297,13 @@ var postgresMigrations = []string{
 	// See the sqliteMigrations note: pre-hash session rows hold the raw token
 	// as the primary key (43 characters) instead of its sha256 (64).
 	`DELETE FROM sessions WHERE length(id) <> 64`,
+	`ALTER TABLE developers ADD COLUMN IF NOT EXISTS retention_max_age_secs BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE emails ADD COLUMN IF NOT EXISTS stored_at BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE emails ADD COLUMN IF NOT EXISTS content_evicted_at BIGINT`,
+	`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS stored_at BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS content_evicted_at BIGINT`,
+	// See the sqliteMigrations note: pre-existing rows start their retention
+	// clock at the upgrade rather than at the epoch.
+	`UPDATE emails SET stored_at = EXTRACT(EPOCH FROM now())::bigint WHERE stored_at = 0`,
+	`UPDATE chat_messages SET stored_at = EXTRACT(EPOCH FROM now())::bigint WHERE stored_at = 0`,
 }

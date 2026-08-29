@@ -455,8 +455,8 @@ func (s *Store) UpsertEmail(e model.Email) error {
 	_, err := s.db.Exec(s.q(`
 		INSERT INTO emails (account_id, id, thread_id, folder_id, subject, from_name, from_email,
 		  to_json, cc_json, bcc_json, reply_to_json, date, snippet, body, body_type,
-		  read, flagged, draft, has_attachments, internet_message_id, attachments_json)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		  read, flagged, draft, has_attachments, internet_message_id, attachments_json, stored_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id, id) DO UPDATE SET
 		  thread_id = excluded.thread_id, folder_id = excluded.folder_id,
 		  subject = excluded.subject, from_name = excluded.from_name,
@@ -476,7 +476,7 @@ func (s *Store) UpsertEmail(e model.Email) error {
 		e.AccountID, e.ID, e.ThreadID, e.FolderID, e.Subject, e.From.Name, e.From.Email,
 		string(to), string(cc), string(bcc), string(rt), e.Date.Unix(), e.Snippet, e.Body,
 		e.BodyType, b2i(e.Read), b2i(e.Flagged), b2i(e.Draft), b2i(e.HasAttachments),
-		e.InternetMessageID, string(att))
+		e.InternetMessageID, string(att), time.Now().Unix())
 	return err
 }
 

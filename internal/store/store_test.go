@@ -1476,3 +1476,72 @@ func TestMigrationDropsPreHashSessionRows(t *testing.T) {
 		t.Fatalf("sessions after reopen = %v, want only the hashed row", got)
 	}
 }
+
+// stored_at is ingestion time, not the provider's timestamp: a backfill of an
+// old mailbox must not look ancient to the retention sweep.
+func TestUpsertEmailStampsStoredAtOnInsertOnly(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedAccount(t, s)
+	old := time.Now().Add(-3 * 365 * 24 * time.Hour).UTC().Truncate(time.Second)
+
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", Subject: "hello", Body: "body", Date: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var first int64
+	if err := s.DB().QueryRow(s.Q(`SELECT stored_at FROM emails WHERE account_id = ? AND id = ?`), acct, "m1").Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first < time.Now().Add(-time.Minute).Unix() {
+		t.Fatalf("stored_at = %d, want a recent timestamp, not the message date %d", first, old.Unix())
+	}
+
+	// A later update must not restamp it, or nothing would ever age out.
+	if err := s.UpsertEmail(model.Email{
+		AccountID: acct, ID: "m1", Subject: "hello again", Body: "body", Date: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var second int64
+	if err := s.DB().QueryRow(s.Q(`SELECT stored_at FROM emails WHERE account_id = ? AND id = ?`), acct, "m1").Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("stored_at changed on update: %d -> %d", first, second)
+	}
+}
+
+func TestUpsertChatMessageStampsStoredAt(t *testing.T) {
+	s := newTestStore(t)
+	acct := seedChatAccount(t, s)
+	if err := s.UpsertChat(model.Chat{AccountID: acct, ID: "c1", Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertChatMessage(model.ChatMessage{
+		AccountID: acct, ID: "cm1", ChatID: "c1", Kind: "text", Text: "hi",
+		SentAt: time.Now().Add(-48 * time.Hour).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var storedAt int64
+	if err := s.DB().QueryRow(s.Q(`SELECT stored_at FROM chat_messages WHERE account_id = ? AND id = ?`), acct, "cm1").Scan(&storedAt); err != nil {
+		t.Fatal(err)
+	}
+	if storedAt < time.Now().Add(-time.Minute).Unix() {
+		t.Fatalf("stored_at = %d, want a recent timestamp", storedAt)
+	}
+}
+
+func TestDevelopersHaveRetentionColumnDefaultingToZero(t *testing.T) {
+	s := newTestStore(t)
+	dev := seedDeveloper(t, s, "dev_1", "dev1@example.com")
+	var secs int64
+	if err := s.DB().QueryRow(s.Q(`SELECT retention_max_age_secs FROM developers WHERE id = ?`), dev).Scan(&secs); err != nil {
+		t.Fatal(err)
+	}
+	if secs != 0 {
+		t.Fatalf("retention_max_age_secs = %d, want 0 (retention off by default)", secs)
+	}
+}
