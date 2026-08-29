@@ -182,6 +182,7 @@ var Endpoints = withAnchors([]Endpoint{
   "name": "Ada Lovelace",
   "created_at": "2026-08-21T09:58:03Z",
   "redirect_domains": ["app.example.com", "*.staging.example.com"],
+  "retention_max_age_secs": 2592000,
   "auth": "api_key"
 }`,
 	},
@@ -210,6 +211,20 @@ var Endpoints = withAnchors([]Endpoint{
 }`,
 		Response: `{
   "redirect_domains": ["app.example.com", "*.staging.example.com"]
+}`,
+	},
+	{
+		Method: "PUT", Path: "/api/v1/me/retention", Group: "Developer & keys",
+		Summary: "Set your message content retention policy. Session-only, so a leaked key cannot shorten or extend how long your message content is kept. Zero means keep forever.",
+		Params: []Param{
+			{Name: "retention_max_age_secs", In: "body", Type: "integer", Required: true,
+				Desc: `Seconds to keep message content: 0 (forever) to 31536000 (one year). After this age, message content is deleted while metadata persists.`},
+		},
+		Request: `{
+  "retention_max_age_secs": 2592000
+}`,
+		Response: `{
+  "retention_max_age_secs": 2592000
 }`,
 	},
 	{

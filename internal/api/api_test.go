@@ -4154,3 +4154,64 @@ func TestRootServesWebsiteAndStaticIsCacheable(t *testing.T) {
 		t.Fatalf("static: %d cache=%q", rec.Code, rec.Header().Get("Cache-Control"))
 	}
 }
+
+func TestSetRetention(t *testing.T) {
+	s, db := newTestServer(t)
+	h := s.Routes()
+	dev, key := seedDev(t, s, "a@x.com")
+
+	put := func(t *testing.T, body string, mod func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/me/retention", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, mod(req))
+		return rec
+	}
+	session := func(req *http.Request) *http.Request { return withSession(t, s, req, dev.ID) }
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"an hour", `{"retention_max_age_secs":3600}`, http.StatusOK},
+		{"zero disables", `{"retention_max_age_secs":0}`, http.StatusOK},
+		{"negative rejected", `{"retention_max_age_secs":-1}`, http.StatusBadRequest},
+		{"over a year rejected", `{"retention_max_age_secs":31536001}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := put(t, tc.body, session); rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+
+	// The value actually persists, and GET /api/v1/me reports it back.
+	if rec := put(t, `{"retention_max_age_secs":3600}`, session); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got, err := db.RetentionMaxAge(dev.ID); err != nil || got != time.Hour {
+		t.Fatalf("RetentionMaxAge = %v, %v; want 1h", got, err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), key))
+	if !strings.Contains(rec.Body.String(), `"retention_max_age_secs":3600`) {
+		t.Fatalf("GET /api/v1/me does not report the policy: %s", rec.Body.String())
+	}
+}
+
+// An API key must not be able to change how long its developer's content is
+// kept — in either direction. Shortening it destroys content; lengthening it
+// defeats the policy. Same rule as the other account settings.
+func TestSetRetentionIsSessionOnly(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/me/retention", strings.NewReader(`{"retention_max_age_secs":3600}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(req, key))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+}
