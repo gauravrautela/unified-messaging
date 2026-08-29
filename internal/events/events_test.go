@@ -822,6 +822,53 @@ func TestDeliverDoesNotEvictWithNoWebhooks(t *testing.T) {
 	}
 }
 
+// A hook whose payload fails to encode never received the event, even
+// though no HTTP attempt was ever made for it. Eviction must still not run:
+// treating this as "every hook accepted it" would destroy content that
+// nothing actually got. A year outside [0,9999] is the one value
+// encoding/json's time.Time refuses to marshal, so this forces
+// json.Marshal(evForHook) to fail for real without touching production code.
+func TestDeliverDoesNotEvictWhenEncodingFailsForAHook(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	seedEmail(t, db, "acc_1", "m1")
+	if err := db.SetRetentionMaxAge("dev_1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	rcv := newReceiver(t, http.StatusOK)
+	if err := db.SaveWebhook(model.Webhook{
+		ID: "wh_1", DeveloperID: "dev_1", AccountID: "acc_1",
+		URL: rcv.URL, Events: []string{"*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log, _ := logx.Capture()
+	d := NewDispatcher(db, nil, log)
+	// deliver is called directly (same package) rather than through Start/Emit;
+	// sem is normally built by Start, so build it here since deliver needs it.
+	d.sem = make(chan struct{}, 4)
+	email, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	email.Date = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	d.deliver(context.Background(), model.Event{
+		Type: model.EventMailReceived, AccountID: "acc_1", Email: &email,
+	})
+
+	if rcv.count() != 0 {
+		t.Fatalf("hook was called despite an encoding failure: %d hits", rcv.count())
+	}
+	got, err := db.GetEmail("acc_1", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ContentEvicted {
+		t.Fatal("evicted although the payload failed to encode for a matched hook")
+	}
+}
+
 func TestDeliverDoesNotEvictWhenRetentionIsOff(t *testing.T) {
 	db := newTestStore(t)
 	seedTenant(t, db)

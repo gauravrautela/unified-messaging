@@ -259,6 +259,10 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 		payload, err := json.Marshal(evForHook)
 		if err != nil {
 			d.log.Error("encoding event", "err", err)
+			// This hook never received the event, so the delivery cannot be
+			// treated as complete: eviction must not run as though every
+			// subscriber got it.
+			failed.Store(true)
 			// Skip only this hook, not the rest of the fan-out: another
 			// subscriber's payload may still encode fine.
 			continue
