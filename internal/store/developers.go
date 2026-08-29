@@ -53,8 +53,8 @@ func (s *Store) DeveloperByEmail(email string) (model.Developer, string, error) 
 	var created int64
 	var rdJSON string
 	err := s.db.QueryRow(s.q(`
-		SELECT id, email, name, password_hash, created_at, redirect_domains_json FROM developers WHERE email = ?`),
-		strings.ToLower(strings.TrimSpace(email))).Scan(&d.ID, &d.Email, &d.Name, &hash, &created, &rdJSON)
+		SELECT id, email, name, password_hash, created_at, redirect_domains_json, retention_max_age_secs FROM developers WHERE email = ?`),
+		strings.ToLower(strings.TrimSpace(email))).Scan(&d.ID, &d.Email, &d.Name, &hash, &created, &rdJSON, &d.RetentionMaxAgeSecs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, "", ErrNotFound
 	}
@@ -70,8 +70,8 @@ func (s *Store) GetDeveloper(id string) (model.Developer, error) {
 	var d model.Developer
 	var created int64
 	var rdJSON string
-	err := s.db.QueryRow(s.q(`SELECT id, email, name, created_at, redirect_domains_json FROM developers WHERE id = ?`), id).
-		Scan(&d.ID, &d.Email, &d.Name, &created, &rdJSON)
+	err := s.db.QueryRow(s.q(`SELECT id, email, name, created_at, redirect_domains_json, retention_max_age_secs FROM developers WHERE id = ?`), id).
+		Scan(&d.ID, &d.Email, &d.Name, &created, &rdJSON, &d.RetentionMaxAgeSecs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -177,10 +177,10 @@ func (s *Store) SessionDeveloper(hash string, now time.Time) (model.Developer, t
 	var devCreated, sessCreated, exp int64
 	var rdJSON string
 	err := s.db.QueryRow(s.q(`
-		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, s.expires_at, s.created_at
+		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, d.retention_max_age_secs, s.expires_at, s.created_at
 		FROM sessions s JOIN developers d ON d.id = s.developer_id
 		WHERE s.id = ? AND s.expires_at > ?`), hash, now.Unix()).
-		Scan(&d.ID, &d.Email, &d.Name, &devCreated, &rdJSON, &exp, &sessCreated)
+		Scan(&d.ID, &d.Email, &d.Name, &devCreated, &rdJSON, &d.RetentionMaxAgeSecs, &exp, &sessCreated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, time.Time{}, time.Time{}, ErrNotFound
 	}
@@ -250,10 +250,10 @@ func (s *Store) DeveloperByKeyHash(hash string) (model.Developer, model.APIKey, 
 	var rdJSON string
 	var last, revoked sql.NullInt64
 	err := s.db.QueryRow(s.q(`
-		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, k.id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at
+		SELECT d.id, d.email, d.name, d.created_at, d.redirect_domains_json, d.retention_max_age_secs, k.id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at
 		FROM api_keys k JOIN developers d ON d.id = k.developer_id
 		WHERE k.hash = ? AND k.revoked_at IS NULL`), hash).
-		Scan(&d.ID, &d.Email, &d.Name, &dCreated, &rdJSON, &k.ID, &k.Name, &k.Prefix, &kCreated, &last, &revoked)
+		Scan(&d.ID, &d.Email, &d.Name, &dCreated, &rdJSON, &d.RetentionMaxAgeSecs, &k.ID, &k.Name, &k.Prefix, &kCreated, &last, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, k, ErrNotFound
 	}
@@ -310,6 +310,34 @@ func (s *Store) RevokeAPIKey(developerID, id string, at time.Time) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetRetentionMaxAge sets how long message content may be retained for this
+// developer's accounts. 0 turns retention off.
+func (s *Store) SetRetentionMaxAge(developerID string, secs int64) error {
+	res, err := s.db.Exec(s.q(`UPDATE developers SET retention_max_age_secs = ? WHERE id = ?`), secs, developerID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RetentionMaxAge is the single-column read on the delivery hot path: the
+// dispatcher asks it once per delivered event to decide whether to evict.
+// A zero duration means retention is off.
+func (s *Store) RetentionMaxAge(developerID string) (time.Duration, error) {
+	var secs int64
+	err := s.db.QueryRow(s.q(`SELECT retention_max_age_secs FROM developers WHERE id = ?`), developerID).Scan(&secs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(secs) * time.Second, nil
 }
 
 func nullTime(n sql.NullInt64) *time.Time {

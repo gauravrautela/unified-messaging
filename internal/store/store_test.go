@@ -1784,3 +1784,42 @@ func TestGetChatMessageReportsContentEvicted(t *testing.T) {
 		t.Error("ContentEvicted = false after eviction, want true")
 	}
 }
+
+func TestSetAndReadRetentionMaxAge(t *testing.T) {
+	s := newTestStore(t)
+	dev := seedDeveloper(t, s, "dev_1", "dev1@example.com")
+
+	d, err := s.RetentionMaxAge(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 0 {
+		t.Fatalf("RetentionMaxAge = %v on a new developer, want 0 (retention off)", d)
+	}
+
+	if err := s.SetRetentionMaxAge(dev, 3600); err != nil {
+		t.Fatal(err)
+	}
+	d, err = s.RetentionMaxAge(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != time.Hour {
+		t.Fatalf("RetentionMaxAge = %v, want 1h", d)
+	}
+
+	got, err := s.GetDeveloper(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RetentionMaxAgeSecs != 3600 {
+		t.Fatalf("GetDeveloper().RetentionMaxAgeSecs = %d, want 3600", got.RetentionMaxAgeSecs)
+	}
+}
+
+func TestRetentionMaxAgeUnknownDeveloper(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.RetentionMaxAge("dev_missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RetentionMaxAge for an unknown developer = %v, want ErrNotFound", err)
+	}
+}

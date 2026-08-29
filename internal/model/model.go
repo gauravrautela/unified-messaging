@@ -234,6 +234,10 @@ type Developer struct {
 	// Always present in JSON, "[]" when empty, so a caller can render it
 	// without a nil check.
 	RedirectDomains []string `json:"redirect_domains"`
+	// RetentionMaxAgeSecs is how long message content may sit in the local
+	// mirror. 0 means keep forever, which is the default and today's
+	// behaviour; any positive value also turns on eviction-on-delivery.
+	RetentionMaxAgeSecs int64 `json:"retention_max_age_secs"`
 }
 
 // APIKey is the listable view of a key. The full key is returned exactly
