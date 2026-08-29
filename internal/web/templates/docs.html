@@ -39,6 +39,7 @@
   <div class="grp"><h2>Reference</h2><ul>
     <li><a href="#events">Events</a></li>
     <li><a href="#delivery">Webhook delivery</a></li>
+    <li><a href="#retention">Message retention</a></li>
     <li><a href="#errors">Errors</a></li>
     <li><a href="#limits">Rate limits &amp; idempotency</a></li>
     <li><a href="#self-hosting">Self-hosting</a></li>
@@ -186,6 +187,23 @@ ok := hmac.Equal([]byte(want), []byte(r.Header.Get("X-Outlook-Signature")))</pre
 <li><code>GET /api/v1/webhooks/{id}/deliveries</code> is the queue: what is waiting, what was abandoned, and why.</li>
 </ul>
 <p>Two other <code>kind</code>s post a short human notification instead of JSON, on the same event filter and the same retry schedule: <code>discord</code> (a <code>discord.com/api/webhooks/…</code> incoming-webhook URL) and <code>telegram</code> (a <code>bot_token</code> from <b>@BotFather</b> plus a <code>chat_id</code>). A Telegram target is checked against Telegram once at registration, so a bad token fails on the create call rather than silently at delivery time.</p>
+</section>
+
+<section id="retention">
+<h2>Message retention</h2>
+<p>By default every message body is kept forever. <code>PUT /api/v1/me/retention</code> (session-only) lowers that per developer: <code>{"retention_max_age_secs": 3600}</code> sets a limit in seconds, and <code>0</code> restores &ldquo;keep forever&rdquo;. Applies to every account you own, mail and chat alike.</p>
+<p>Content is dropped on whichever of these happens first:</p>
+<ul>
+<li><b>Every subscribing webhook has accepted it.</b> The moment the last hook that would have received a message succeeds, its content is deleted immediately &mdash; there is no waiting for the retention window to expire if delivery is already done.</li>
+<li><b>The retention window elapses.</b> An hourly sweep evicts anything older than <code>retention_max_age_secs</code> regardless of delivery state &mdash; a hook that is still retrying, or that was never configured, does not keep content alive past the limit.</li>
+</ul>
+<p>An evicted Email or ChatMessage still exists &mdash; you keep the id, the timestamp and <code>content_evicted: true</code> &mdash; but its content is gone, permanently:</p>
+<ul>
+<li><b>Search stops matching it.</b> <code>GET /api/v1/emails?q=</code> matches your query against <code>subject</code>, <code>snippet</code> and the sender address, all of which eviction blanks. An evicted email simply drops out of search results as it ages out, with no error to tell you why.</li>
+<li><b>There is no undo, and for WhatsApp there is no fallback.</b> Eviction is permanent for every provider. For WhatsApp specifically there is no history API to re-fetch a message from afterward, so once this service's copy is evicted, your own webhook endpoint's copy (if a delivery ever succeeded) is the only one that still exists anywhere.</li>
+<li><b>A WhatsApp edit to an already-evicted message is ignored.</b> If an edit arrives for a message whose content has already been evicted, the edit is dropped rather than reviving or partially restoring the row.</li>
+<li><b>For chat, only the message text is removed &mdash; not who was in the conversation.</b> Attendees are address-book state, stored independently of message content, and retention never touches them. A chat whose every message has been evicted still lists the same participants.</li>
+</ul>
 </section>
 
 <section id="errors">

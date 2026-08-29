@@ -168,6 +168,18 @@ document.addEventListener("DOMContentLoaded", () => {
   // ---- message list ----
 
   function listRow(m) {
+    // An evicted message has had its subject, snippet and sender blanked by
+    // the retention policy (store/retention.go). Left alone that renders as
+    // an empty row with no sender, which reads as a bug rather than a
+    // deliberate, permanent removal — so it gets its own explicit label.
+    if (m.content_evicted) {
+      return '<li><button type="button" role="option" data-id="' + esc(m.id) + '"' +
+        ' class="' + (m.read ? "" : "unread") + '" aria-selected="' + (m.id === state.selected) + '">' +
+          '<span class="top"><span class="title">(content removed by retention policy)</span>' +
+          '<span class="muted small when">' + esc(relTime(m.date)) + '</span></span>' +
+          '<span class="sub muted">Evicted — subject, sender and body are gone for good.</span>' +
+        '</button></li>';
+    }
     const who = (m.from && (m.from.name || m.from.email)) || "(unknown)";
     const marks = (m.flagged ? " ⚑" : "") + (m.has_attachments ? " 📎" : "") + (m.draft ? " [draft]" : "");
     return '<li><button type="button" role="option" data-id="' + esc(m.id) + '"' +
@@ -232,6 +244,14 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     if (state.selected !== id) return; // the reader moved on while this was in flight
+
+    if (m.content_evicted) {
+      emptyBody(
+        "Content removed by your retention policy",
+        "This message's subject, sender and body were deleted once every subscribing webhook accepted it (or when the " +
+        "retention limit was reached). Attachments are gone too. This cannot be undone — there is no copy left to restore.");
+      return;
+    }
 
     const line = (label, rs) => (rs && rs.length)
       ? '<div class="addr"><b>' + label + ':</b> ' +

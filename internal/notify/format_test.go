@@ -81,3 +81,39 @@ func TestFormatChatHeaderShowsWhere(t *testing.T) {
 		}
 	}
 }
+
+// status@broadcast is a single shared pseudo-chat that every contact's
+// status posts land in; its stored Chat.Name is a stale, borrowed value from
+// whichever contact's post first backfilled it (see internal/notify/format.go
+// chatName doc comment). The label must therefore come from the message
+// sender, never from the chat's name, no matter what that name says.
+func TestFormatStatusUsesSenderNotStaleChatName(t *testing.T) {
+	ev := model.Event{
+		Type:      model.EventChatReceived,
+		AccountID: "acc_1",
+		Chat:      &model.Chat{Kind: "status", Name: "Satish Mehra"},
+		Message:   &model.ChatMessage{Sender: model.Attendee{Name: "Vishal Gupta"}, Text: "[image]"},
+	}
+	md := Format(ev, Markdown)
+	if !strings.Contains(md, "Status · Vishal Gupta") {
+		t.Errorf("want status label to use sender name, got:\n%s", md)
+	}
+	if strings.Contains(md, "Satish Mehra") {
+		t.Errorf("want stale chat name not to leak into label, got:\n%s", md)
+	}
+}
+
+// Groups have genuine per-chat names; a group event must keep using the
+// chat's name, not the sender, so this fix does not regress the group path.
+func TestFormatGroupStillUsesChatName(t *testing.T) {
+	ev := model.Event{
+		Type:      model.EventChatReceived,
+		AccountID: "acc_1",
+		Chat:      &model.Chat{Kind: "group", Name: "Founders"},
+		Message:   &model.ChatMessage{Sender: model.Attendee{Name: "Vatsal"}, Text: "hi"},
+	}
+	md := Format(ev, Markdown)
+	if !strings.Contains(md, "Group: Founders") {
+		t.Errorf("want group label to use chat name, got:\n%s", md)
+	}
+}

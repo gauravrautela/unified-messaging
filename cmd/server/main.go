@@ -67,7 +67,8 @@ func run(log *slog.Logger) error {
 	db.SetSealKey(cfg.TokenKey)
 	db.SetLogger(log.With("component", "store"))
 	db.PurgeExpiredOAuthStates()
-	db.PurgeDeadDeliveries(time.Now().Add(-cfg.DeliveryRetention))
+	db.PurgeDeadDeliveries(time.Now(), cfg.DeliveryRetention)
+	db.EvictExpiredContent(time.Now())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -90,12 +91,19 @@ func run(log *slog.Logger) error {
 				return
 			case <-t.C:
 				db.PurgeExpiredOAuthStates()
-				n, err := db.PurgeDeadDeliveries(time.Now().Add(-cfg.DeliveryRetention))
-				if err != nil {
+				if n, err := db.PurgeDeadDeliveries(time.Now(), cfg.DeliveryRetention); err != nil {
 					log.Error("purging dead deliveries", "err", err)
-					continue
+				} else {
+					log.Info("purge", "dead_deliveries", n)
 				}
-				log.Info("purge", "dead_deliveries", n)
+
+				// Maintenance jobs are independent: neither should skip the other
+				// on failure. If a purge fails, the retention sweep must still run.
+				if evicted, err := db.EvictExpiredContent(time.Now()); err != nil {
+					log.Error("evicting expired content", "err", err)
+				} else {
+					log.Info("retention sweep", "evicted", evicted)
+				}
 			}
 		}
 	}()

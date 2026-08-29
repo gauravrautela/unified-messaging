@@ -92,6 +92,51 @@ func (h *harness) events() []model.Event {
 	return append([]model.Event(nil), h.got...)
 }
 
+// The replay guard in sink.Edited compares prev.Text to the incoming text. On
+// an evicted row prev.Text is "", so a replayed edit would no longer match,
+// would re-apply, and would emit a second chat_updated. Eviction must not
+// introduce a duplicate-event bug.
+func TestEditOnEvictedMessageIsIgnored(t *testing.T) {
+	h := newHarness(t)
+	acc := h.link(t, "111")
+	if err := h.rt.Attach(acc); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.fake.Sink(acc) != nil })
+
+	sent := time.Now()
+	h.fake.Sink(acc).Message(acc, model.ChatMessage{
+		ID: "M1", ChatID: "c1", Kind: "text", Text: "meet me at six",
+		SentAt: sent, Sender: model.Attendee{ID: "peer"},
+	}, model.Chat{ID: "c1", Kind: "direct"}, model.Attendee{ID: "peer"})
+	waitFor(t, func() bool {
+		m, err := h.db.GetChatMessage(acc, "M1")
+		return err == nil && m.Text == "meet me at six"
+	})
+
+	if err := h.db.EvictChatMessageContent(acc, "M1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := len(h.events())
+
+	h.fake.Sink(acc).Edited(acc, "c1", "M1", "meet me at seven", time.Now())
+
+	// Give the sink's queue a chance to process it before asserting absence.
+	waitFor(t, func() bool {
+		return h.recs.Contains("content-evicted")
+	})
+	if got := len(h.events()); got != before {
+		t.Fatalf("edit on an evicted message emitted %d new event(s), want 0", got-before)
+	}
+	m, err := h.db.GetChatMessage(acc, "M1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Text != "" {
+		t.Fatalf("edit resurrected evicted text: %q", m.Text)
+	}
+}
+
 func TestAttachConnectsAndReceivesMessage(t *testing.T) {
 	h := newHarness(t)
 	acc := h.link(t, "1")

@@ -111,6 +111,16 @@ func messageFrom(e *events.Message) (model.ChatMessage, string) {
 		m.Text = msg.GetExtendedTextMessage().GetText()
 		m.QuotedMessageID = msg.GetExtendedTextMessage().GetContextInfo().GetStanzaID()
 	default:
+		if hasOnlyNoiseFields(msg) {
+			// Key-distribution setup is routinely piggybacked on real
+			// content in group sends, so it cannot be dropped just because
+			// it is present — only when it is ALL that is present. Reaching
+			// here already means no recognised content matched, so this is
+			// the point to decide "machinery" vs. "content we don't render
+			// yet". As with GetProtocolMessage() above, an empty kind means
+			// "drop it": no WhatsApp client ever shows this either.
+			return m, ""
+		}
 		m.Kind = "unsupported"
 		m.Text = mediaLabel(msg)
 	}
@@ -223,6 +233,41 @@ func mediaLabel(msg *waE2E.Message) string {
 		return "[unsupported: " + name + "]"
 	}
 	return "[unsupported]"
+}
+
+// noiseFields are wire fields that carry no user content, ever — protocol
+// machinery WhatsApp attaches to a message rather than something any client
+// renders. Kept deliberately small: each entry here silently drops a message
+// carrying nothing else, so a wrong one loses real user content.
+//
+//   - senderKeyDistributionMessage: E2E group-session key setup. WhatsApp
+//     piggybacks this on real content as often as it sends it bare (see
+//     hasOnlyNoiseFields), but on its own it is pure crypto bootstrapping.
+//   - messageContextInfo: reply/forward bookkeeping (e.g. stanza ids), never
+//     content by itself; already treated as invisible by firstFieldName below.
+var noiseFields = map[protoreflect.Name]bool{
+	"senderKeyDistributionMessage": true,
+	"messageContextInfo":           true,
+}
+
+// hasOnlyNoiseFields reports whether every populated field on msg is known
+// protocol noise (see noiseFields) — i.e. there is no content on it, matched
+// or not, that any chat should ever surface. Callers must check this only
+// after every recognised content case has already failed to match, since an
+// SKDM commonly rides alongside a real conversation or media message.
+func hasOnlyNoiseFields(msg *waE2E.Message) bool {
+	if msg == nil {
+		return false
+	}
+	only := true
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if !noiseFields[fd.Name()] {
+			only = false
+			return false
+		}
+		return true
+	})
+	return only
 }
 
 // firstFieldName is the JSON name of the first populated field of a message,

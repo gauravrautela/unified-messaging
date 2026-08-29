@@ -55,6 +55,13 @@ type FakeMail struct {
 	createCalls atomic.Int64
 	listCalls   atomic.Int64
 
+	// Attachments is what ListAttachments reports. Nil keeps the old
+	// behaviour: provider.ErrNotFound, as if the message had none.
+	Attachments []model.Attachment
+	// AttachmentCalls counts ListAttachments calls, so a test can assert that
+	// a read of an evicted message never reached the provider at all.
+	AttachmentCalls atomic.Int64
+
 	mu            sync.Mutex
 	deleted       []string
 	notifications []provider.Notification
@@ -97,7 +104,11 @@ func (f *FakeMail) UpdateMessage(ctx context.Context, accountID, messageID strin
 }
 
 func (f *FakeMail) ListAttachments(ctx context.Context, accountID, messageID string) ([]model.Attachment, error) {
-	return nil, provider.ErrNotFound
+	f.AttachmentCalls.Add(1)
+	if f.Attachments == nil {
+		return nil, provider.ErrNotFound
+	}
+	return f.Attachments, nil
 }
 
 func (f *FakeMail) DownloadAttachment(ctx context.Context, accountID, messageID, attachmentID string) ([]byte, error) {

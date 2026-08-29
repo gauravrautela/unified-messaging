@@ -306,7 +306,7 @@ func (s *Store) ReplaceChatMembers(accountID, chatID string, members []model.Cha
 const chatMessageSelect = `
 	SELECT m.account_id, m.id, m.chat_id, m.sender_id, COALESCE(a.phone, ''), COALESCE(a.name, ''),
 	       COALESCE(a.is_self, 0), m.is_from_me, m.kind, m.text, m.quoted_id, m.sent_at, m.edited_at,
-	       m.deleted, m.status, m.reactions_json
+	       m.deleted, m.status, m.reactions_json, m.content_evicted_at
 	FROM chat_messages m
 	LEFT JOIN attendees a ON a.account_id = m.account_id AND a.id = m.sender_id`
 
@@ -318,11 +318,11 @@ func (s *Store) UpsertChatMessage(m model.ChatMessage) (bool, error) {
 	}
 	rj, _ := json.Marshal(m.Reactions)
 	res, err := s.db.Exec(s.q(`
-		INSERT INTO chat_messages (account_id, id, chat_id, sender_id, is_from_me, kind, text, quoted_id, sent_at, edited_at, deleted, status, reactions_json)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO chat_messages (account_id, id, chat_id, sender_id, is_from_me, kind, text, quoted_id, sent_at, edited_at, deleted, status, reactions_json, stored_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id, id) DO NOTHING`),
 		m.AccountID, m.ID, m.ChatID, m.Sender.ID, b2i(m.IsFromMe), m.Kind, m.Text, m.QuotedMessageID, m.SentAt.Unix(),
-		nullUnix(m.EditedAt), b2i(m.Deleted), m.Status, string(rj))
+		nullUnix(m.EditedAt), b2i(m.Deleted), m.Status, string(rj), time.Now().Unix())
 	if err != nil {
 		return false, err
 	}
@@ -447,8 +447,17 @@ func (s *Store) ApplyReaction(accountID, id string, r model.Reaction) error {
 	})
 }
 
+// EditChatMessage rewrites a message's text. The content_evicted_at IS NULL
+// guard mirrors EvictChatMessageContent below: without it, an edit against an
+// already-evicted row would resurrect content the retention policy destroyed
+// — permanently, since an evicted row is exactly the row every eviction path
+// (this store's own sweep and the delivery trigger) skips forever. Matching
+// zero rows is not an error here; both callers rely on that, so a match
+// against an evicted row is a silent no-op rather than a failure.
 func (s *Store) EditChatMessage(accountID, id, text string, at time.Time) error {
-	_, err := s.db.Exec(s.q(`UPDATE chat_messages SET text = ?, edited_at = ? WHERE account_id = ? AND id = ?`),
+	_, err := s.db.Exec(s.q(`
+		UPDATE chat_messages SET text = ?, edited_at = ?
+		WHERE account_id = ? AND id = ? AND content_evicted_at IS NULL`),
 		text, at.Unix(), accountID, id)
 	return err
 }
@@ -460,6 +469,18 @@ func (s *Store) RevokeChatMessage(accountID, id string) error {
 	return err
 }
 
+// EvictChatMessageContent blanks a chat message's text. Unlike mail, the
+// participants are not on this row — they live in `attendees`, which is
+// address-book state and out of scope. The row itself survives so a late
+// reaction or receipt still resolves through GetChatMessage.
+func (s *Store) EvictChatMessageContent(accountID, id string, at time.Time) error {
+	_, err := s.db.Exec(s.q(`
+		UPDATE chat_messages SET text = '', content_evicted_at = ?
+		WHERE account_id = ? AND id = ? AND content_evicted_at IS NULL`),
+		at.Unix(), accountID, id)
+	return err
+}
+
 func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	var m model.ChatMessage
 	var isFromMe, deleted int
@@ -467,9 +488,10 @@ func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	var editedAt sql.NullInt64
 	var reactionsJSON string
 	var senderIsSelf int
+	var evictedAt sql.NullInt64
 	err := r.Scan(&m.AccountID, &m.ID, &m.ChatID, &m.Sender.ID, &m.Sender.Phone, &m.Sender.Name, &senderIsSelf,
 		&isFromMe, &m.Kind, &m.Text, &m.QuotedMessageID,
-		&sentAt, &editedAt, &deleted, &m.Status, &reactionsJSON)
+		&sentAt, &editedAt, &deleted, &m.Status, &reactionsJSON, &evictedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -488,6 +510,7 @@ func scanChatMessage(r scanner) (model.ChatMessage, error) {
 	if m.Reactions == nil {
 		m.Reactions = []model.Reaction{}
 	}
+	m.ContentEvicted = evictedAt.Valid
 	return m, nil
 }
 

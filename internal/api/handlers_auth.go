@@ -477,3 +477,41 @@ func (s *Server) handleSetRedirectDomains(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"redirect_domains": domains})
 }
+
+// ---- message retention policy ----
+
+type setRetentionRequest struct {
+	MaxAgeSecs int64 `json:"retention_max_age_secs"`
+}
+
+// maxRetentionSecs is a year. Anything longer is indistinguishable from "keep
+// forever", which is what 0 already means, and a bound keeps a typo from
+// setting a policy that silently never fires.
+const maxRetentionSecs = 365 * 24 * 60 * 60
+
+// handleSetRetention is session-only, like the other account-settings
+// mutations: a leaked API key must not be able to change how long its
+// developer's message content is kept — in either direction. Shortening it
+// destroys content; lengthening it defeats the policy.
+func (s *Server) handleSetRetention(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSession(w, r) {
+		return
+	}
+	dev, _ := developerFrom(r.Context())
+	var req setRetentionRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.MaxAgeSecs < 0 || req.MaxAgeSecs > maxRetentionSecs {
+		writeError(w, http.StatusBadRequest, "invalid_body",
+			"retention_max_age_secs must be between 0 (keep forever) and 31536000 (one year)")
+		return
+	}
+	if err := s.store.SetRetentionMaxAge(dev.ID, req.MaxAgeSecs); err != nil {
+		logx.From(r.Context()).Error("setting retention", "developer_id", dev.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "could not save the retention policy")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"retention_max_age_secs": req.MaxAgeSecs})
+}

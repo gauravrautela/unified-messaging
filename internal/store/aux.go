@@ -312,12 +312,28 @@ func (s *Store) DeleteDelivery(id string) error {
 	return err
 }
 
-// PurgeDeadDeliveries removes abandoned deliveries older than before. A dead
-// delivery keeps the full message payload it failed to send, so leaving them
-// forever is an unbounded (and increasingly sensitive) amount of retained
-// mail/chat content. Live deliveries — still retrying — are never touched.
-func (s *Store) PurgeDeadDeliveries(before time.Time) (int64, error) {
-	res, err := s.db.Exec(s.q(`DELETE FROM webhook_deliveries WHERE dead = 1 AND created_at < ?`), before.Unix())
+// PurgeDeadDeliveries removes abandoned deliveries. A dead delivery keeps the
+// full message payload it failed to send, so leaving them forever is an
+// unbounded (and increasingly sensitive) amount of retained mail/chat content.
+// Live deliveries — still retrying — are never touched: that payload is the
+// only copy the retry has.
+//
+// Two cutoffs apply, whichever is shorter: the deployment-wide `global`
+// window, and the owning developer's own retention policy. Without the second,
+// a tenant who asked us to hold content for an hour would still have bodies on
+// disk a week later, inside a dead delivery, and their policy would be a false
+// claim.
+func (s *Store) PurgeDeadDeliveries(now time.Time, global time.Duration) (int64, error) {
+	res, err := s.db.Exec(s.q(`
+		DELETE FROM webhook_deliveries
+		WHERE dead = 1 AND (
+		  created_at < ?
+		  OR EXISTS (
+		    SELECT 1 FROM webhooks w JOIN developers d ON d.id = w.developer_id
+		    WHERE w.id = webhook_deliveries.webhook_id
+		      AND d.retention_max_age_secs > 0
+		      AND ? - webhook_deliveries.created_at > d.retention_max_age_secs))`),
+		now.Add(-global).Unix(), now.Unix())
 	if err != nil {
 		return 0, err
 	}

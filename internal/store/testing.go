@@ -65,3 +65,7 @@ func OpenForTest(t testing.TB) *Store {
 	})
 	return s
 }
+
+// Q gives tests raw access to the dialect's rebinder, so a test can assert on
+// a column the public API does not expose.
+func (s *Store) Q(q string) string { return s.q(q) }

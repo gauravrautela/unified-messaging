@@ -76,7 +76,7 @@
         </form>
       </div>
     </div>
-    <div class="card">
+    <div class="card" style="margin-bottom:var(--s5)">
       <div class="card-head"><h2 style="margin:0">Redirect domains</h2></div>
       <div class="card-body">
         <form id="redirect-domains-form" style="max-width:28rem">
@@ -86,6 +86,25 @@
             <span class="hint">One per line. A hosted-auth success or failure redirect must land on one of these. Use <code>*.example.com</code> to cover every subdomain.</span>
           </div>
           <button class="btn primary" type="submit">Save domains</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 style="margin:0">Message retention</h2></div>
+      <div class="card-body">
+        <form id="retention-form" style="max-width:28rem">
+          <div class="field">
+            <label for="retention-max-age">Keep message content for</label>
+            <input id="retention-max-age" type="number" min="0" max="31536000" step="1" value="{{.RetentionMaxAgeSecs}}" required>
+            <span class="hint">
+              Seconds. Content is dropped the moment every subscribing webhook has accepted it, and is never kept
+              longer than this even if a webhook never accepts it. Eviction is permanent —
+              <strong>for WhatsApp there is no way to recover it</strong>: there is no history API to re-fetch from,
+              so your webhook endpoint is the only copy once content is gone. Use <code>0</code> to keep content
+              forever (the default).
+            </span>
+          </div>
+          <button class="btn primary" type="submit">Save retention</button>
         </form>
       </div>
     </div>
@@ -760,6 +779,33 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  async function loadRetention() {
+    try {
+      const me = await api("/api/v1/me");
+      $("retention-max-age").value = me.retention_max_age_secs || 0;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  $("retention-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submit = e.target.querySelector('[type=submit]');
+    const secs = parseInt($("retention-max-age").value, 10) || 0;
+    submit.disabled = true;
+    try {
+      const res = await api("/api/v1/me/retention", { method: "PUT", body: { retention_max_age_secs: secs } });
+      $("retention-max-age").value = res.retention_max_age_secs || 0;
+      notice("success", res.retention_max_age_secs
+        ? "Retention saved. Content older than " + res.retention_max_age_secs + "s is now evicted once every webhook accepts it."
+        : "Retention set to keep content forever.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
   // ---- dialogs ----
 
   document.querySelectorAll("dialog").forEach((d) => {
@@ -775,7 +821,7 @@ document.addEventListener("DOMContentLoaded", () => {
       history.replaceState(null, "", location.pathname + location.hash);
     }
     await loadProviders();
-    await Promise.all([loadAccounts(), loadWebhooks(), loadKeys(), loadRedirectDomains()]);
+    await Promise.all([loadAccounts(), loadWebhooks(), loadKeys(), loadRedirectDomains(), loadRetention()]);
   })();
 });
 </script>

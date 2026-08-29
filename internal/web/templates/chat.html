@@ -171,19 +171,26 @@ document.addEventListener("DOMContentLoaded", () => {
   // What a bubble actually shows. A poll that re-filled every bubble every
   // five seconds would drop the reader's text selection each round, so the
   // signature is stashed on the element and an unchanged message is left alone.
-  const sigOf = (m) => [m.text, m.status, m.edited_at, m.deleted, m.sent_at].join("\u0000");
+  const sigOf = (m) => [m.text, m.status, m.edited_at, m.deleted, m.content_evicted, m.sent_at].join("\u0000");
 
   // Every value here goes in as text, never as markup: a message body is the
   // most attacker-controlled string on the page.
   function fill(el, m) {
     el.dataset.sig = sigOf(m);
     el.className = "bubble" + (m.is_from_me ? " me" : "") + (m.deleted ? " deleted" : "") +
+      (m.content_evicted ? " evicted" : "") +
       (m.status === "sending" ? " sending" : "") + (m.status === "failed" ? " failed" : "");
     el.dataset.id = m.id;
     el.dataset.sent = m.sent_at || "";
     const text = document.createElement("div");
     text.className = "text";
-    text.textContent = m.deleted ? "This message was deleted" : (m.text || "");
+    // content_evicted means the text was permanently removed by the
+    // retention policy (store/retention.go): rendering m.text as "" here
+    // would look identical to a genuinely empty message, so it gets its own
+    // wording. This is distinct from m.deleted, which is the sender deleting
+    // the message on the provider's side.
+    text.textContent = m.content_evicted ? "Content removed by your retention policy"
+      : m.deleted ? "This message was deleted" : (m.text || "");
     const when = document.createElement("div");
     when.className = "when";
     when.textContent = m.status === "sending" ? "Sending…"

@@ -2361,6 +2361,60 @@ func TestChatRoutesHappyPath(t *testing.T) {
 	}
 }
 
+// C1: the public API edit handler must refuse to write over an evicted
+// message rather than resurrecting its content — mirroring the guard already
+// in place on the WhatsApp inbound edit path (chatsync/sink.go). The refusal
+// must happen before the provider is called, not after: a half-performed
+// edit (sent to WhatsApp but not recorded) is worse than refusing outright.
+func TestPatchChatMessageRefusesEvictedContent(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, key := seedDev(t, s, "a@x.com")
+	acc := seedChat(t, s, db, dev.ID)
+	h := s.Routes()
+	j := func(method, path, body string) *httptest.ResponseRecorder {
+		req := withKey(httptest.NewRequest(method, path, strings.NewReader(body)), key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "EVICTED1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "gone", SentAt: time.Now(), Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EvictChatMessageContent(acc, "EVICTED1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := j("PATCH", "/api/v1/chats/c1/messages/EVICTED1?account_id="+acc, `{"text":"resurrected"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "content_evicted") {
+		t.Fatalf("edit evicted message: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.fake().Commands(); len(got) != 0 {
+		t.Fatalf("provider was called for a refused edit: %d commands", len(got))
+	}
+	got, err := db.GetChatMessage(acc, "EVICTED1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "" {
+		t.Fatalf("text = %q after a refused edit, want it to stay blank", got.Text)
+	}
+
+	// The same request against a normal own-message still succeeds.
+	if _, err := db.UpsertChatMessage(model.ChatMessage{
+		AccountID: acc, ID: "NORMAL1", ChatID: "c1", IsFromMe: true, Kind: "text",
+		Text: "hi", SentAt: time.Now(), Sender: model.Attendee{ID: "self"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = j("PATCH", "/api/v1/chats/c1/messages/NORMAL1?account_id="+acc, `{"text":"hi!"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edit normal message: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestSendFailureLeavesNoRow(t *testing.T) {
 	s, db := newTestServer(t)
 	dev, key := seedDev(t, s, "a@x.com")
@@ -3780,6 +3834,60 @@ func TestMirrorMissIsNegativelyCached(t *testing.T) {
 	}
 }
 
+// Server.complete lazily fetches attachment metadata from the provider and
+// caches it on the row. On an evicted message the store write is already
+// refused by UpsertEmail's guard, but the response would still carry the
+// filenames — and a filename is as revealing as a subject line.
+func TestGetEmailDoesNotFetchAttachmentsForEvictedMessage(t *testing.T) {
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	fm.Attachments = []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}}
+	s, db := newTestServerWithProviders(t, fm)
+	_, key, acctID := seedFakeMailAccount(t, s, db)
+
+	if err := db.UpsertEmail(model.Email{
+		AccountID: acctID, ID: "M1", Subject: "quarterly numbers",
+		From: model.Recipient{Email: "alice@example.com"},
+		Body: "<p>secret</p>", BodyType: "html", Date: time.Now().UTC(),
+		HasAttachments: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A normal read fetches and caches the metadata: the baseline that proves
+	// the assertion below is about eviction and not about a broken fixture.
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/emails/M1?account_id="+acctID, nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "payroll.xlsx") {
+		t.Fatalf("baseline read did not return attachment metadata: %s", rec.Body.String())
+	}
+
+	if err := db.EvictEmailContent(acctID, "M1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := fm.AttachmentCalls.Load()
+
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/emails/M1?account_id="+acctID, nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "payroll.xlsx") {
+		t.Errorf("evicted message returned attachment filenames: %s", body)
+	}
+	if !strings.Contains(body, `"content_evicted":true`) {
+		t.Errorf("evicted message not flagged: %s", body)
+	}
+	if got := fm.AttachmentCalls.Load(); got != before {
+		t.Errorf("ListAttachments called %d extra times for an evicted message, want 0", got-before)
+	}
+}
+
 // TestNotificationHandlingIsBounded fires 100 concurrent notifications whose
 // ParseNotifications call blocks, and checks that at most 32 of them are
 // ever running inside the dedicated goroutine dispatchNotification spawns
@@ -4152,5 +4260,66 @@ func TestRootServesWebsiteAndStaticIsCacheable(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/app.js", nil))
 	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
 		t.Fatalf("static: %d cache=%q", rec.Code, rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestSetRetention(t *testing.T) {
+	s, db := newTestServer(t)
+	h := s.Routes()
+	dev, key := seedDev(t, s, "a@x.com")
+
+	put := func(t *testing.T, body string, mod func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/me/retention", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, mod(req))
+		return rec
+	}
+	session := func(req *http.Request) *http.Request { return withSession(t, s, req, dev.ID) }
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"an hour", `{"retention_max_age_secs":3600}`, http.StatusOK},
+		{"zero disables", `{"retention_max_age_secs":0}`, http.StatusOK},
+		{"negative rejected", `{"retention_max_age_secs":-1}`, http.StatusBadRequest},
+		{"over a year rejected", `{"retention_max_age_secs":31536001}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := put(t, tc.body, session); rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+
+	// The value actually persists, and GET /api/v1/me reports it back.
+	if rec := put(t, `{"retention_max_age_secs":3600}`, session); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got, err := db.RetentionMaxAge(dev.ID); err != nil || got != time.Hour {
+		t.Fatalf("RetentionMaxAge = %v, %v; want 1h", got, err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet, "/api/v1/me", nil), key))
+	if !strings.Contains(rec.Body.String(), `"retention_max_age_secs":3600`) {
+		t.Fatalf("GET /api/v1/me does not report the policy: %s", rec.Body.String())
+	}
+}
+
+// An API key must not be able to change how long its developer's content is
+// kept — in either direction. Shortening it destroys content; lengthening it
+// defeats the policy. Same rule as the other account settings.
+func TestSetRetentionIsSessionOnly(t *testing.T) {
+	s, _ := newTestServer(t)
+	_, key := seedDev(t, s, "a@x.com")
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/me/retention", strings.NewReader(`{"retention_max_age_secs":3600}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(req, key))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 }

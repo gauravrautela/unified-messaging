@@ -127,7 +127,16 @@ func chatName(ev model.Event) string {
 		case "group":
 			return "Group: " + firstNonEmpty(ev.Chat.Name, name, "unnamed")
 		case "status":
-			return "Status · " + firstNonEmpty(name, "unknown")
+			// status@broadcast is a single pseudo-chat shared by every
+			// contact's status posts, so its stored Chat.Name is meaningless
+			// by construction — it is whichever contact's post happened to
+			// backfill it first (see UpsertChat), and stays stale forever
+			// after. Ignore it entirely and use the sender.
+			sender := ""
+			if ev.Message != nil {
+				sender = attendee(ev.Message.Sender)
+			}
+			return "Status · " + firstNonEmpty(sender, "unknown")
 		case "channel":
 			id := strings.TrimSuffix(ev.Chat.ID, "@newsletter")
 			return "Channel · " + firstNonEmpty(ev.Chat.Name, id, name)

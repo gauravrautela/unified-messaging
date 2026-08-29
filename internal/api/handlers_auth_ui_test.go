@@ -79,3 +79,24 @@ func TestAuthErrorIsAnnounced(t *testing.T) {
 		t.Error("the re-rendered form dropped the email")
 	}
 }
+
+// The dashboard must actually render the control, or the setting exists only
+// for API callers and the "user option" this feature exists for is missing.
+func TestDashboardRendersRetentionControl(t *testing.T) {
+	s, db := newTestServer(t)
+	dev, _ := seedDev(t, s, "a@x.com")
+	if err := db.SetRetentionMaxAge(dev.ID, 3600); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withSession(t, s, httptest.NewRequest(http.MethodGet, "/dashboard", nil), dev.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"retention", "3600"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard does not render %q", want)
+		}
+	}
+}
