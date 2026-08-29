@@ -3780,6 +3780,60 @@ func TestMirrorMissIsNegativelyCached(t *testing.T) {
 	}
 }
 
+// Server.complete lazily fetches attachment metadata from the provider and
+// caches it on the row. On an evicted message the store write is already
+// refused by UpsertEmail's guard, but the response would still carry the
+// filenames — and a filename is as revealing as a subject line.
+func TestGetEmailDoesNotFetchAttachmentsForEvictedMessage(t *testing.T) {
+	fm := providertest.NewFakeMail("FAKEMAIL")
+	fm.Attachments = []model.Attachment{{ID: "a1", Name: "payroll.xlsx"}}
+	s, db := newTestServerWithProviders(t, fm)
+	_, key, acctID := seedFakeMailAccount(t, s, db)
+
+	if err := db.UpsertEmail(model.Email{
+		AccountID: acctID, ID: "M1", Subject: "quarterly numbers",
+		From: model.Recipient{Email: "alice@example.com"},
+		Body: "<p>secret</p>", BodyType: "html", Date: time.Now().UTC(),
+		HasAttachments: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A normal read fetches and caches the metadata: the baseline that proves
+	// the assertion below is about eviction and not about a broken fixture.
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/emails/M1?account_id="+acctID, nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "payroll.xlsx") {
+		t.Fatalf("baseline read did not return attachment metadata: %s", rec.Body.String())
+	}
+
+	if err := db.EvictEmailContent(acctID, "M1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := fm.AttachmentCalls.Load()
+
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, withKey(httptest.NewRequest(http.MethodGet,
+		"/api/v1/emails/M1?account_id="+acctID, nil), key))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "payroll.xlsx") {
+		t.Errorf("evicted message returned attachment filenames: %s", body)
+	}
+	if !strings.Contains(body, `"content_evicted":true`) {
+		t.Errorf("evicted message not flagged: %s", body)
+	}
+	if got := fm.AttachmentCalls.Load(); got != before {
+		t.Errorf("ListAttachments called %d extra times for an evicted message, want 0", got-before)
+	}
+}
+
 // TestNotificationHandlingIsBounded fires 100 concurrent notifications whose
 // ParseNotifications call blocks, and checks that at most 32 of them are
 // ever running inside the dedicated goroutine dispatchNotification spawns
