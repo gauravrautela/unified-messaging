@@ -88,6 +88,9 @@ func Format(ev model.Event, f Flavour) string {
 		}
 	case model.EventChatDeleted:
 		b.head("🗑", "Message deleted", chatName(ev))
+	case model.EventWebhookTest:
+		b.head("🔔", "Test event", acct)
+		b.line("This destination is receiving deliveries.")
 	case model.EventAccountError:
 		status := ""
 		if ev.Account != nil {

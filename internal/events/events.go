@@ -6,6 +6,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -546,4 +547,103 @@ func (d *Dispatcher) deliveryLog(dl store.Delivery, developerID string) *slog.Lo
 		log = log.With("developer_id", developerID)
 	}
 	return log
+}
+
+// Errors Redeliver returns for a delivery it will not send.
+var (
+	// ErrNotDead: the delivery is still being retried (or another request
+	// has just claimed it). Only an abandoned delivery is redelivered by hand.
+	ErrNotDead = errors.New("delivery is not dead")
+	// ErrExpired: the delivery is older than the developer's retention age,
+	// so its content is no longer ours to send.
+	ErrExpired = errors.New("delivery is older than the retention age")
+)
+
+// redeliverLease is how long a claimed redelivery is hidden from the retry
+// loop while its own attempt runs. Longer than any one send can take; if the
+// process dies mid-attempt, the retry loop picks the delivery up after it.
+const redeliverLease = 10 * time.Minute
+
+// Attempt is the outcome of the one immediate attempt a test or a redelivery
+// makes. Accepted false means the delivery is now in the retry queue, exactly
+// as a failed fresh delivery would be; Error says why, scrubbed.
+type Attempt struct {
+	DeliveryID string `json:"delivery_id"`
+	Accepted   bool   `json:"accepted"`
+	Error      string `json:"error,omitempty"`
+}
+
+// SendTest sends a webhook_test event to one hook, whatever its event filter,
+// through the same sender, signing and retry path as a fresh delivery. It
+// waits for the first attempt only; a failure is queued for retry and shows
+// in the hook's delivery log.
+func (d *Dispatcher) SendTest(ctx context.Context, h model.Webhook) (Attempt, error) {
+	ev := model.Event{
+		Type: model.EventWebhookTest, AccountID: h.AccountID, Timestamp: time.Now().UTC(),
+		Webhook: &model.WebhookRef{ID: h.ID, Name: h.Name},
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return Attempt{}, err
+	}
+	id, err := accounts.NewID("dl")
+	if err != nil {
+		return Attempt{}, err
+	}
+	dl := store.Delivery{
+		ID: id, WebhookID: h.ID, AccountID: h.AccountID, EventType: ev.Type,
+		Payload: payload, CreatedAt: time.Now().UTC(),
+	}
+	// Detached like every other delivery: a caller hanging up must not abort
+	// a POST the subscriber may already have accepted.
+	if err := d.send(context.WithoutCancel(ctx), h, dl, 1); err != nil {
+		d.enqueue(dl, err)
+		return Attempt{DeliveryID: id, Error: notify.ScrubErr(err).Error()}, nil
+	}
+	d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision", "decision", "delivered", "attempts", 1, "test", true)
+	return Attempt{DeliveryID: id, Accepted: true}, nil
+}
+
+// Redeliver re-sends one dead delivery of hook h from its stored payload,
+// unchanged. It refuses a delivery that is not dead (ErrNotDead) or older
+// than the developer's retention age (ErrExpired); one that does not exist —
+// including every delivery that was accepted, since those are never kept —
+// is store.ErrNotFound. The original row is reused: accepted, it is deleted
+// as a successful retry is; refused, it starts the retry schedule again.
+func (d *Dispatcher) Redeliver(ctx context.Context, h model.Webhook, deliveryID string) (Attempt, error) {
+	dl, err := d.store.GetDelivery(h.ID, deliveryID)
+	if err != nil {
+		return Attempt{}, err
+	}
+	if !dl.Dead {
+		return Attempt{}, ErrNotDead
+	}
+	maxAge, err := d.store.RetentionMaxAge(h.DeveloperID)
+	if err != nil {
+		return Attempt{}, err
+	}
+	now := time.Now().UTC()
+	// The same boundary PurgeDeadDeliveries uses: older than, not at.
+	if maxAge > 0 && now.Sub(dl.CreatedAt) > maxAge {
+		return Attempt{}, ErrExpired
+	}
+	claimed, err := d.store.ClaimDeadDelivery(dl.ID, now.Add(redeliverLease))
+	if err != nil {
+		return Attempt{}, err
+	}
+	if !claimed {
+		return Attempt{}, ErrNotDead
+	}
+	dl.Dead = false
+	dl.Attempts = 1
+	d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision", "decision", "redeliver")
+	if err := d.send(context.WithoutCancel(ctx), h, dl, 1); err != nil {
+		d.schedule(dl, err)
+		return Attempt{DeliveryID: dl.ID, Error: notify.ScrubErr(err).Error()}, nil
+	}
+	d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision", "decision", "delivered", "attempts", 1)
+	if err := d.store.DeleteDelivery(dl.ID); err != nil {
+		d.log.Error("clearing redelivered event", "delivery_id", dl.ID, "err", err)
+	}
+	return Attempt{DeliveryID: dl.ID, Accepted: true}, nil
 }
