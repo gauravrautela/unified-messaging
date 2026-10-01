@@ -90,7 +90,7 @@ func (s *Store) DeleteSubscription(id string) error {
 
 // ---------- outbound webhooks ----------
 
-const webhookSelect = `SELECT id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config FROM webhooks`
+const webhookSelect = `SELECT id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config, paused FROM webhooks`
 
 // webhookConfig is the sealed part of a hook: credentials that must not sit
 // in the row in clear. Only telegram hooks have one today.
@@ -126,9 +126,9 @@ func (s *Store) SaveWebhook(w model.Webhook) error {
 		config = sealed
 	}
 	_, err := s.db.Exec(s.q(`
-		INSERT INTO webhooks (id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`),
-		w.ID, w.DeveloperID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix(), w.Kind, config)
+		INSERT INTO webhooks (id, developer_id, account_id, name, url, secret, events_json, created_at, kind, config, paused)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`),
+		w.ID, w.DeveloperID, w.AccountID, w.Name, w.URL, w.Secret, string(ev), w.CreatedAt.Unix(), w.Kind, config, b2i(w.Paused))
 	return err
 }
 
@@ -167,6 +167,21 @@ func (s *Store) GetAnyWebhook(id string) (model.Webhook, error) {
 	return s.oneWebhook(webhookSelect+` WHERE id = ?`, id)
 }
 
+// SetWebhookPaused pauses or resumes one of a developer's hooks. Setting the
+// state a hook already has is not an error. Nothing else on the hook, and
+// none of its deliveries, is touched.
+func (s *Store) SetWebhookPaused(developerID, id string, paused bool) error {
+	res, err := s.db.Exec(s.q(`UPDATE webhooks SET paused = ? WHERE developer_id = ? AND id = ?`),
+		b2i(paused), developerID, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) DeleteWebhook(developerID, id string) error {
 	res, err := s.db.Exec(s.q(`DELETE FROM webhooks WHERE developer_id = ? AND id = ?`), developerID, id)
 	if err != nil {
@@ -200,7 +215,7 @@ func (s *Store) queryWebhooks(q string, args ...any) ([]model.Webhook, error) {
 		var w model.Webhook
 		var ev, kind, config string
 		var created int64
-		if err := rows.Scan(&w.ID, &w.DeveloperID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created, &kind, &config); err != nil {
+		if err := rows.Scan(&w.ID, &w.DeveloperID, &w.AccountID, &w.Name, &w.URL, &w.Secret, &ev, &created, &kind, &config, &w.Paused); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(ev), &w.Events)
@@ -287,12 +302,16 @@ func (s *Store) SaveDelivery(d Delivery) error {
 }
 
 // DueDeliveries returns live deliveries whose retry time has passed, oldest
-// first.
+// first. A paused hook's deliveries are left out: they keep their place and
+// their attempt count, and fall due again the moment the hook is resumed.
+// Filtering here rather than in the retry loop keeps a paused hook's backlog
+// from filling every page and starving everyone else's retries.
 func (s *Store) DueDeliveries(now time.Time, limit int) ([]Delivery, error) {
 	start := time.Now()
 	out, err := s.queryDeliveries(`
 		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
 		FROM webhook_deliveries WHERE dead = 0 AND next_attempt_at <= ?
+		  AND NOT EXISTS (SELECT 1 FROM webhooks w WHERE w.id = webhook_deliveries.webhook_id AND w.paused = 1)
 		ORDER BY next_attempt_at LIMIT ?`, now.Unix(), limit)
 	s.trace("DueDeliveries", start, "limit", limit, "rows", len(out))
 	return out, err

@@ -171,11 +171,14 @@ type Webhook struct {
 	Kind string `json:"kind"`
 	// URL is the developer endpoint (webhook) or the Discord incoming-webhook
 	// URL (discord); unused for telegram.
-	URL       string          `json:"url,omitempty"`
-	Secret    string          `json:"secret,omitempty"`
-	Telegram  *TelegramTarget `json:"telegram,omitempty"`
-	Events    []string        `json:"events"`
-	CreatedAt time.Time       `json:"created_at"`
+	URL      string          `json:"url,omitempty"`
+	Secret   string          `json:"secret,omitempty"`
+	Telegram *TelegramTarget `json:"telegram,omitempty"`
+	Events   []string        `json:"events"`
+	// Paused stops automatic delivery: events emitted while it is set are not
+	// sent to this hook, and its queued retries wait until it is resumed.
+	Paused    bool      `json:"paused"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Event names we emit.

@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
   events_json  TEXT NOT NULL DEFAULT '[]',
   kind         TEXT NOT NULL DEFAULT 'webhook',
   config       TEXT NOT NULL DEFAULT '',
+  paused       INTEGER NOT NULL DEFAULT 0,
   created_at   {{BIGINT}} NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhooks_by_developer ON webhooks(developer_id);
@@ -282,6 +283,7 @@ var sqliteMigrations = []string{
 	// now sets it.
 	`UPDATE emails SET stored_at = CAST(strftime('%s','now') AS INTEGER) WHERE stored_at = 0`,
 	`UPDATE chat_messages SET stored_at = CAST(strftime('%s','now') AS INTEGER) WHERE stored_at = 0`,
+	`ALTER TABLE webhooks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0`,
 }
 
 // postgresMigrations are the same additive changes for Postgres, where
@@ -306,4 +308,5 @@ var postgresMigrations = []string{
 	// clock at the upgrade rather than at the epoch.
 	`UPDATE emails SET stored_at = EXTRACT(EPOCH FROM now())::bigint WHERE stored_at = 0`,
 	`UPDATE chat_messages SET stored_at = EXTRACT(EPOCH FROM now())::bigint WHERE stored_at = 0`,
+	`ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS paused INTEGER NOT NULL DEFAULT 0`,
 }
