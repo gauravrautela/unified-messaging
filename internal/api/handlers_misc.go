@@ -538,6 +538,38 @@ func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, got)
 }
 
+func (s *Server) handlePauseWebhook(w http.ResponseWriter, r *http.Request) {
+	s.setWebhookPaused(w, r, true)
+}
+
+func (s *Server) handleResumeWebhook(w http.ResponseWriter, r *http.Request) {
+	s.setWebhookPaused(w, r, false)
+}
+
+// setWebhookPaused pauses or resumes one of the developer's hooks and answers
+// with the hook as it now stands. Asking for the state a hook is already in
+// is not an error: the answer is the same, so a retried request is safe.
+func (s *Server) setWebhookPaused(w http.ResponseWriter, r *http.Request, paused bool) {
+	dev, _ := developerFrom(r.Context())
+	id := r.PathValue("id")
+	err := s.store.SetWebhookPaused(dev.ID, id, paused)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		return
+	}
+	if err != nil {
+		logx.From(r.Context()).Error("pausing webhook", "webhook_id", id, "paused", paused, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	h, ok := s.ownWebhook(w, r, id)
+	if !ok {
+		return
+	}
+	h.Secret = ""
+	writeJSON(w, http.StatusOK, h)
+}
+
 // handleRedeliver re-sends one dead delivery from its stored payload. Only an
 // abandoned delivery inside the developer's retention age qualifies; an
 // accepted delivery is never kept, so it is simply not found.
