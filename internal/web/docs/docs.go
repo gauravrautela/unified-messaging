@@ -791,6 +791,31 @@ Content-Disposition: attachment; filename="plan.pdf"
 }`,
 	},
 
+	{
+		Method: "POST", Path: "/api/v1/webhooks/{id}/test", Group: "Webhooks",
+		Summary: "Send a signed webhook_test event to this hook, whatever its event filter, and say whether the destination accepted the first attempt. A refused test is retried and listed under deliveries like any other.",
+		Params: []Param{
+			{Name: "id", In: "path", Type: "string", Required: true, Desc: "The webhook id (wh_…) — a webhook, Discord or Telegram hook."},
+		},
+		Response: `{
+  "delivery_id": "dl_9c02f4a71be34d5f8a11c706",
+  "accepted": false,
+  "error": "status 500"
+}`,
+	},
+	{
+		Method: "POST", Path: "/api/v1/webhooks/{id}/deliveries/{did}/redeliver", Group: "Webhooks",
+		Summary: "Re-send one dead delivery from its stored payload, unchanged and signed as before. 409 not_dead if it is still retrying; 410 expired if it is older than your retention age; 404 if it does not exist — an accepted delivery is never kept, so it cannot be replayed. A refused redelivery starts the retry schedule again.",
+		Params: []Param{
+			{Name: "id", In: "path", Type: "string", Required: true, Desc: "The webhook id (wh_…)."},
+			{Name: "did", In: "path", Type: "string", Required: true, Desc: "The dead delivery's id (dl_…)."},
+		},
+		Response: `{
+  "delivery_id": "dl_9c02f4a71be34d5f8a11c706",
+  "accepted": true
+}`,
+	},
+
 	// ---- Chat ----
 	{
 		Method: "GET", Path: "/api/v1/chats", Group: "Chat",

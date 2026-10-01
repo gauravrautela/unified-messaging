@@ -86,6 +86,8 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		{"POST /api/v1/drafts/{id}/send", "POST", "/api/v1/drafts/D1/send?account_id=acc_A", "", 404},
 		{"DELETE /api/v1/webhooks/{id}", "DELETE", "/api/v1/webhooks/wh_A", "", 404},
 		{"GET /api/v1/webhooks/{id}/deliveries", "GET", "/api/v1/webhooks/wh_A/deliveries", "", 404},
+		{"POST /api/v1/webhooks/{id}/test", "POST", "/api/v1/webhooks/wh_A/test", "", 404},
+		{"POST /api/v1/webhooks/{id}/deliveries/{did}/redeliver", "POST", "/api/v1/webhooks/wh_A/deliveries/dl_A/redeliver", "", 404},
 		{"GET /api/v1/chats", "GET", "/api/v1/chats?account_id=acc_wa", "", 404},
 		{"POST /api/v1/chats", "POST", "/api/v1/chats", `{"account_id":"acc_wa","phone":"+15551234567","text":"hi"}`, 404},
 		{"GET /api/v1/chats/{id}", "GET", "/api/v1/chats/c1?account_id=acc_wa", "", 404},

@@ -353,6 +353,8 @@ accounts' events.
 | `GET` | `/api/v1/webhooks` |
 | `DELETE` | `/api/v1/webhooks/{id}` |
 | `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones |
+| `POST` | `/api/v1/webhooks/{id}/test` — send a signed `webhook_test` event; `{delivery_id, accepted, error}` |
+| `POST` | `/api/v1/webhooks/{id}/deliveries/{did}/redeliver` — re-send one dead delivery (409 not dead, 410 past retention) |
 
 The easiest way to set one is at connect time: pass `"webhook": {"url": ...,
 "secret": ...}` to `POST /api/v1/hosted-auth` and it is bound to the account
