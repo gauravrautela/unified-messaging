@@ -376,6 +376,7 @@ var Endpoints = withAnchors([]Endpoint{
       "kind": "webhook",
       "url": "https://api.example.com/hooks/messages",
       "events": ["mail_received", "mail_sent"],
+      "paused": false,
       "created_at": "2026-08-21T10:04:02Z"
     }
   ],
@@ -410,6 +411,7 @@ var Endpoints = withAnchors([]Endpoint{
   "url": "https://api.example.com/hooks/messages",
   "secret": "whsec_2f1e9c74d0a3",
   "events": ["mail_received", "mail_sent"],
+  "paused": false,
   "created_at": "2026-08-28T09:41:12Z"
 }`,
 	},
@@ -712,6 +714,7 @@ Content-Disposition: attachment; filename="plan.pdf"
       "kind": "webhook",
       "url": "https://api.example.com/hooks/messages",
       "events": ["*"],
+      "paused": false,
       "created_at": "2026-08-21T10:04:02Z"
     },
     {
@@ -720,6 +723,7 @@ Content-Disposition: attachment; filename="plan.pdf"
       "kind": "discord",
       "url": "https://discord.com/api/webhooks/1234567890/AbCdEf",
       "events": ["account_status"],
+      "paused": false,
       "created_at": "2026-08-25T11:30:18Z"
     }
   ],
@@ -753,6 +757,7 @@ Content-Disposition: attachment; filename="plan.pdf"
   "url": "https://api.example.com/hooks/messages",
   "secret": "whsec_2f1e9c74d0a3",
   "events": ["mail_received", "chat_received"],
+  "paused": false,
   "created_at": "2026-08-28T09:41:12Z"
 }`,
 	},
@@ -801,6 +806,38 @@ Content-Disposition: attachment; filename="plan.pdf"
   "delivery_id": "dl_9c02f4a71be34d5f8a11c706",
   "accepted": false,
   "error": "status 500"
+}`,
+	},
+	{
+		Method: "POST", Path: "/api/v1/webhooks/{id}/pause", Group: "Webhooks",
+		Summary: "Pause a hook while you maintain or fix its destination. Its setup and delivery log are kept. While paused, events are not sent to it and are not queued for it — they are skipped — and retries already queued wait, their attempts unspent, until it is resumed. A test or redelivery you ask for is still sent. Pausing a paused hook is not an error.",
+		Params: []Param{
+			{Name: "id", In: "path", Type: "string", Required: true, Desc: "The webhook id (wh_…)."},
+		},
+		Response: `{
+  "id": "wh_5c1de77a90b4426f9c0b12a7",
+  "name": "prod",
+  "kind": "webhook",
+  "url": "https://api.example.com/hooks/messages",
+  "events": ["*"],
+  "paused": true,
+  "created_at": "2026-08-21T10:04:02Z"
+}`,
+	},
+	{
+		Method: "POST", Path: "/api/v1/webhooks/{id}/resume", Group: "Webhooks",
+		Summary: "Resume a paused hook. New events reach it again, and retries held while it was paused fall due at once. Resuming a hook that is not paused is not an error.",
+		Params: []Param{
+			{Name: "id", In: "path", Type: "string", Required: true, Desc: "The webhook id (wh_…)."},
+		},
+		Response: `{
+  "id": "wh_5c1de77a90b4426f9c0b12a7",
+  "name": "prod",
+  "kind": "webhook",
+  "url": "https://api.example.com/hooks/messages",
+  "events": ["*"],
+  "paused": false,
+  "created_at": "2026-08-21T10:04:02Z"
 }`,
 	},
 	{

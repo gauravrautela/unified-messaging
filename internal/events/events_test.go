@@ -995,3 +995,79 @@ func TestDeliverDoesNotEvictWhenRetentionIsOff(t *testing.T) {
 		t.Fatal("evicted although the developer has no retention policy")
 	}
 }
+
+// A paused hook is not sent events emitted while it is paused, and they are
+// not queued for it; an unpaused hook on the same account still gets them.
+// After resuming, new events reach it again.
+func TestPausedHookIsSkippedUntilResumed(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	paused := newReceiver(t, http.StatusOK)
+	live := newReceiver(t, http.StatusOK)
+	for id, url := range map[string]string{"wh_p": paused.URL, "wh_l": live.URL} {
+		if err := db.SaveWebhook(model.Webhook{ID: id, DeveloperID: "dev_1", URL: url, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SetWebhookPaused("dev_1", "wh_p", true); err != nil {
+		t.Fatal(err)
+	}
+	d := newFastDispatcher(t, db, 10*time.Millisecond)
+
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
+	waitFor(t, func() bool { return live.count() == 1 })
+	// Give a would-be delivery to the paused hook time to land.
+	time.Sleep(100 * time.Millisecond)
+	if paused.count() != 0 {
+		t.Fatalf("paused hook received %d deliveries", paused.count())
+	}
+	if q, _ := db.ListDeliveries("wh_p", 10, 0); len(q) != 0 {
+		t.Fatalf("event queued for paused hook: %+v", q)
+	}
+
+	if err := db.SetWebhookPaused("dev_1", "wh_p", false); err != nil {
+		t.Fatal(err)
+	}
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M2"}})
+	waitFor(t, func() bool { return paused.count() == 1 && live.count() == 2 })
+}
+
+// Pausing holds retries already queued: none is attempted while the hook is
+// paused, so none spends its schedule, and each goes out once it is resumed.
+func TestPausedHookHoldsQueuedRetries(t *testing.T) {
+	db := newTestStore(t)
+	seedTenant(t, db)
+	rcv := newReceiver(t, http.StatusInternalServerError)
+	if err := db.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: rcv.URL, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	// The first retry is due well after the pause lands, so a hit while
+	// paused can only be the pause failing to hold it.
+	d := newFastDispatcher(t, db, 300*time.Millisecond, time.Hour)
+
+	d.Emit(model.Event{Type: model.EventMailReceived, AccountID: "acc_1", Email: &model.Email{ID: "M1"}})
+	waitFor(t, func() bool {
+		q, _ := db.ListDeliveries("wh_1", 10, 0)
+		return len(q) == 1
+	})
+	if err := db.SetWebhookPaused("dev_1", "wh_1", true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond) // past the retry's due time, many ticks
+	if rcv.count() != 1 {
+		t.Fatalf("paused hook was attempted: %d hits", rcv.count())
+	}
+	if q, _ := db.ListDeliveries("wh_1", 10, 0); len(q) != 1 || q[0].Attempts != 1 || q[0].Dead {
+		t.Fatalf("held delivery changed: %+v", q)
+	}
+	before := rcv.count()
+
+	rcv.setCode(http.StatusOK)
+	if err := db.SetWebhookPaused("dev_1", "wh_1", false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		q, _ := db.ListDeliveries("wh_1", 10, 0)
+		return len(q) == 0 && rcv.count() == before+1
+	})
+}

@@ -354,6 +354,8 @@ accounts' events.
 | `DELETE` | `/api/v1/webhooks/{id}` |
 | `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones |
 | `POST` | `/api/v1/webhooks/{id}/test` — send a signed `webhook_test` event; `{delivery_id, accepted, error}` |
+| `POST` | `/api/v1/webhooks/{id}/pause` — stop deliveries while you fix the destination; events meanwhile are skipped, queued retries wait |
+| `POST` | `/api/v1/webhooks/{id}/resume` — deliver again; held retries fall due at once |
 | `POST` | `/api/v1/webhooks/{id}/deliveries/{did}/redeliver` — re-send one dead delivery (409 not dead, 410 past retention) |
 
 The easiest way to set one is at connect time: pass `"webhook": {"url": ...,

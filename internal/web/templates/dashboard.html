@@ -533,11 +533,16 @@ document.addEventListener("DOMContentLoaded", () => {
       shown.map((h) =>
         '<tr data-wid="' + esc(h.id) + '">' +
           "<td><span class=\"badge\">" + esc(h.kind) + "</span> " +
+            (h.paused ? '<span class="pill warn">paused</span> ' : "") +
             (h.name ? "<strong>" + esc(h.name) + "</strong><br>" : "") +
             '<code style="word-break:break-all">' + esc(hookTarget(h)) + "</code></td>" +
           "<td>" + esc(hookScope(h)) + "</td>" +
           '<td class="muted small">' + esc((h.events && h.events.length) ? h.events.join(", ") : "everything") + "</td>" +
-          '<td style="text-align:right"><button class="btn sm danger" type="button" data-action="remove-webhook">Remove</button></td>' +
+          '<td style="text-align:right">' +
+            (h.paused
+              ? '<button class="btn sm" type="button" data-action="resume-webhook">Resume</button> '
+              : '<button class="btn sm" type="button" data-action="pause-webhook">Pause</button> ') +
+            '<button class="btn sm danger" type="button" data-action="remove-webhook">Remove</button></td>' +
         "</tr>").join("") +
       "</tbody></table>" +
       (hookFilter ? '<div class="row"><button class="btn sm ghost" type="button" data-action="clear-filter">Show every webhook</button></div>' : ""));
@@ -573,6 +578,22 @@ document.addEventListener("DOMContentLoaded", () => {
     if (action === "add-webhook") { $("webhook-dialog").showModal(); return; }
     if (action === "clear-filter") { hookFilter = ""; renderWebhooks(); return; }
     if (action === "reload-webhooks") { loadWebhooks(); return; }
+    if (action === "pause-webhook" || action === "resume-webhook") {
+      const pause = action === "pause-webhook";
+      const wid = btn.closest("tr").dataset.wid;
+      btn.disabled = true;
+      try {
+        await api("/api/v1/webhooks/" + encodeURIComponent(wid) + (pause ? "/pause" : "/resume"), { method: "POST" });
+        notice("success", pause
+          ? "Webhook paused. Events are skipped and queued retries wait until you resume it."
+          : "Webhook resumed.");
+        await loadWebhooks();
+      } catch (err) {
+        fail(err);
+        btn.disabled = false;
+      }
+      return;
+    }
     if (action !== "remove-webhook") return;
     const id = btn.closest("tr").dataset.wid;
     const hook = hooks.filter((h) => h.id === id)[0] || {};

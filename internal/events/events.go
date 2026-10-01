@@ -259,6 +259,15 @@ func (d *Dispatcher) deliver(ctx context.Context, ev model.Event) {
 				"developer_id", h.DeveloperID, "reason", "event filter")
 			continue
 		}
+		// A paused hook is not sent events emitted while it is paused, and
+		// they are not queued for it either: queuing would hold message
+		// content for as long as the pause lasts. It does not count toward
+		// eviction — it was never going to receive this event.
+		if h.Paused {
+			d.log.Debug("hook skipped", "webhook_id", h.ID, "account_id", ev.AccountID,
+				"developer_id", h.DeveloperID, "reason", "paused")
+			continue
+		}
 		if deliversFullPayload(h.Kind) {
 			matched++
 		}
@@ -430,6 +439,13 @@ func (d *Dispatcher) retryDue(stop, postCtx context.Context) {
 			d.deliveryLog(dl, "").Debug("delivery decision",
 				"decision", "dropped", "reason", "webhook gone")
 			_ = d.store.DeleteDelivery(dl.ID)
+			continue
+		}
+		if h.Paused {
+			// Paused after DueDeliveries listed it: leave the row as it is,
+			// attempts unspent, for when the hook is resumed.
+			d.deliveryLog(dl, h.DeveloperID).Debug("delivery decision",
+				"decision", "held", "reason", "paused")
 			continue
 		}
 		dl.Attempts++

@@ -226,3 +226,89 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// Pausing and resuming change only the flag: the hook's setup and its
+// delivery log come through both untouched, and another developer's hook is
+// not found.
+func TestSetWebhookPausedKeepsSetupAndDeliveries(t *testing.T) {
+	s := openWithKey(t)
+	in := model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Name: "ops", URL: "https://h.example.com",
+		Secret: "s3cret", Events: []string{"mail_received"}, CreatedAt: time.Now().UTC().Truncate(time.Second)}
+	if err := s.SaveWebhook(in); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.SaveDelivery(store.Delivery{ID: "dl_1", WebhookID: "wh_1", EventType: "mail_received",
+		Payload: []byte(`{}`), Attempts: 8, Dead: true, NextAttemptAt: now, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, paused := range []bool{true, true, false, false} {
+		if err := s.SetWebhookPaused("dev_1", "wh_1", paused); err != nil {
+			t.Fatalf("paused=%v: %v", paused, err)
+		}
+		got, err := s.GetWebhook("dev_1", "wh_1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Paused != paused {
+			t.Fatalf("paused = %v, want %v", got.Paused, paused)
+		}
+		got.Paused = false
+		if got.Name != in.Name || got.URL != in.URL || got.Secret != in.Secret ||
+			len(got.Events) != 1 || got.Events[0] != "mail_received" || !got.CreatedAt.Equal(in.CreatedAt) {
+			t.Fatalf("setup changed: %+v", got)
+		}
+		if q, _ := s.ListDeliveries("wh_1", 10, 0); len(q) != 1 || q[0].ID != "dl_1" {
+			t.Fatalf("delivery log changed: %+v", q)
+		}
+	}
+
+	if err := s.CreateDeveloper(model.Developer{ID: "dev_2", Email: "e@x.com"}, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetWebhookPaused("dev_2", "wh_1", true); err != store.ErrNotFound {
+		t.Fatalf("other developer: err = %v, want ErrNotFound", err)
+	}
+	if err := s.SetWebhookPaused("dev_1", "wh_nope", true); err != store.ErrNotFound {
+		t.Fatalf("unknown hook: err = %v, want ErrNotFound", err)
+	}
+}
+
+// A paused hook's due retries are not handed to the retry loop, and are again
+// once it is resumed, attempts unchanged.
+func TestDueDeliveriesSkipsPausedHooks(t *testing.T) {
+	s := openWithKey(t)
+	now := time.Now().UTC()
+	for _, id := range []string{"wh_1", "wh_2"} {
+		if err := s.SaveWebhook(model.Webhook{ID: id, DeveloperID: "dev_1", URL: "https://h.example.com", CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveDelivery(store.Delivery{ID: "dl_" + id, WebhookID: id, EventType: "mail_received",
+			Payload: []byte(`{}`), Attempts: 2, NextAttemptAt: now.Add(-time.Minute), CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetWebhookPaused("dev_1", "wh_1", true); err != nil {
+		t.Fatal(err)
+	}
+	due, err := s.DueDeliveries(now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].WebhookID != "wh_2" {
+		t.Fatalf("due while wh_1 paused = %+v", due)
+	}
+	if err := s.SetWebhookPaused("dev_1", "wh_1", false); err != nil {
+		t.Fatal(err)
+	}
+	due, _ = s.DueDeliveries(now, 10)
+	if len(due) != 2 {
+		t.Fatalf("due after resume = %+v", due)
+	}
+	for _, dl := range due {
+		if dl.Attempts != 2 {
+			t.Fatalf("attempts changed while paused: %+v", dl)
+		}
+	}
+}
