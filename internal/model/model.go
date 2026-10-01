@@ -185,6 +185,9 @@ const (
 	EventMailUpdated  = "mail_updated"
 	EventMailDeleted  = "mail_deleted"
 	EventAccountError = "account_status"
+	// EventWebhookTest is sent only to the one hook a developer asks to
+	// test; it is never emitted by sync and cannot be subscribed to.
+	EventWebhookTest = "webhook_test"
 )
 
 // KnownEvent reports whether name is one we emit (or the "*" wildcard).

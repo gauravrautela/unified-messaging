@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gauravrautela/unified-messaging/internal/accounts"
+	"github.com/gauravrautela/unified-messaging/internal/events"
 	"github.com/gauravrautela/unified-messaging/internal/logx"
 	"github.com/gauravrautela/unified-messaging/internal/model"
 	"github.com/gauravrautela/unified-messaging/internal/notify"
@@ -501,6 +502,64 @@ func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, listResponse[store.Delivery]{Items: items, Limit: limit, Offset: offset})
+}
+
+// ownWebhook loads hook id for the signed-in developer, writing the 404 (one
+// that does not exist and one of another developer's look the same) or 500
+// itself. ok false means the response is already written.
+func (s *Server) ownWebhook(w http.ResponseWriter, r *http.Request, id string) (model.Webhook, bool) {
+	dev, _ := developerFrom(r.Context())
+	h, err := s.store.GetWebhook(dev.ID, id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		return h, false
+	}
+	if err != nil {
+		logx.From(r.Context()).Error("loading webhook", "webhook_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return h, false
+	}
+	return h, true
+}
+
+// handleTestWebhook sends a signed webhook_test event to one hook and reports
+// whether the destination accepted the first attempt. A refusal is queued
+// and retried like any delivery, and shows in the hook's deliveries.
+func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
+	h, ok := s.ownWebhook(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	got, err := s.dispatcher.SendTest(r.Context(), h)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+// handleRedeliver re-sends one dead delivery from its stored payload. Only an
+// abandoned delivery inside the developer's retention age qualifies; an
+// accepted delivery is never kept, so it is simply not found.
+func (s *Server) handleRedeliver(w http.ResponseWriter, r *http.Request) {
+	h, ok := s.ownWebhook(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	got, err := s.dispatcher.Redeliver(r.Context(), h, r.PathValue("did"))
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "delivery not found")
+	case errors.Is(err, events.ErrNotDead):
+		writeError(w, http.StatusConflict, "not_dead", "only a dead delivery can be redelivered")
+	case errors.Is(err, events.ErrExpired):
+		writeError(w, http.StatusGone, "expired", "delivery is older than your retention age")
+	case err != nil:
+		logx.From(r.Context()).Error("redelivering", "webhook_id", h.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+	default:
+		writeJSON(w, http.StatusOK, got)
+	}
 }
 
 // deliveriesPaging parses limit/offset for the deliveries listing. Unlike

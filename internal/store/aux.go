@@ -307,6 +307,38 @@ func (s *Store) ListDeliveries(webhookID string, limit, offset int) ([]Delivery,
 		FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at LIMIT ? OFFSET ?`, webhookID, limit, offset)
 }
 
+// GetDelivery returns one queued or dead delivery of one webhook. The caller
+// has already proved the webhook belongs to the developer; scoping by
+// webhook_id here is what keeps a delivery id from another hook out of reach.
+func (s *Store) GetDelivery(webhookID, id string) (Delivery, error) {
+	out, err := s.queryDeliveries(`
+		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
+		FROM webhook_deliveries WHERE webhook_id = ? AND id = ?`, webhookID, id)
+	if err != nil {
+		return Delivery{}, err
+	}
+	if len(out) == 0 {
+		return Delivery{}, ErrNotFound
+	}
+	return out[0], nil
+}
+
+// ClaimDeadDelivery revives a dead delivery for a manual redelivery. It is one
+// conditional write, so of two concurrent requests exactly one claims the
+// row; the other gets false. next_attempt_at is pushed to leaseUntil so the
+// retry loop does not pick the row up while the redelivery's own attempt is
+// in flight — and does pick it up if the process dies before it finishes.
+func (s *Store) ClaimDeadDelivery(id string, leaseUntil time.Time) (bool, error) {
+	res, err := s.db.Exec(s.q(`
+		UPDATE webhook_deliveries SET dead = 0, next_attempt_at = ?
+		WHERE id = ? AND dead = 1`), leaseUntil.Unix(), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 func (s *Store) DeleteDelivery(id string) error {
 	_, err := s.db.Exec(s.q(`DELETE FROM webhook_deliveries WHERE id = ?`), id)
 	return err
