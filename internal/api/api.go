@@ -49,6 +49,10 @@ type Server struct {
 	// links tracks in-flight QR pairing attempts, keyed by connect state.
 	links *linkRegistry
 
+	// started is when the server was built; healthz reports the uptime so an
+	// operator can spot a restart loop without reading pod events.
+	started time.Time
+
 	// notifyTransport, when set, replaces the HTTP POST notify() would
 	// otherwise make. Tests use it to observe notify_url payloads without a
 	// real listener; production leaves it nil.
@@ -72,6 +76,7 @@ func NewServer(cfg *config.Config, s *store.Store, reg *provider.Registry, a *ac
 	srv := &Server{
 		cfg: cfg, store: s, registry: reg, accts: a, syncer: sy, auth: au,
 		chat: chat, dispatcher: dispatcher, senders: senders, log: log, links: newLinkRegistry(),
+		started: time.Now(),
 	}
 	go srv.sweepLinks()
 	return srv
@@ -198,7 +203,11 @@ func (s *Server) browserHandlers() map[string]http.HandlerFunc {
 					status = http.StatusServiceUnavailable
 				}
 			}
-			body := map[string]any{"dropped_events": dropped, "db": dbStatus}
+			body := map[string]any{
+				"dropped_events": dropped,
+				"db":             dbStatus,
+				"uptime_seconds": int64(time.Since(s.started).Seconds()),
+			}
 			if status == http.StatusOK {
 				body["status"] = "ok"
 			} else {

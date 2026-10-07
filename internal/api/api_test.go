@@ -2782,6 +2782,23 @@ func TestHealthzReportsDroppedEvents(t *testing.T) {
 	}
 }
 
+// A restart loop is easiest to spot from a small uptime, so healthz reports
+// how long this server has been up.
+func TestHealthzReportsUptime(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.started = time.Now().Add(-90 * time.Second)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	up, ok := body["uptime_seconds"].(float64)
+	if !ok || up < 90 || up > 120 {
+		t.Fatalf("healthz uptime_seconds = %v, want about 90", body["uptime_seconds"])
+	}
+}
+
 // healthz's "db" field is the one place an operator can tell the database
 // itself (not just the process) is reachable — separate from dropped_events,
 // which only ever reflects the in-process dispatcher.
