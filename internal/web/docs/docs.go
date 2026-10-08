@@ -762,6 +762,45 @@ Content-Disposition: attachment; filename="plan.pdf"
 }`,
 	},
 	{
+		Method: "GET", Path: "/api/v1/webhooks/{id}", Group: "Webhooks",
+		Summary: "One hook, as the listing shows it. The secret is never echoed. A hook that does not exist, and one that belongs to another developer, are the same 404.",
+		Params: []Param{
+			{Name: "id", In: "path", Type: "string", Required: true, Desc: "The webhook id (wh_…)."},
+		},
+		Response: `{
+  "id": "wh_5c1de77a90b4426f9c0b12a7",
+  "name": "prod",
+  "kind": "webhook",
+  "url": "https://api.example.com/hooks/messages",
+  "events": ["mail_received", "chat_received"],
+  "paused": false,
+  "created_at": "2026-08-28T09:41:12Z"
+}`,
+	},
+	{
+		Method: "PATCH", Path: "/api/v1/webhooks/{id}", Group: "Webhooks",
+		Summary: "Change a hook's name, destination URL and/or event filter without recreating it. Send only the fields to change. The id, the signing secret, the paused state, the account it is bound to and its delivery log are kept, so nothing that verifies signatures has to be redeployed. Each field is validated as it is on creation, against the hook's kind (a Discord hook's URL must stay a discord.com incoming-webhook URL; a Telegram hook has no URL). kind, secret, bot_token and chat_id cannot be changed — they are rejected as unknown fields. An empty body, or one that names none of the three fields, is a 400 empty_patch. Deliveries already queued for retry go to the new URL.",
+		Params: []Param{
+			{Name: "id", In: "path", Type: "string", Required: true, Desc: "The webhook id (wh_…)."},
+			{Name: "name", In: "body", Type: "string", Desc: `A new label; "" clears it.`},
+			{Name: "url", In: "body", Type: "string", Desc: "A new destination. Same rule as at creation: a public http(s) URL for kind=webhook, a discord.com incoming-webhook URL for kind=discord, not allowed for kind=telegram."},
+			{Name: "events", In: "body", Type: "string[]", Desc: `Replaces the event filter. Event types, or ["*"] for all. Must not be empty.`},
+		},
+		Request: `{
+  "url": "https://api.example.com/v2/hooks/messages",
+  "events": ["mail_received", "mail_sent"]
+}`,
+		Response: `{
+  "id": "wh_5c1de77a90b4426f9c0b12a7",
+  "name": "prod",
+  "kind": "webhook",
+  "url": "https://api.example.com/v2/hooks/messages",
+  "events": ["mail_received", "mail_sent"],
+  "paused": false,
+  "created_at": "2026-08-28T09:41:12Z"
+}`,
+	},
+	{
 		Method: "DELETE", Path: "/api/v1/webhooks/{id}", Group: "Webhooks",
 		Summary: "Delete a hook. Queued deliveries for it stop.",
 		Params: []Param{

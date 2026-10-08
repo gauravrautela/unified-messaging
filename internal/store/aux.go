@@ -182,6 +182,53 @@ func (s *Store) SetWebhookPaused(developerID, id string, paused bool) error {
 	return nil
 }
 
+// WebhookUpdate is the part of a hook that can be edited in place. A nil
+// field is left as it is; Events nil leaves the filter alone, while a non-nil
+// slice replaces it (callers decide what an empty one means). The signing
+// secret, the sealed target, kind, scope, paused flag and creation time are
+// not here on purpose: an edit never touches them.
+type WebhookUpdate struct {
+	Name   *string
+	URL    *string
+	Events []string
+}
+
+// errEmptyWebhookUpdate marks a call that names nothing to change: a bug in
+// the caller, kept distinct from ErrNotFound so it is never mistaken for a
+// missing hook.
+var errEmptyWebhookUpdate = errors.New("store: webhook update changes nothing")
+
+// UpdateWebhook applies u to one of a developer's hooks in a single UPDATE
+// bound to the developer, so a hook that is deleted, or that is another
+// developer's, is ErrNotFound and there is no read-then-write window. Its
+// deliveries are keyed by hook id and are not touched.
+func (s *Store) UpdateWebhook(developerID, id string, u WebhookUpdate) error {
+	var set []string
+	var args []any
+	if u.Name != nil {
+		set, args = append(set, "name = ?"), append(args, *u.Name)
+	}
+	if u.URL != nil {
+		set, args = append(set, "url = ?"), append(args, *u.URL)
+	}
+	if u.Events != nil {
+		ev, _ := json.Marshal(u.Events)
+		set, args = append(set, "events_json = ?"), append(args, string(ev))
+	}
+	if len(set) == 0 {
+		return errEmptyWebhookUpdate
+	}
+	args = append(args, developerID, id)
+	res, err := s.db.Exec(s.q(`UPDATE webhooks SET `+strings.Join(set, ", ")+` WHERE developer_id = ? AND id = ?`), args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) DeleteWebhook(developerID, id string) error {
 	res, err := s.db.Exec(s.q(`DELETE FROM webhooks WHERE developer_id = ? AND id = ?`), developerID, id)
 	if err != nil {

@@ -351,6 +351,8 @@ accounts' events.
 | `DELETE` | `/api/v1/accounts/{id}/webhooks/{wid}` |
 | `POST` | `/api/v1/webhooks` — developer-wide; empty `events` means everything |
 | `GET` | `/api/v1/webhooks` |
+| `GET` | `/api/v1/webhooks/{id}` — one hook, never its secret |
+| `PATCH` | `/api/v1/webhooks/{id}` — `{"name"?, "url"?, "events"?}`: change a hook in place; keeps its id, signing secret, paused state and delivery log (`kind`, `secret` and the Telegram target are not editable; empty `events` is a 400, use `["*"]`) |
 | `DELETE` | `/api/v1/webhooks/{id}` |
 | `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones |
 | `POST` | `/api/v1/webhooks/{id}/test` — send a signed `webhook_test` event; `{delivery_id, accepted, error}` |
