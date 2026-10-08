@@ -114,6 +114,8 @@ var apiRoutes = []string{
 	"POST /api/v1/drafts/{id}/send",
 	"GET /api/v1/webhooks",
 	"POST /api/v1/webhooks",
+	"GET /api/v1/webhooks/{id}",
+	"PATCH /api/v1/webhooks/{id}",
 	"DELETE /api/v1/webhooks/{id}",
 	"GET /api/v1/webhooks/{id}/deliveries",
 	"POST /api/v1/webhooks/{id}/test",
@@ -295,6 +297,8 @@ func (s *Server) Routes() http.Handler {
 
 		"GET /api/v1/webhooks":                 s.handleListWebhooks,
 		"POST /api/v1/webhooks":                s.handleCreateWebhook,
+		"GET /api/v1/webhooks/{id}":            s.handleGetWebhook,
+		"PATCH /api/v1/webhooks/{id}":          s.handlePatchWebhook,
 		"DELETE /api/v1/webhooks/{id}":         s.handleDeleteWebhook,
 		"GET /api/v1/webhooks/{id}/deliveries": s.handleListWebhookDeliveries,
 		"POST /api/v1/webhooks/{id}/test":      s.handleTestWebhook,

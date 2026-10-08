@@ -1,7 +1,9 @@
 package store_test
 
 import (
+	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -312,3 +314,113 @@ func TestDueDeliveriesSkipsPausedHooks(t *testing.T) {
 		}
 	}
 }
+
+// UpdateWebhook changes only what it is given, and never the secret, the
+// paused flag, the scope, the kind or the delivery log.
+func TestUpdateWebhookChangesOnlyTheSuppliedFields(t *testing.T) {
+	s := openWithKey(t)
+	created := time.Now().UTC().Truncate(time.Second)
+	in := model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Name: "prod", URL: "https://old.example.com/in",
+		Secret: "whsec_1", Events: []string{"mail_received"}, Paused: true, CreatedAt: created}
+	if err := s.SaveWebhook(in); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.SaveDelivery(store.Delivery{ID: "dl_1", WebhookID: "wh_1", EventType: "mail_received",
+		Payload: []byte(`{}`), Attempts: 8, Dead: true, NextAttemptAt: now, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	newURL, newName := "https://new.example.com/in", "staging"
+	for _, step := range []struct {
+		label string
+		upd   store.WebhookUpdate
+		want  func(*model.Webhook)
+	}{
+		{"name only", store.WebhookUpdate{Name: &newName}, func(w *model.Webhook) { w.Name = newName }},
+		{"url only", store.WebhookUpdate{URL: &newURL}, func(w *model.Webhook) { w.URL = newURL }},
+		{"events only", store.WebhookUpdate{Events: []string{"mail_sent", "*"}}, func(w *model.Webhook) { w.Events = []string{"mail_sent", "*"} }},
+		{"all three", store.WebhookUpdate{Name: strPtr(""), URL: strPtr("https://third.example.com"), Events: []string{"account_status"}},
+			func(w *model.Webhook) {
+				w.Name, w.URL, w.Events = "", "https://third.example.com", []string{"account_status"}
+			}},
+	} {
+		if err := s.UpdateWebhook("dev_1", "wh_1", step.upd); err != nil {
+			t.Fatalf("%s: %v", step.label, err)
+		}
+		step.want(&in)
+		got, err := s.GetWebhook("dev_1", "wh_1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Name != in.Name || got.URL != in.URL || !slices.Equal(got.Events, in.Events) {
+			t.Fatalf("%s: got %+v, want name=%q url=%q events=%v", step.label, got, in.Name, in.URL, in.Events)
+		}
+		if got.Secret != "whsec_1" || !got.Paused || got.Kind != model.WebhookKindWebhook ||
+			got.AccountID != "" || !got.CreatedAt.Equal(created) {
+			t.Fatalf("%s: untouched fields changed: %+v", step.label, got)
+		}
+		if q, _ := s.ListDeliveries("wh_1", 10, 0); len(q) != 1 || q[0].ID != "dl_1" {
+			t.Fatalf("%s: delivery log changed: %+v", step.label, q)
+		}
+	}
+}
+
+// Another developer's hook, and one that does not exist, are the same
+// ErrNotFound, and the former is left exactly as it was.
+func TestUpdateWebhookIsScopedToTheDeveloper(t *testing.T) {
+	s := openWithKey(t)
+	if err := s.CreateDeveloper(model.Developer{ID: "dev_2", Email: "e@x.com"}, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Name: "prod",
+		URL: "https://a.example.com", Events: []string{"mail_received"}, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	upd := store.WebhookUpdate{Name: strPtr("hijacked"), URL: strPtr("https://evil.example.com"), Events: []string{"*"}}
+	for _, tc := range []struct{ dev, id string }{{"dev_2", "wh_1"}, {"dev_1", "wh_nope"}} {
+		if err := s.UpdateWebhook(tc.dev, tc.id, upd); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("UpdateWebhook(%s, %s) = %v, want ErrNotFound", tc.dev, tc.id, err)
+		}
+	}
+	got, err := s.GetWebhook("dev_1", "wh_1")
+	if err != nil || got.Name != "prod" || got.URL != "https://a.example.com" || !slices.Equal(got.Events, []string{"mail_received"}) {
+		t.Fatalf("hook changed by another developer: %+v, %v", got, err)
+	}
+}
+
+// A call that names nothing to change is a bug in the caller, not a quiet
+// success and not a 'not found'.
+func TestUpdateWebhookWithNothingToChangeIsAnError(t *testing.T) {
+	s := openWithKey(t)
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://a.example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.UpdateWebhook("dev_1", "wh_1", store.WebhookUpdate{})
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("empty update = %v, want a plain error", err)
+	}
+}
+
+// Renaming or re-filtering a telegram hook must not touch its sealed target.
+func TestUpdateWebhookKeepsTelegramTarget(t *testing.T) {
+	s := openWithKey(t)
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", Kind: model.WebhookKindTelegram,
+		Telegram: &model.TelegramTarget{ChatID: "-100123", BotToken: "123:ABC"},
+		Events:   []string{"chat_received"}, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateWebhook("dev_1", "wh_1", store.WebhookUpdate{Name: strPtr("ops"), Events: []string{"*"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetWebhook("dev_1", "wh_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "ops" || !slices.Equal(got.Events, []string{"*"}) ||
+		got.Telegram == nil || got.Telegram.ChatID != "-100123" || got.Telegram.BotToken != "123:ABC" {
+		t.Fatalf("telegram hook after update = %+v (%+v)", got, got.Telegram)
+	}
+}
+
+func strPtr(s string) *string { return &s }

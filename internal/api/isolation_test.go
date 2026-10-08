@@ -84,6 +84,10 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		{"GET /api/v1/emails/{id}/attachments/{aid}", "GET", "/api/v1/emails/M1/attachments/A1?account_id=acc_A", "", 404},
 		{"POST /api/v1/drafts", "POST", "/api/v1/drafts", `{"account_id":"acc_A","to":[{"email":"x@y.com"}],"subject":"s","body":"b"}`, 404},
 		{"POST /api/v1/drafts/{id}/send", "POST", "/api/v1/drafts/D1/send?account_id=acc_A", "", 404},
+		{"GET /api/v1/webhooks/{id}", "GET", "/api/v1/webhooks/wh_A", "", 404},
+		{"PATCH /api/v1/webhooks/{id}", "PATCH", "/api/v1/webhooks/wh_A", `{"url":"https://b.example.com","events":["*"]}`, 404},
+		// An account-scoped hook is reached through the same route.
+		{"PATCH /api/v1/webhooks/{id}", "PATCH", "/api/v1/webhooks/wh_A_acc", `{"url":"https://b.example.com","events":["*"]}`, 404},
 		{"DELETE /api/v1/webhooks/{id}", "DELETE", "/api/v1/webhooks/wh_A", "", 404},
 		{"GET /api/v1/webhooks/{id}/deliveries", "GET", "/api/v1/webhooks/wh_A/deliveries", "", 404},
 		{"POST /api/v1/webhooks/{id}/test", "POST", "/api/v1/webhooks/wh_A/test", "", 404},
@@ -177,6 +181,14 @@ func TestCrossTenantAccessIs404(t *testing.T) {
 		}
 		if strings.Contains(rec.Body.String(), "secret") || strings.Contains(rec.Body.String(), "a@outlook.com") {
 			t.Errorf("%s %s as B (session) leaked A's data: %s", tc.method, tc.path, rec.Body.String())
+		}
+	}
+
+	// None of B's PATCH probes changed A's hooks.
+	for _, id := range []string{"wh_A", "wh_A_acc"} {
+		got, err := db.GetWebhook(devA.ID, id)
+		if err != nil || got.URL != "https://a.example.com" || len(got.Events) != 0 {
+			t.Errorf("B's probes changed A's %s: %+v, %v", id, got, err)
 		}
 	}
 

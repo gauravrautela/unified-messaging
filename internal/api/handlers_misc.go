@@ -319,17 +319,14 @@ func (r webhookRequest) validate() error {
 	}
 	switch r.Kind {
 	case model.WebhookKindWebhook:
-		if r.URL == "" {
-			return errors.New("url is required")
-		}
-		if err := publicHTTPURL(r.URL); err != nil {
+		if err := validateHookURL(r.Kind, r.URL); err != nil {
 			return err
 		}
 		if r.BotToken != "" || r.ChatID != "" {
 			return errors.New("bot_token and chat_id apply to kind=telegram only")
 		}
 	case model.WebhookKindDiscord:
-		if err := discordWebhookURL(r.URL); err != nil {
+		if err := validateHookURL(r.Kind, r.URL); err != nil {
 			return err
 		}
 		if r.Secret != "" {
@@ -346,7 +343,28 @@ func (r webhookRequest) validate() error {
 			return errors.New("url and secret do not apply to kind=telegram")
 		}
 	}
-	for _, e := range r.Events {
+	return validateEvents(r.Events)
+}
+
+// validateHookURL is the one rule for a hook's destination URL, shared by
+// create and by PATCH so an edit can never accept what create would refuse.
+func validateHookURL(kind, raw string) error {
+	switch kind {
+	case model.WebhookKindWebhook:
+		if raw == "" {
+			return errors.New("url is required")
+		}
+		return publicHTTPURL(raw)
+	case model.WebhookKindDiscord:
+		return discordWebhookURL(raw)
+	}
+	return errors.New("url does not apply to kind=telegram")
+}
+
+// validateEvents is the one rule for an event filter, shared by create and
+// PATCH.
+func validateEvents(events []string) error {
+	for _, e := range events {
 		if !model.KnownEvent(e) {
 			return fmt.Errorf("unknown event %q", e)
 		}
@@ -479,6 +497,91 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	// Echo the secret back once so the caller can configure verification, then
 	// never again.
 	writeJSON(w, http.StatusCreated, hook)
+}
+
+// patchWebhookRequest is the body of PATCH /webhooks/{id}: the fields of a
+// hook that can change without breaking anything that depends on it. A nil
+// field means "leave it". kind, secret and the telegram target are not here
+// (an unknown field is a 400, as everywhere): a secret is returned once at
+// creation, and the kind and the sealed target are what the hook is.
+type patchWebhookRequest struct {
+	Name   *string  `json:"name,omitempty"`
+	URL    *string  `json:"url,omitempty"`
+	Events []string `json:"events,omitempty"`
+}
+
+// handleGetWebhook reads one of the developer's hooks, in the shape the
+// listing gives, never its secret.
+func (s *Server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
+	h, ok := s.ownWebhook(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	h.Secret = ""
+	writeJSON(w, http.StatusOK, h)
+}
+
+// handlePatchWebhook edits a hook in place: same id, same signing secret,
+// same paused state, same delivery log. Each field supplied is validated
+// exactly as create validates it, against the hook's own kind. Hooks
+// reached through an account are edited here too, as they are deleted and
+// paused here, and keep their account.
+func (s *Server) handlePatchWebhook(w http.ResponseWriter, r *http.Request) {
+	dev, _ := developerFrom(r.Context())
+	// Ownership comes first: a body that fails validation must not tell a
+	// caller anything about a hook that is not theirs.
+	h, ok := s.ownWebhook(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	var req patchWebhookRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if req.Name == nil && req.URL == nil && req.Events == nil {
+		writeError(w, http.StatusBadRequest, "empty_patch", "supply name, url and/or events")
+		return
+	}
+	// A hook's kind never changes, so validating against the kind read above
+	// holds at the write below; if the hook was deleted in between, the
+	// UPDATE finds no row and answers 404.
+	if req.URL != nil {
+		if err := validateHookURL(h.Kind, *req.URL); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
+			return
+		}
+	}
+	if req.Events != nil {
+		// Create reads an empty filter as "the default for the scope" (every
+		// event on a developer-wide hook, new messages on an account one), so
+		// an empty list here would silently mean different things. Say what
+		// is meant instead.
+		if len(req.Events) == 0 {
+			writeError(w, http.StatusBadRequest, "invalid_webhook", `events must not be empty; use ["*"] to receive every event`)
+			return
+		}
+		if err := validateEvents(req.Events); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_webhook", err.Error())
+			return
+		}
+	}
+	err := s.store.UpdateWebhook(dev.ID, h.ID, store.WebhookUpdate{Name: req.Name, URL: req.URL, Events: req.Events})
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "webhook not found")
+		return
+	}
+	if err != nil {
+		logx.From(r.Context()).Error("updating webhook", "webhook_id", h.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	updated, ok := s.ownWebhook(w, r, h.ID)
+	if !ok {
+		return
+	}
+	updated.Secret = ""
+	writeJSON(w, http.StatusOK, updated)
 }
 
 // handleListWebhookDeliveries shows what is still waiting for a retry and what
