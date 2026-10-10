@@ -1878,3 +1878,32 @@ func TestRetentionMaxAgeUnknownDeveloper(t *testing.T) {
 		t.Fatalf("RetentionMaxAge for an unknown developer = %v, want ErrNotFound", err)
 	}
 }
+
+func TestListDeliveriesFilteredAppliesFilterInSQL(t *testing.T) {
+	s := newTestStore(t)
+	seedDeveloper(t, s, "dev_1", "a@x.com")
+	if err := s.SaveWebhook(model.Webhook{ID: "wh_1", DeveloperID: "dev_1", URL: "https://x.example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 4; i++ {
+		c := now.Add(time.Duration(i) * time.Second)
+		if err := s.SaveDelivery(Delivery{ID: fmt.Sprintf("dl_f_%d", i), WebhookID: "wh_1", EventType: "mail_received",
+			Payload: []byte(`{}`), Dead: i < 2, NextAttemptAt: c, CreatedAt: c}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	yes, no := true, false
+	got, err := s.ListDeliveriesFiltered("wh_1", DeliveryFilter{Dead: &yes, Since: now.Add(time.Second)}, 10, 0)
+	if err != nil || len(got) != 1 || got[0].ID != "dl_f_1" {
+		t.Fatalf("dead+since = %+v, %v; want [dl_f_1]", got, err)
+	}
+	got, err = s.ListDeliveriesFiltered("wh_1", DeliveryFilter{Dead: &no}, 1, 1)
+	if err != nil || len(got) != 1 || got[0].ID != "dl_f_3" {
+		t.Fatalf("pending page 2 = %+v, %v; want [dl_f_3]", got, err)
+	}
+	got, err = s.ListDeliveriesFiltered("wh_other", DeliveryFilter{}, 10, 0)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("other hook = %#v, %v; want empty non-nil", got, err)
+	}
+}

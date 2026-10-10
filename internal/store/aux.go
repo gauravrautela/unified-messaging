@@ -321,9 +321,37 @@ func (s *Store) DueDeliveries(now time.Time, limit int) ([]Delivery, error) {
 // oldest first. An outage can pile up hundreds of dead deliveries with full
 // message payloads, so an unbounded listing is not safe to expose.
 func (s *Store) ListDeliveries(webhookID string, limit, offset int) ([]Delivery, error) {
-	return s.queryDeliveries(`
+	return s.ListDeliveriesFiltered(webhookID, DeliveryFilter{}, limit, offset)
+}
+
+// DeliveryFilter narrows ListDeliveriesFiltered. The zero value matches every
+// delivery.
+type DeliveryFilter struct {
+	// Dead, when non-nil, keeps only dead (true) or still-queued (false) rows.
+	Dead *bool
+	// Since, when non-zero, keeps only rows created at or after it.
+	Since time.Time
+}
+
+// ListDeliveriesFiltered is ListDeliveries with the filter applied in SQL, so
+// the page and the offset count only matching rows. The id tie-break keeps
+// pages stable when several rows share a created_at second.
+func (s *Store) ListDeliveriesFiltered(webhookID string, f DeliveryFilter, limit, offset int) ([]Delivery, error) {
+	q := `
 		SELECT id, webhook_id, account_id, event_type, payload, attempts, next_attempt_at, last_error, dead, created_at
-		FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at LIMIT ? OFFSET ?`, webhookID, limit, offset)
+		FROM webhook_deliveries WHERE webhook_id = ?`
+	args := []any{webhookID}
+	if f.Dead != nil {
+		q += " AND dead = ?"
+		args = append(args, b2i(*f.Dead))
+	}
+	if !f.Since.IsZero() {
+		q += " AND created_at >= ?"
+		args = append(args, f.Since.Unix())
+	}
+	q += " ORDER BY created_at, id LIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
+	return s.queryDeliveries(q, args...)
 }
 
 // GetDelivery returns one queued or dead delivery of one webhook. The caller
