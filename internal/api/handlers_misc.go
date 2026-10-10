@@ -495,8 +495,29 @@ func (s *Server) handleListWebhookDeliveries(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	var filter store.DeliveryFilter
+	q := r.URL.Query()
+	// "pending" is a delivery still waiting for a retry; "dead" is one that
+	// ran out of attempts. Those are the only two states the queue stores.
+	switch v := q.Get("status"); v {
+	case "":
+	case "pending", "dead":
+		dead := v == "dead"
+		filter.Dead = &dead
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_status", "status must be pending or dead")
+		return
+	}
+	if v := q.Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_since", "since must be an RFC 3339 timestamp")
+			return
+		}
+		filter.Since = t
+	}
 	limit, offset := deliveriesPaging(r)
-	items, err := s.store.ListDeliveries(id, limit, offset)
+	items, err := s.store.ListDeliveriesFiltered(id, filter, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return

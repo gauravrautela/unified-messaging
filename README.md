@@ -352,7 +352,7 @@ accounts' events.
 | `POST` | `/api/v1/webhooks` — developer-wide; empty `events` means everything |
 | `GET` | `/api/v1/webhooks` |
 | `DELETE` | `/api/v1/webhooks/{id}` |
-| `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones |
+| `GET` | `/api/v1/webhooks/{id}/deliveries` — failed deliveries still queued, and dead ones (`?status=pending|dead`, `?since=<RFC 3339>`, `?limit`, `?offset`) |
 | `POST` | `/api/v1/webhooks/{id}/test` — send a signed `webhook_test` event; `{delivery_id, accepted, error}` |
 | `POST` | `/api/v1/webhooks/{id}/pause` — stop deliveries while you fix the destination; events meanwhile are skipped, queued retries wait |
 | `POST` | `/api/v1/webhooks/{id}/resume` — deliver again; held retries fall due at once |
